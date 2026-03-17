@@ -53,7 +53,8 @@ runs:
           name=$(basename "$p")
           hash="${name%%-*}"
           echo "$hash"
-        done | sort -u > "$WORK/local-hashes.txt"
+        done > "$WORK/local-hashes-raw.txt"
+        sort -u "$WORK/local-hashes-raw.txt" > "$WORK/local-hashes.txt"
 
         TOTAL=$(wc -l < "$WORK/local-hashes.txt" | tr -d ' ')
         echo "Resolved $TOTAL store paths"
@@ -117,7 +118,8 @@ runs:
           if [ -n "$url" ]; then
             basename "$url"
           fi
-        done | sort -u > "$WORK/nars.txt"
+        done > "$WORK/nars-raw.txt"
+        sort -u "$WORK/nars-raw.txt" > "$WORK/nars.txt"
 
         NAR_OK=0
         NAR_FAIL=0
