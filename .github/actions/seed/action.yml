@@ -34,7 +34,11 @@ runs:
         if [ -n "$STORE_PATHS" ]; then
           PATHS="$STORE_PATHS"
         elif [ -f shell.nix ] || [ -f default.nix ]; then
-          PATHS=$(nix-store -qR $(nix-instantiate shell.nix 2>/dev/null || nix-instantiate default.nix 2>/dev/null) 2>/dev/null || true)
+          # nix-build the shell to get runtime outputs (not .drv derivations)
+          SHELL_OUT=$(nix-build shell.nix --no-out-link 2>/dev/null || nix-build default.nix --no-out-link 2>/dev/null || true)
+          if [ -n "$SHELL_OUT" ]; then
+            PATHS=$(nix-store -qR $SHELL_OUT 2>/dev/null || true)
+          fi
         else
           echo "::warning::No store paths provided and no shell.nix/default.nix found."
           exit 0
@@ -75,17 +79,16 @@ runs:
         fi
 
         # --- Export only missing paths ---
-        MISSING_PATHS=""
         for p in $PATHS; do
           hash=$(basename "$p" | sed 's/-.*//')
           if grep -qxF "$hash" "$WORK/missing-hashes.txt"; then
-            MISSING_PATHS="$MISSING_PATHS $p"
+            echo "$p"
           fi
-        done
+        done > "$WORK/missing-paths.txt"
 
         echo "Exporting $MISSING missing paths..."
         mkdir -p "$WORK/export"
-        if ! nix copy --to "file://$WORK/export" $MISSING_PATHS 2>&1 | tail -5; then
+        if ! xargs nix copy --to "file://$WORK/export" < "$WORK/missing-paths.txt" 2>&1 | tail -5; then
           echo "::warning::nix copy reported errors (continuing with partial export)"
         fi
 
