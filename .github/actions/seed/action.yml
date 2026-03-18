@@ -15,7 +15,7 @@ inputs:
   parallel:
     description: 'Max concurrent uploads'
     required: false
-    default: '8'
+    default: '32'
 
 runs:
   using: 'composite'
@@ -111,19 +111,23 @@ runs:
         UPLOAD_COUNT=$(wc -l < "$WORK/narinfo-list.txt" | tr -d ' ')
         echo "Uploading $UPLOAD_COUNT narinfos (filtered from $EXPORTED exported)"
 
-        cat "$WORK/narinfo-list.txt" | xargs -P "$PARALLEL" -I{} sh -c '
-            code=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 30 \
-              -X PUT \
-              -H "Authorization: Bearer $1" \
-              --data-binary @"$2/export/{}.narinfo" \
-              "$3/{}.narinfo") || code="000"
-            if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
-              touch "$2/ok/{}"
-            else
-              echo "$code" > "$2/fail/{}.narinfo"
-            fi
-          ' _ "$CACHE_API_KEY" "$WORK" "$CACHE_URL"
+        upload_narinfo() {
+          local hash="$1"
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            -X PUT \
+            -H "Authorization: Bearer $CACHE_API_KEY" \
+            --data-binary @"$WORK/export/$hash.narinfo" \
+            "$CACHE_URL/$hash.narinfo") || code="000"
+          if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
+            touch "$WORK/ok/$hash"
+          else
+            echo "$code" > "$WORK/fail/$hash.narinfo"
+          fi
+        }
+        export -f upload_narinfo
+        export CACHE_API_KEY WORK CACHE_URL
+        xargs -P "$PARALLEL" -n1 -a "$WORK/narinfo-list.txt" bash -c 'upload_narinfo "$1"' _
 
         NARINFO_OK=$(find "$WORK/ok" -type f ! -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
         NARINFO_FAIL=$(find "$WORK/fail" -name '*.narinfo' 2>/dev/null | wc -l | tr -d ' ')
@@ -148,21 +152,25 @@ runs:
           done | sort -u > "$WORK/nars.txt"
 
           if [ -s "$WORK/nars.txt" ]; then
-            cat "$WORK/nars.txt" | xargs -P "$PARALLEL" -I{} sh -c '
-              if [ ! -f "$1/export/nar/{}" ]; then
-                exit 0
+            upload_nar() {
+              local narfile="$1"
+              if [ ! -f "$WORK/export/nar/$narfile" ]; then
+                return 0
               fi
               code=$(curl -s -o /dev/null -w "%{http_code}" \
                 --max-time 120 \
-                -T "$1/export/nar/{}" \
-                -H "Authorization: Bearer $2" \
-                "$3/nar/{}") || code="000"
+                -T "$WORK/export/nar/$narfile" \
+                -H "Authorization: Bearer $CACHE_API_KEY" \
+                "$CACHE_URL/nar/$narfile") || code="000"
               if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
-                touch "$1/ok/nar-{}"
+                touch "$WORK/ok/nar-$narfile"
               else
-                echo "$code" > "$1/fail/nar-{}"
+                echo "$code" > "$WORK/fail/nar-$narfile"
               fi
-            ' _ "$WORK" "$CACHE_API_KEY" "$CACHE_URL"
+            }
+            export -f upload_nar
+            export CACHE_API_KEY WORK CACHE_URL
+            xargs -P "$PARALLEL" -n1 -a "$WORK/nars.txt" bash -c 'upload_nar "$1"' _
 
             NAR_OK=$(find "$WORK/ok" -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
             NAR_FAIL=$(find "$WORK/fail" -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
