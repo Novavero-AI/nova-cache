@@ -15,7 +15,7 @@ inputs:
   parallel:
     description: 'Max concurrent uploads'
     required: false
-    default: '32'
+    default: '8'
 
 runs:
   using: 'composite'
@@ -45,29 +45,25 @@ runs:
           exit 0
         fi
 
-        # Convert store paths to narinfo hashes (the 32-char prefix of each path)
         WORK=$(mktemp -d)
         trap "rm -rf $WORK" EXIT
 
+        # --- Build local hash list ---
         for p in $PATHS; do
-          name=$(basename "$p")
-          hash="${name%%-*}"
-          echo "$hash"
-        done > "$WORK/local-hashes-raw.txt"
-        sort -u "$WORK/local-hashes-raw.txt" > "$WORK/local-hashes.txt"
+          basename "$p" | sed 's/-.*//'
+        done | sort -u > "$WORK/local-hashes.txt"
 
         TOTAL=$(wc -l < "$WORK/local-hashes.txt" | tr -d ' ')
-        echo "Resolved $TOTAL store paths"
+        echo "Resolved $TOTAL unique store paths"
 
-        # --- Fetch cached hashes in a single request ---
+        # --- Fetch remote hashes ---
         if curl -sf "$CACHE_URL/narinfo-hashes" -o "$WORK/remote-hashes.txt" 2>/dev/null; then
           sort -u "$WORK/remote-hashes.txt" > "$WORK/remote-sorted.txt"
         else
-          # Endpoint unavailable (older server) — treat as empty cache
           touch "$WORK/remote-sorted.txt"
         fi
 
-        # --- Diff: find hashes present locally but not in the remote cache ---
+        # --- Diff ---
         comm -23 "$WORK/local-hashes.txt" "$WORK/remote-sorted.txt" > "$WORK/missing-hashes.txt"
 
         MISSING=$(wc -l < "$WORK/missing-hashes.txt" | tr -d ' ')
@@ -81,8 +77,7 @@ runs:
         # --- Export only missing paths ---
         MISSING_PATHS=""
         for p in $PATHS; do
-          name=$(basename "$p")
-          hash="${name%%-*}"
+          hash=$(basename "$p" | sed 's/-.*//')
           if grep -qxF "$hash" "$WORK/missing-hashes.txt"; then
             MISSING_PATHS="$MISSING_PATHS $p"
           fi
@@ -90,59 +85,95 @@ runs:
 
         echo "Exporting $MISSING missing paths..."
         mkdir -p "$WORK/export"
-        nix copy --to "file://$WORK/export" $MISSING_PATHS 2>/dev/null || true
+        if ! nix copy --to "file://$WORK/export" $MISSING_PATHS 2>&1 | tail -5; then
+          echo "::warning::nix copy reported errors (continuing with partial export)"
+        fi
+
+        # Count what was actually exported
+        EXPORTED=$(find "$WORK/export" -maxdepth 1 -name '*.narinfo' | wc -l | tr -d ' ')
+        echo "Exported $EXPORTED narinfos"
+
+        if [ "$EXPORTED" -eq 0 ]; then
+          echo "::warning::nix copy produced no narinfos — nothing to upload."
+          exit 0
+        fi
 
         # --- Upload narinfos ---
         mkdir -p "$WORK/ok" "$WORK/fail"
 
+        # Only upload narinfos that are actually missing (nix copy exports transitive deps too)
         find "$WORK/export" -maxdepth 1 -name '*.narinfo' -exec basename {} .narinfo \; | \
-          xargs -P "$PARALLEL" -I{} sh -c '
-            code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+          grep -Fxf "$WORK/missing-hashes.txt" > "$WORK/narinfo-list.txt" || true
+
+        UPLOAD_COUNT=$(wc -l < "$WORK/narinfo-list.txt" | tr -d ' ')
+        echo "Uploading $UPLOAD_COUNT narinfos (filtered from $EXPORTED exported)"
+
+        cat "$WORK/narinfo-list.txt" | xargs -P "$PARALLEL" -I{} sh -c '
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 30 \
+              -X PUT \
               -H "Authorization: Bearer $1" \
               --data-binary @"$2/export/{}.narinfo" \
-              "$3/{}.narinfo") || true
+              "$3/{}.narinfo") || code="000"
             if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
               touch "$2/ok/{}"
             else
               echo "$code" > "$2/fail/{}.narinfo"
             fi
-            exit 0
           ' _ "$CACHE_API_KEY" "$WORK" "$CACHE_URL"
 
-        NARINFO_OK=$(find "$WORK/ok" -type f | wc -l | tr -d ' ')
-        NARINFO_FAIL=$(find "$WORK/fail" -name '*.narinfo' | wc -l | tr -d ' ')
+        NARINFO_OK=$(find "$WORK/ok" -type f ! -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
+        NARINFO_FAIL=$(find "$WORK/fail" -name '*.narinfo' 2>/dev/null | wc -l | tr -d ' ')
 
-        # --- Upload NARs ---
-        for hash in $(find "$WORK/ok" -type f -exec basename {} \;); do
-          url=$(grep -m1 '^URL:' "$WORK/export/$hash.narinfo" 2>/dev/null | sed 's/^URL: *//' || true)
-          if [ -n "$url" ]; then
-            basename "$url"
-          fi
-        done > "$WORK/nars-raw.txt"
-        sort -u "$WORK/nars-raw.txt" > "$WORK/nars.txt"
-
-        NAR_OK=0
-        NAR_FAIL=0
-        if [ -s "$WORK/nars.txt" ]; then
-          cat "$WORK/nars.txt" | xargs -P "$PARALLEL" -I{} sh -c '
-            if [ ! -f "$1/export/nar/{}" ]; then
-              exit 0
-            fi
-            code=$(curl -s -o /dev/null -w "%{http_code}" -T "$1/export/nar/{}" \
-              -H "Authorization: Bearer $2" \
-              "$3/nar/{}") || true
-            if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
-              touch "$1/ok/nar-{}"
-            else
-              echo "$code" > "$1/fail/nar-{}"
-            fi
-            exit 0
-          ' _ "$WORK" "$CACHE_API_KEY" "$CACHE_URL"
-
-          NAR_OK=$(find "$WORK/ok" -name 'nar-*' | wc -l | tr -d ' ')
-          NAR_FAIL=$(find "$WORK/fail" -name 'nar-*' | wc -l | tr -d ' ')
+        # Print sample failure codes for diagnostics
+        if [ "$NARINFO_FAIL" -gt 0 ]; then
+          echo "Sample failure codes:"
+          for f in $(find "$WORK/fail" -name '*.narinfo' | head -5); do
+            echo "  $(basename "$f"): HTTP $(cat "$f")"
+          done
         fi
 
+        # --- Upload NARs (only for successfully uploaded narinfos) ---
+        NAR_OK=0
+        NAR_FAIL=0
+        if [ "$NARINFO_OK" -gt 0 ]; then
+          for hash in $(find "$WORK/ok" -type f ! -name 'nar-*' -exec basename {} \;); do
+            url=$(grep -m1 '^URL:' "$WORK/export/$hash.narinfo" 2>/dev/null | sed 's/^URL: *//' || true)
+            if [ -n "$url" ]; then
+              basename "$url"
+            fi
+          done | sort -u > "$WORK/nars.txt"
+
+          if [ -s "$WORK/nars.txt" ]; then
+            cat "$WORK/nars.txt" | xargs -P "$PARALLEL" -I{} sh -c '
+              if [ ! -f "$1/export/nar/{}" ]; then
+                exit 0
+              fi
+              code=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 120 \
+                -T "$1/export/nar/{}" \
+                -H "Authorization: Bearer $2" \
+                "$3/nar/{}") || code="000"
+              if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
+                touch "$1/ok/nar-{}"
+              else
+                echo "$code" > "$1/fail/nar-{}"
+              fi
+            ' _ "$WORK" "$CACHE_API_KEY" "$CACHE_URL"
+
+            NAR_OK=$(find "$WORK/ok" -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
+            NAR_FAIL=$(find "$WORK/fail" -name 'nar-*' 2>/dev/null | wc -l | tr -d ' ')
+
+            if [ "$NAR_FAIL" -gt 0 ]; then
+              echo "Sample NAR failure codes:"
+              for f in $(find "$WORK/fail" -name 'nar-*' | head -5); do
+                echo "  $(basename "$f"): HTTP $(cat "$f")"
+              done
+            fi
+          fi
+        fi
+
+        echo ""
         echo "Narinfo: $NARINFO_OK uploaded, $NARINFO_FAIL failed (skipped $((TOTAL - MISSING)) cached)"
         echo "Nar:     $NAR_OK uploaded, $NAR_FAIL failed"
 
@@ -165,7 +196,7 @@ runs:
             if [ "$LOCAL_SP" != "$REMOTE_SP" ]; then
               echo "::warning::Validation failed: StorePath mismatch on $SAMPLE"
             else
-              echo "Validation passed: $SAMPLE — content, signature, and NAR verified"
+              echo "Validation passed: $SAMPLE"
             fi
           fi
         fi
