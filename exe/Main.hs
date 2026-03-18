@@ -23,7 +23,6 @@ import Network.Wai
     strictRequestBody,
   )
 import qualified Network.Wai.Handler.Warp as Warp
-import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (SecretKey, parseSecretKey, sign)
 import NovaCache.Store (FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
@@ -100,7 +99,7 @@ main = do
   putStrLn ("store root: " ++ storeRoot)
   putStrLn ("signing: " ++ maybe "disabled" (const "enabled") sigKey)
   putStrLn ("write auth: " ++ maybe "disabled (open writes!)" (const "enabled") (cfgApiKey cfg))
-  Warp.run port (logStdout (app cfg))
+  Warp.run port (app cfg)
 
 -- | Load a signing key from a file, if configured.
 loadSigningKey :: Maybe FilePath -> IO (Maybe SecretKey)
