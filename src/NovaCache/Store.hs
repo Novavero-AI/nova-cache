@@ -19,6 +19,7 @@ module NovaCache.Store
   )
 where
 
+import Control.Exception (SomeException, catch, onException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Text (Text)
@@ -27,8 +28,11 @@ import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
     listDirectory,
+    removeFile,
+    renameFile,
   )
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
+import System.IO (hClose, openBinaryTempFile)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -64,6 +68,10 @@ defaultPriority = 50
 defaultStoreDir :: Text
 defaultStoreDir = "/nix/store"
 
+-- | Prefix for temporary files used during atomic writes.
+tempFilePrefix :: String
+tempFilePrefix = ".nova.tmp"
+
 -- ---------------------------------------------------------------------------
 -- Initialization
 -- ---------------------------------------------------------------------------
@@ -96,11 +104,13 @@ readNarInfo fs hashKey = case sanitizePath hashKey of
 
 -- | Write a narinfo by its store path hash.
 --
+-- Uses atomic write-to-temp-then-rename so concurrent readers never
+-- see partial content.
 -- Returns 'False' for path components containing traversal sequences.
 writeNarInfo :: FileStore -> Text -> ByteString -> IO Bool
 writeNarInfo fs hashKey body = case sanitizePath hashKey of
   Nothing -> pure False
-  Just safe -> BS.writeFile (fsRoot fs </> narinfoSubdir </> safe) body >> pure True
+  Just safe -> atomicWriteFile (fsRoot fs </> narinfoSubdir </> safe) body >> pure True
 
 -- ---------------------------------------------------------------------------
 -- NAR operations
@@ -116,11 +126,13 @@ readNar fs fileName = case sanitizePath fileName of
 
 -- | Write a NAR file by its filename.
 --
+-- Uses atomic write-to-temp-then-rename so concurrent readers never
+-- see partial content.
 -- Returns 'False' for path components containing traversal sequences.
 writeNar :: FileStore -> Text -> ByteString -> IO Bool
 writeNar fs fileName body = case sanitizePath fileName of
   Nothing -> pure False
-  Just safe -> BS.writeFile (fsRoot fs </> narSubdir </> safe) body >> pure True
+  Just safe -> atomicWriteFile (fsRoot fs </> narSubdir </> safe) body >> pure True
 
 -- ---------------------------------------------------------------------------
 -- Listing
@@ -129,8 +141,11 @@ writeNar fs fileName body = case sanitizePath fileName of
 -- | List all narinfo hashes currently stored.
 --
 -- Returns the filenames in the @narinfo/@ subdirectory as 'Text' values.
+-- Filters out temporary files from in-progress atomic writes.
 listNarInfoHashes :: FileStore -> IO [Text]
-listNarInfoHashes fs = map T.pack <$> listDirectory (fsRoot fs </> narinfoSubdir)
+listNarInfoHashes fs =
+  filter (not . T.isPrefixOf ".") . map T.pack
+    <$> listDirectory (fsRoot fs </> narinfoSubdir)
 
 -- ---------------------------------------------------------------------------
 -- Cache metadata
@@ -161,6 +176,33 @@ sanitizePath txt
 -- ---------------------------------------------------------------------------
 -- Internal
 -- ---------------------------------------------------------------------------
+
+-- | Write a file atomically via write-to-temp-then-rename.
+--
+-- Writes to a temporary file in the same directory, then renames to
+-- the target path. On POSIX, @rename@ is atomic — readers see either
+-- the old content or the new content, never a partial write.
+-- Cleans up the temporary file on failure.
+atomicWriteFile :: FilePath -> ByteString -> IO ()
+atomicWriteFile target content = do
+  let dir = takeDirectory target
+  (tmpPath, h) <- openBinaryTempFile dir tempFilePrefix
+  let cleanup = do
+        ignoringExceptions (hClose h)
+        ignoringExceptions (removeFile tmpPath)
+  ( do
+      BS.hPut h content
+      hClose h
+      renameFile tmpPath target
+    )
+    `onException` cleanup
+
+-- | Swallow all exceptions from a cleanup action.
+ignoringExceptions :: IO () -> IO ()
+ignoringExceptions action = action `catch` silenceException
+  where
+    silenceException :: SomeException -> IO ()
+    silenceException _ = pure ()
 
 -- | Read a file if it exists, returning 'Nothing' otherwise.
 readIfExists :: FilePath -> IO (Maybe ByteString)
