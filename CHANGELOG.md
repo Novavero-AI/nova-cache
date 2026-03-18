@@ -25,7 +25,7 @@
 - **Fix xargs line-too-long** — large path lists passed via file instead of inline.
 - **Diagnostic output** — upload failure HTTP codes now printed; `nix copy` errors
   no longer silenced.
-- **Parallelism** — default reduced from 32 to 8; per-upload `--max-time` added.
+- **Parallelism** — per-upload `--max-time` added (120s for NARs, 30s for narinfos).
 
 ### Server validation
 

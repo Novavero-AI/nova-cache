@@ -148,7 +148,7 @@ sign (SecretKey keyName secretBytes) ni = do
   let pk = Ed25519.toPublic sk
       msg = TE.encodeUtf8 (fingerprint ni)
       sig = Ed25519.sign sk pk msg
-      sigB64 = TE.decodeUtf8 (B64.encode (convert sig))
+      sigB64 = TE.decodeLatin1 (B64.encode (convert sig))
   pure (keyName <> keySeparator <> sigB64)
 
 -- | Verify a @keyname:base64sig@ signature against a narinfo and public key.

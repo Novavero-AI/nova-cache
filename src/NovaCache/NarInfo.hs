@@ -135,9 +135,7 @@ parseLine :: Text -> Maybe (Text, Text)
 parseLine line = case T.breakOn kvSeparator line of
   (_, rest)
     | T.null rest -> Nothing
-    | otherwise -> Just (key, T.drop kvSeparatorLen rest)
-    where
-      key = fst (T.breakOn kvSeparator line)
+  (key, rest) -> Just (key, T.drop kvSeparatorLen rest)
 
 -- | Render a key-value pair.
 kv :: Text -> Text -> Text

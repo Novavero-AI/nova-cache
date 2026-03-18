@@ -15,7 +15,7 @@ import qualified Data.Text.Encoding as TE
 
 -- | Encode bytes to base64 'Text'.
 encode :: ByteString -> Text
-encode = TE.decodeUtf8 . B64.encode
+encode = TE.decodeLatin1 . B64.encode
 
 -- | Decode base64 'Text' to bytes.
 decode :: Text -> Either String ByteString
