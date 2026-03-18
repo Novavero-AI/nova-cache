@@ -15,6 +15,7 @@ where
 
 import Data.ByteString (ByteString)
 import Data.Text (Text)
+import qualified Data.Text as T
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 import NovaCache.NarInfo (NarInfo (..))
 import NovaCache.Signing (PublicKey, verify)
@@ -46,6 +47,8 @@ data ValidationError
     SignatureInvalid !Text
   | -- | The narinfo has zero signatures.
     NoSignatures
+  | -- | StorePath is a derivation (.drv) — binary caches serve build outputs only.
+    DerivationStorePath !Text
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -57,13 +60,16 @@ data ValidationError
 -- Returns the 'NarInfo' unchanged on success for composition.
 validateNarInfo :: NarInfo -> Either [ValidationError] NarInfo
 validateNarInfo ni =
-  case concat [sizeErrors, storePathErrors, fileHashErrors, narHashErrors, refErrors] of
+  case concat [sizeErrors, drvErrors, storePathErrors, fileHashErrors, narHashErrors, refErrors] of
     [] -> Right ni
     errs -> Left errs
   where
     sizeErrors =
       [NegativeFileSize (niFileSize ni) | niFileSize ni < 0]
         ++ [NegativeNarSize (niNarSize ni) | niNarSize ni < 0]
+
+    drvErrors =
+      [DerivationStorePath (niStorePath ni) | ".drv" `T.isSuffixOf` niStorePath ni]
 
     storePathErrors = case parseStorePath defaultStoreDir (niStorePath ni) of
       Left err -> [InvalidStorePath (niStorePath ni) err]

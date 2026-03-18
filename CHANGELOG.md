@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.2.0 — 2026-03-18
+
+### Seed action fixes
+
+- **Resolve runtime outputs, not derivations** — `nix-instantiate` replaced
+  with `nix-build --no-out-link` so the cache stores actual binaries instead of
+  `.drv` build recipes. This was the root cause of the cache being ineffective.
+- **Filter uploads to diff-only** — `nix copy` exports transitive deps; uploads
+  now filtered against the missing-hashes diff to avoid re-uploading cached paths.
+- **Fix broken pipe** — `find | xargs` with `pipefail` caused spurious failures;
+  now writes to intermediate files.
+- **Fix xargs line-too-long** — large path lists passed via file instead of inline.
+- **Diagnostic output** — upload failure HTTP codes now printed; `nix copy` errors
+  no longer silenced.
+- **Parallelism** — default reduced from 32 to 8; per-upload `--max-time` added.
+
+### Server validation
+
+- **Reject derivation narinfos** — `validateNarInfo` now rejects any narinfo
+  where StorePath ends in `.drv` with a new `DerivationStorePath` error. Binary
+  caches serve build outputs, not build recipes.
+- 1 new test (75 total)
+
 ## 0.3.1.0 — 2026-03-07
 
 ### Drop `memory` dependency, use `ram`

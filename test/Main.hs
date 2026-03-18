@@ -631,6 +631,15 @@ testValidate =
               "negative narsize"
               (Left [Validate.NegativeNarSize (-1)])
               (Validate.validateNarInfo ni),
+      test "validateNarInfo derivation StorePath rejected" $
+        let drvPath = "/nix/store/abc12345678901234567890123456789-foo.drv"
+            ni = mkValidNarInfo {NarInfo.niStorePath = drvPath}
+         in case Validate.validateNarInfo ni of
+              Left [Validate.DerivationStorePath raw] ->
+                assertEqual "raw value" drvPath raw
+              other -> do
+                putStrLn ("    expected Left [DerivationStorePath ..], got: " ++ show other)
+                pure False,
       test "validateNarInfo bad StorePath" $
         let ni = mkValidNarInfo {NarInfo.niStorePath = "not-a-store-path"}
          in case Validate.validateNarInfo ni of

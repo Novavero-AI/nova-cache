@@ -403,9 +403,9 @@ A reusable composite action is included for pushing Nix store paths to a nova-ca
 | `cache-url` | yes | Base URL of the nova-cache server |
 | `api-key` | yes | Bearer token for authenticating uploads |
 | `paths` | no | Explicit store paths (space-separated). Defaults to all paths from `shell.nix` / `default.nix` |
-| `parallel` | no | Max concurrent uploads (default: 32) |
+| `parallel` | no | Max concurrent uploads (default: 8) |
 
-The action fetches `GET /narinfo-hashes` to determine which paths are already cached, exports only the missing paths, and uploads narinfo + NAR files in parallel. Falls back to uploading everything if the endpoint is unavailable (servers < 0.3.0.0). Works with any CI that has Nix installed.
+The action resolves runtime store paths via `nix-build`, diffs against the server's `GET /narinfo-hashes`, exports only missing paths, and uploads narinfo + NAR files in parallel. Includes per-upload timeouts, failure diagnostics, and a round-trip validation check. Works with any CI that has Nix installed.
 
 ---
 
