@@ -295,7 +295,7 @@ nix build --substituters http://cache.example.com --trusted-public-keys "mykey:b
 ```
 
 - **10 modules**, 8 pure + 2 at the IO boundary (Compression optional via flag)
-- **74 core tests + 4 compression tests**, hand-rolled harness, no framework dependencies
+- **75 core tests + 4 compression tests**, hand-rolled harness, no framework dependencies
 - **Zero partial functions** — total by construction
 - **Strict by default** — bang patterns on all data fields
 
