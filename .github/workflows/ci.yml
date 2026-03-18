@@ -73,7 +73,9 @@ jobs:
       - name: Cache Cabal store
         uses: actions/cache@v4
         with:
-          path: ~/.cabal/store
+          path: |
+            ~/.cabal/store
+            ~/AppData/Roaming/cabal/store
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-cache.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
