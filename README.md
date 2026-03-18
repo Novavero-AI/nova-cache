@@ -230,6 +230,7 @@ PORT=5000 NIX_CACHE_DIR=./nix-cache nova-cache-server
 | `NIX_CACHE_DIR` | Store directory (default: `./nix-cache`) |
 | `CACHE_API_KEY` | Bearer token required for PUT requests. Omit for open writes. |
 | `SIGNING_KEY_FILE` | Path to Ed25519 secret key file for server-side narinfo signing. |
+| `LOG_REQUESTS` | Set to `0` to disable request logging. Enabled by default (Apache Combined format). |
 
 ### Endpoints
 

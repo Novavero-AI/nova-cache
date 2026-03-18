@@ -1,0 +1,14 @@
+# Normalize all text files to LF in the repository.
+# On checkout, git converts to the platform's native line endings.
+* text=auto
+
+# Force LF for source files regardless of platform.
+*.hs        text eol=lf
+*.cabal     text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.nix       text eol=lf
+*.sh        text eol=lf
+*.txt       text eol=lf
+LICENSE     text eol=lf

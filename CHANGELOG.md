@@ -2,6 +2,17 @@
 
 ## 0.3.2.0 — 2026-03-18
 
+### Server logging
+
+- **Request logging** — Apache Combined format via `wai-extra` middleware,
+  configurable with `LOG_REQUESTS=0` to disable.
+- **Error logging** — auth rejections, validation failures, oversized uploads,
+  and bad paths now logged to stderr with request method and path context.
+- **`withLimitedBody` combinator** — extracted common body-limiting pattern from
+  PUT handlers, reducing duplication.
+- **`notFound` named constant** — replaces three inline 404 responses.
+- Fixed `loadSigningKey` warnings going to stdout instead of stderr.
+
 ### Seed action fixes
 
 - **Resolve runtime outputs, not derivations** — `nix-instantiate` replaced
