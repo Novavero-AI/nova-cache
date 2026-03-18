@@ -6,7 +6,7 @@
 
 - **Resolve runtime outputs, not derivations** — `nix-instantiate` replaced
   with `nix-build --no-out-link` so the cache stores actual binaries instead of
-  `.drv` build recipes. This was the root cause of the cache being ineffective.
+  `.drv` build recipes.
 - **Filter uploads to diff-only** — `nix copy` exports transitive deps; uploads
   now filtered against the missing-hashes diff to avoid re-uploading cached paths.
 - **Fix broken pipe** — `find | xargs` with `pipefail` caused spurious failures;
