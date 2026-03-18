@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2.1 — 2026-03-18
+
+- Replace partial `decodeUtf8` with total `decodeLatin1` in `Base64.encode`
+  and `Signing.sign` — provably safe on base64 ASCII output, eliminates last
+  partial function usage
+- Fix redundant `T.breakOn` call in `NarInfo.parseLine`
+- No API changes
+
 ## 0.3.2.0 — 2026-03-18
 
 ### Server logging
