@@ -122,11 +122,36 @@ jobs:
         env:
           OCI_HOST: ${{ secrets.OCI_HOST }}
           OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+          CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: |
           mkdir -p ~/.ssh
           echo "$OCI_SSH_KEY" > ~/.ssh/oci_key
           chmod 600 ~/.ssh/oci_key
           echo "${{ secrets.OCI_HOST_KEY }}" >> ~/.ssh/known_hosts
+
+          # Render service file with API key from GitHub secret
+          cat > /tmp/nova-cache.service <<EOF
+          [Unit]
+          Description=Nova Cache Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          Group=ubuntu
+          ExecStart=/usr/local/bin/nova-cache-server --port 5000 --store /var/lib/nix-cache
+          Restart=always
+          RestartSec=5
+          Environment=PORT=5000
+          Environment=NIX_CACHE_DIR=/var/lib/nix-cache
+          Environment=CACHE_API_KEY=${CACHE_API_KEY}
+          Environment=SIGNING_KEY_FILE=/etc/nix-cache/secret-key
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          scp -i ~/.ssh/oci_key /tmp/nova-cache.service "ubuntu@${OCI_HOST}:/tmp/nova-cache.service"
 
           ssh -i ~/.ssh/oci_key "ubuntu@${OCI_HOST}" "\
             source ~/.ghcup/env && \
@@ -139,5 +164,7 @@ jobs:
             sudo systemctl stop nova-cache.service && \
             sudo cp \"\$BINARY\" /usr/local/bin/nova-cache-server && \
             sudo chmod +x /usr/local/bin/nova-cache-server && \
+            sudo cp /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
+            sudo systemctl daemon-reload && \
             sudo systemctl start nova-cache.service && \
             sudo systemctl status nova-cache.service --no-pager"
