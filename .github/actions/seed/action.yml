@@ -31,6 +31,7 @@ runs:
         set -euo pipefail
 
         # --- Resolve store paths ---
+        PATHS=""
         if [ -n "$STORE_PATHS" ]; then
           PATHS="$STORE_PATHS"
         elif [ -f shell.nix ] || [ -f default.nix ]; then
