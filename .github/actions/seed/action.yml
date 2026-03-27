@@ -41,13 +41,13 @@ runs:
             PATHS=$(nix-store -qR $SHELL_OUT 2>/dev/null || true)
           fi
         else
-          echo "::warning::No store paths provided and no shell.nix/default.nix found."
-          exit 0
+          echo "::error::No store paths provided and no shell.nix/default.nix found."
+          exit 1
         fi
 
         if [ -z "$PATHS" ]; then
-          echo "::warning::No store paths resolved."
-          exit 0
+          echo "::error::No store paths resolved — seed failed."
+          exit 1
         fi
 
         WORK=$(mktemp -d)
