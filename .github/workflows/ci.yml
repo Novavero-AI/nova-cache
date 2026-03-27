@@ -78,7 +78,7 @@ jobs:
         with:
           path: |
             ~/.cabal/store
-            ~/AppData/Roaming/cabal/store
+            C:\cabal\store
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-cache.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 

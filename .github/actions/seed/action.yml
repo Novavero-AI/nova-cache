@@ -35,10 +35,21 @@ runs:
         if [ -n "$STORE_PATHS" ]; then
           PATHS="$STORE_PATHS"
         elif [ -f shell.nix ] || [ -f default.nix ]; then
-          # nix-build the shell to get runtime outputs (not .drv derivations)
-          SHELL_OUT=$(nix-build shell.nix --no-out-link 2>/dev/null || nix-build default.nix --no-out-link || true)
-          if [ -n "$SHELL_OUT" ]; then
-            PATHS=$(nix-store -qR $SHELL_OUT 2>/dev/null || true)
+          BUILD_OUT=""
+          # Try shell.nix first (dev shells cache more deps). Failure is expected
+          # if the file doesn't exist or isn't a buildable derivation.
+          if [ -f shell.nix ]; then
+            echo "Trying nix-build shell.nix..."
+            BUILD_OUT=$(nix-build shell.nix --no-out-link 2>/dev/null) || true
+          fi
+          # Fall back to default.nix. No error suppression — if this fails, the
+          # nix-build error goes straight to the CI log and set -e stops the script.
+          if [ -z "$BUILD_OUT" ] && [ -f default.nix ]; then
+            echo "Building default.nix..."
+            BUILD_OUT=$(nix-build default.nix --no-out-link)
+          fi
+          if [ -n "$BUILD_OUT" ]; then
+            PATHS=$(nix-store -qR $BUILD_OUT)
           fi
         else
           echo "::error::No store paths provided and no shell.nix/default.nix found."
