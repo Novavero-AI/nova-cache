@@ -36,7 +36,7 @@ runs:
           PATHS="$STORE_PATHS"
         elif [ -f shell.nix ] || [ -f default.nix ]; then
           # nix-build the shell to get runtime outputs (not .drv derivations)
-          SHELL_OUT=$(nix-build shell.nix --no-out-link 2>/dev/null || nix-build default.nix --no-out-link 2>/dev/null || true)
+          SHELL_OUT=$(nix-build shell.nix --no-out-link 2>&1 || nix-build default.nix --no-out-link 2>&1 || true)
           if [ -n "$SHELL_OUT" ]; then
             PATHS=$(nix-store -qR $SHELL_OUT 2>/dev/null || true)
           fi
