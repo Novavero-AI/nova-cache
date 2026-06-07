@@ -252,10 +252,20 @@ readStr :: NarParser ByteString
 readStr bs
   | BS.length bs < wordSize =
       Left "unexpected end of NAR: need 8 bytes for string length"
-  | totalLen > BS.length payload =
+  -- Compare the Word64 length to the remaining bytes BEFORE narrowing it to
+  -- Int: a hostile length above maxBound::Int would otherwise wrap negative
+  -- and slip past the totalLen check below.
+  | len > fromIntegral (BS.length payload) =
       Left
         ( "unexpected end of NAR: string length "
             ++ show len
+            ++ " exceeds remaining "
+            ++ show (BS.length payload)
+        )
+  | totalLen > BS.length payload =
+      Left
+        ( "unexpected end of NAR: padded string length "
+            ++ show totalLen
             ++ " exceeds remaining "
             ++ show (BS.length payload)
         )
