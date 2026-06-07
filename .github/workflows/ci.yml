@@ -84,7 +84,7 @@ jobs:
 
       - name: Install liblzma (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y liblzma-dev
 
       - name: Build
         run: cabal build --ghc-options="-Werror" ${{ matrix.compression == false && '-f-compression' || '' }}
