@@ -424,6 +424,12 @@ testSigning =
               ok1 <- assertTrue "starts with 1;" (T.isPrefixOf "1;" fp)
               ok2 <- assertTrue "contains storePath" (T.isInfixOf "/nix/store/" fp)
               pure (ok1 && ok2),
+      test "fingerprint renders references as full store paths" $
+        let ni = mkTestNarInfo {NarInfo.niReferences = ["00000000000000000000000000000000-glibc-2.40"]}
+            fp = Signing.fingerprint ni
+         in assertTrue
+              "reference is a full /nix/store path in the fingerprint"
+              (T.isInfixOf "/nix/store/00000000000000000000000000000000-glibc-2.40" fp),
       test "parseSecretKey valid" $
         let keyBytes = BS.pack ([1 .. 32] ++ [33 .. 64])
             keyB64 = TE.decodeUtf8 (B64.encode keyBytes)

@@ -134,8 +134,13 @@ fingerprint ni =
       niStorePath ni,
       niNarHash ni,
       T.pack (show (niNarSize ni)),
-      T.intercalate referenceSep (niReferences ni)
+      T.intercalate referenceSep (map (storeDir <>) (niReferences ni))
     ]
+  where
+    -- References in a narinfo are basenames, but the fingerprint signs them as
+    -- full store paths (/nix/store/<hash>-<name>), matching C++ Nix.  The store
+    -- directory is the leading path of the (already absolute) niStorePath.
+    storeDir = T.dropWhileEnd (/= '/') (niStorePath ni)
 
 -- ---------------------------------------------------------------------------
 -- Signing and verification

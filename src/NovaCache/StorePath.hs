@@ -20,6 +20,7 @@ import Data.Char (isAlphaNum)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import NovaCache.Base32 (isBase32Char)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -108,6 +109,8 @@ parseBaseName basename
       Left ("store path too short: " ++ T.unpack basename)
   | T.index basename storePathHashLen /= hashNameSeparator =
       Left ("expected '-' after hash in store path: " ++ T.unpack basename)
+  | not (T.all isBase32Char hashPart) =
+      Left ("invalid nix-base32 hash in store path: " ++ T.unpack hashPart)
   | T.null name =
       Left ("empty name in store path: " ++ T.unpack basename)
   | not (T.all validNameChar name) =

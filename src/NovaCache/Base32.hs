@@ -6,6 +6,7 @@
 module NovaCache.Base32
   ( encode,
     decode,
+    isBase32Char,
   )
 where
 
@@ -48,6 +49,13 @@ asciiTableSize = 256
 -- | Sentinel value for characters outside the alphabet.
 invalidMarker :: Word8
 invalidMarker = 0xFF
+
+-- | Is a character part of the Nix base32 alphabet
+-- (@0123456789abcdfghijklmnpqrsvwxyz@)?  Used to validate store-path hashes.
+isBase32Char :: Char -> Bool
+isBase32Char c = case nixDecodeLut V.!? ord c of
+  Just v -> v /= invalidMarker
+  Nothing -> False
 
 -- | Bits per base32 character.
 bitsPerChar :: Int
