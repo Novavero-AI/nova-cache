@@ -120,14 +120,29 @@ jobs:
     steps:
       - name: Deploy to OCI
         env:
-          OCI_HOST: ${{ secrets.OCI_HOST }}
           OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
           CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+          # Cloudflare Access service token: reach the box through Access,
+          # since its public port 22 is closed now.
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
+          # Install cloudflared and reach the box through Cloudflare Access:
+          # its public port 22 is closed, so SSH is Access-only now.
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+
           mkdir -p ~/.ssh
           echo "$OCI_SSH_KEY" > ~/.ssh/oci_key
           chmod 600 ~/.ssh/oci_key
-          echo "${{ secrets.OCI_HOST_KEY }}" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<'SSHCFG'
+          Host anv26
+            HostName anv26.novavero.ai
+            User ubuntu
+            IdentityFile ~/.ssh/oci_key
+            ProxyCommand cloudflared access ssh --hostname %h
+            StrictHostKeyChecking accept-new
+          SSHCFG
 
           # Render service file with API key from GitHub secret
           cat > /tmp/nova-cache.service <<EOF
@@ -151,9 +166,9 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-          scp -i ~/.ssh/oci_key /tmp/nova-cache.service "ubuntu@${OCI_HOST}:/tmp/nova-cache.service"
+          scp /tmp/nova-cache.service anv26:/tmp/nova-cache.service
 
-          ssh -i ~/.ssh/oci_key "ubuntu@${OCI_HOST}" "\
+          ssh anv26 "\
             source ~/.ghcup/env && \
             cd ~/nova-cache && \
             git pull && \
