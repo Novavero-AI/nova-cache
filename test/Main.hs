@@ -330,7 +330,6 @@ sampleNarInfoText =
       "NarSize: 67890",
       "References: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.38",
       "Deriver: cccccccccccccccccccccccccccccccc-hello-1.0.drv",
-      "System: x86_64-linux",
       "Sig: cache.example.com:c2lnbmF0dXJl",
       "Sig: backup.example.com:YW5vdGhlcnNpZw=="
     ]
@@ -352,9 +351,8 @@ testNarInfo =
             ok5 <- assertEqual "narSize" 67890 (NarInfo.niNarSize ni)
             ok6 <- assertEqual "refs count" 2 (length (NarInfo.niReferences ni))
             ok7 <- assertEqual "deriver" (Just "cccccccccccccccccccccccccccccccc-hello-1.0.drv") (NarInfo.niDeriver ni)
-            ok8 <- assertEqual "system" (Just "x86_64-linux") (NarInfo.niSystem ni)
-            ok9 <- assertEqual "sigs count" 2 (length (NarInfo.niSigs ni))
-            pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9),
+            ok8 <- assertEqual "sigs count" 2 (length (NarInfo.niSigs ni))
+            pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8),
       test "parse/render roundtrip" $
         case NarInfo.parseNarInfo sampleNarInfoText of
           Left err -> do
@@ -386,11 +384,10 @@ testNarInfo =
                 pure False
               Right ni -> do
                 ok1 <- assertEqual "deriver" Nothing (NarInfo.niDeriver ni)
-                ok2 <- assertEqual "system" Nothing (NarInfo.niSystem ni)
-                ok3 <- assertEqual "sigs" [] (NarInfo.niSigs ni)
-                ok4 <- assertEqual "ca" Nothing (NarInfo.niCA ni)
-                ok5 <- assertEqual "refs" [] (NarInfo.niReferences ni)
-                pure (ok1 && ok2 && ok3 && ok4 && ok5),
+                ok2 <- assertEqual "sigs" [] (NarInfo.niSigs ni)
+                ok3 <- assertEqual "ca" Nothing (NarInfo.niCA ni)
+                ok4 <- assertEqual "refs" [] (NarInfo.niReferences ni)
+                pure (ok1 && ok2 && ok3 && ok4),
       test "parse missing required key fails" $
         let incomplete = T.unlines ["StorePath: /nix/store/aaaa-test", "URL: nar/test.nar.xz"]
          in assertLeft "missing key" (NarInfo.parseNarInfo incomplete),
@@ -491,7 +488,6 @@ mkTestNarInfo =
       NarInfo.niNarSize = 200,
       NarInfo.niReferences = ["aaaa-hello-1.0"],
       NarInfo.niDeriver = Nothing,
-      NarInfo.niSystem = Nothing,
       NarInfo.niSigs = [],
       NarInfo.niCA = Nothing
     }
@@ -551,6 +547,10 @@ testFileStore =
         assertEqual "empty" Nothing (Store.sanitizePath ""),
       test "sanitizePath accepts valid hash" $
         assertEqual "valid" (Just "abc123def456") (Store.sanitizePath "abc123def456"),
+      test "sanitizePath rejects windows device name" $
+        assertEqual "device nul" Nothing (Store.sanitizePath "nul"),
+      test "sanitizePath rejects dotfile" $
+        assertEqual "dotfile" Nothing (Store.sanitizePath ".hidden"),
       test "read rejects traversal" $ do
         tmpDir <- createTestDir
         store <- Store.newFileStore tmpDir
@@ -611,7 +611,6 @@ mkValidNarInfo =
       NarInfo.niNarSize = 5,
       NarInfo.niReferences = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0"],
       NarInfo.niDeriver = Nothing,
-      NarInfo.niSystem = Nothing,
       NarInfo.niSigs = [],
       NarInfo.niCA = Nothing
     }

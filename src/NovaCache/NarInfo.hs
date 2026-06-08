@@ -2,7 +2,7 @@
 --
 -- A @.narinfo@ file is a simple @Key: Value@ text format describing a
 -- store path in a binary cache. The format supports multiple @Sig@ lines
--- and optional fields for @Deriver@, @System@, and @CA@.
+-- and optional fields for @Deriver@ and @CA@.
 module NovaCache.NarInfo
   ( NarInfo (..),
     parseNarInfo,
@@ -11,7 +11,7 @@ module NovaCache.NarInfo
 where
 
 import Data.List (find)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -30,7 +30,6 @@ data NarInfo = NarInfo
     niNarSize :: !Integer,
     niReferences :: ![Text],
     niDeriver :: !(Maybe Text),
-    niSystem :: !(Maybe Text),
     niSigs :: ![Text],
     niCA :: !(Maybe Text)
   }
@@ -52,19 +51,18 @@ keyNarHash = "NarHash"
 keyNarSize = "NarSize"
 keyReferences = "References"
 
-keyDeriver, keySystem, keySig, keyCA :: Text
+keyDeriver, keySig, keyCA :: Text
 keyDeriver = "Deriver"
-keySystem = "System"
 keySig = "Sig"
 keyCA = "CA"
 
--- | Key-value separator in narinfo format.
+-- | Key-value separator used when rendering narinfo lines.
 kvSeparator :: Text
 kvSeparator = ": "
 
--- | Length of the key-value separator.
-kvSeparatorLen :: Int
-kvSeparatorLen = 2
+-- | Field delimiter used when parsing (Nix splits on the first colon).
+fieldColon :: Text
+fieldColon = ":"
 
 -- ---------------------------------------------------------------------------
 -- Parsing
@@ -92,7 +90,6 @@ parseNarInfo txt = do
         niNarSize = narSize,
         niReferences = parseRefs (lookupFirst keyReferences kvs),
         niDeriver = lookupFirst keyDeriver kvs,
-        niSystem = lookupFirst keySystem kvs,
         niSigs = lookupAll keySig kvs,
         niCA = lookupFirst keyCA kvs
       }
@@ -122,7 +119,6 @@ renderNarInfo ni =
       kv keyReferences (T.unwords (niReferences ni))
     ]
       ++ optionalKV keyDeriver (niDeriver ni)
-      ++ optionalKV keySystem (niSystem ni)
       ++ map (kv keySig) (niSigs ni)
       ++ optionalKV keyCA (niCA ni)
 
@@ -131,11 +127,18 @@ renderNarInfo ni =
 -- ---------------------------------------------------------------------------
 
 -- | Parse a single @Key: Value@ line.
+--
+-- Splits on the first colon (matching Nix), strips a single leading space
+-- from the value, and tolerates a trailing carriage return so CRLF-terminated
+-- narinfo from other tools parses correctly.
 parseLine :: Text -> Maybe (Text, Text)
-parseLine line = case T.breakOn kvSeparator line of
+parseLine rawLine = case T.breakOn fieldColon line of
   (_, rest)
     | T.null rest -> Nothing
-  (key, rest) -> Just (key, T.drop kvSeparatorLen rest)
+  (key, rest) -> Just (key, dropLeadingSpace (T.drop 1 rest))
+  where
+    line = T.dropWhileEnd (== '\r') rawLine
+    dropLeadingSpace value = fromMaybe value (T.stripPrefix " " value)
 
 -- | Render a key-value pair.
 kv :: Text -> Text -> Text
