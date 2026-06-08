@@ -17,6 +17,7 @@
 | Module | Purpose |
 | --- | --- |
 | `NovaCache.Base32` | Nix-specific base32 (`0123456789abcdfghijklmnpqrsvwxyz` alphabet) |
+| `NovaCache.Base64` | Standard base64 encode/decode (re-exported) |
 | `NovaCache.Hash` | SHA-256 hashing, formatted as `sha256:<nix-base32>` |
 | `NovaCache.StorePath` | Store path parsing and rendering with validated hashes |
 | `NovaCache.NAR` | NAR archive serialization and deserialization |
@@ -128,6 +129,6 @@ cabal build --ghc-options=-Werror    # warnings as errors
 cabal build --flag server            # with the server
 ```
 
-## License
+---
 
-BSD-3-Clause. © [Novavero AI](https://github.com/Novavero-AI)
+<p align="center"><sub>BSD-3-Clause · <a href="https://github.com/Novavero-AI">Novavero AI</a></sub></p>
