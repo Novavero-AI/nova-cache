@@ -137,7 +137,7 @@ jobs:
           chmod 600 ~/.ssh/oci_key
           cat >> ~/.ssh/config <<'SSHCFG'
           Host anv26
-            HostName anv26.novavero.ai
+            HostName ${{ secrets.OCI_HOST }}
             User ubuntu
             IdentityFile ~/.ssh/oci_key
             ProxyCommand cloudflared access ssh --hostname %h
