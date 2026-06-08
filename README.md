@@ -20,7 +20,7 @@
 A focused, minimal library implementing the full Nix binary cache protocol:
 
 - **Base32** — Nix-specific encoding with the custom `0123456789abcdfghijklmnpqrsvwxyz` alphabet, O(n) ST-based decode
-- **Hash** — SHA-256 hashing with `sha256:<nix-base32>` formatting, composition pipeline over crypton
+- **Hash** — SHA-256 hashing with `sha256:<nix-base32>` formatting (via crypton)
 - **StorePath** — Store path parsing, validation, and hash extraction with enforced invariants via newtypes
 - **NAR** — Binary serialization and deserialization of the Nix ARchive format using `Builder` monoid composition
 - **NarInfo** — Parse and render the key-value narinfo text format
@@ -295,10 +295,7 @@ nix build --substituters http://cache.example.com --trusted-public-keys "mykey:b
   └──────────────────────────────────────────────────────┘
 ```
 
-- **10 modules**, 8 pure + 2 at the IO boundary (Compression optional via flag)
-- **75 core tests + 4 compression tests**, hand-rolled harness, no framework dependencies
-- **Zero partial functions** — total by construction
-- **Strict by default** — bang patterns on all data fields
+Functions are total and data fields are strict throughout.
 
 ---
 
