@@ -19,9 +19,10 @@ module NovaCache.Store
   )
 where
 
-import Control.Exception (SomeException, catch, onException)
+import Control.Exception (IOException, SomeException, catch, onException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Directory
@@ -159,19 +160,37 @@ getCacheInfo fs = (fsStoreDir fs, True, fsPriority fs)
 -- Path sanitization
 -- ---------------------------------------------------------------------------
 
--- | Validate a path component for safe filesystem use.
+-- | Validate a path component for safe filesystem use via a positive allowlist.
 --
--- Rejects components containing directory separators (@\/@, @\\@),
--- traversal sequences (@..@), or empty strings. Returns 'Just' the
--- sanitized 'FilePath' on success, 'Nothing' on rejection.
+-- Accepts only non-empty names of @[A-Za-z0-9._+-]@ that do not start with a
+-- dot and are not a Windows reserved device name. This rejects directory
+-- separators, @.@\/@..@ traversal, dotfiles (including the temp-write prefix),
+-- NUL bytes, alternate-data-stream (@name:stream@) syntax, and device names
+-- like @nul@ — so a client-supplied hash or NAR filename can never escape the
+-- store directory or resolve to a device, on any platform.
 sanitizePath :: Text -> Maybe FilePath
 sanitizePath txt
   | T.null txt = Nothing
-  | T.any isPathSeparator txt = Nothing
-  | txt == ".." = Nothing
+  | T.isPrefixOf "." txt = Nothing
+  | T.any (not . isSafeChar) txt = Nothing
+  | isReservedName txt = Nothing
   | otherwise = Just (T.unpack txt)
   where
-    isPathSeparator c = c == '/' || c == '\\'
+    isSafeChar c =
+      isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-+" :: [Char])
+
+-- | Is the name a Windows reserved device (@con@, @prn@, @aux@, @nul@,
+-- @com1@-@com9@, @lpt1@-@lpt9@)? Matched case-insensitively on the portion
+-- before the first dot, since @nul.txt@ also opens the device. Enforced on
+-- every platform so a Windows-hosted cache is safe too.
+isReservedName :: Text -> Bool
+isReservedName txt = T.toLower (T.takeWhile (/= '.') txt) `elem` reservedNames
+  where
+    reservedNames =
+      ["con", "prn", "aux", "nul"]
+        ++ ["com" <> n | n <- digits]
+        ++ ["lpt" <> n | n <- digits]
+    digits = [T.pack (show n) | n <- [1 .. 9 :: Int]]
 
 -- ---------------------------------------------------------------------------
 -- Internal
@@ -205,9 +224,17 @@ ignoringExceptions action = action `catch` silenceException
     silenceException _ = pure ()
 
 -- | Read a file if it exists, returning 'Nothing' otherwise.
+--
+-- Any I/O error (bad permissions, a race with deletion, a name that slips
+-- through validation) is treated as absence rather than propagating and
+-- crashing the request handler.
 readIfExists :: FilePath -> IO (Maybe ByteString)
-readIfExists path = do
-  exists <- doesFileExist path
-  if exists
-    then Just <$> BS.readFile path
-    else pure Nothing
+readIfExists path = readExisting `catch` ignoreIOError
+  where
+    readExisting = do
+      exists <- doesFileExist path
+      if exists
+        then Just <$> BS.readFile path
+        else pure Nothing
+    ignoreIOError :: IOException -> IO (Maybe ByteString)
+    ignoreIOError _ = pure Nothing

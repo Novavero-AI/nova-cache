@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0.0 — 2026-06-08
+
+### Breaking changes
+
+- **`NarInfo` drops the `niSystem` field** — `System` is not part of the Nix
+  narinfo wire format (Nix ignores unknown keys), so it is removed from the
+  exported record and `renderNarInfo` no longer emits a `System:` line.
+
+### Security
+
+- **API key required for writes** — the server refuses to start when
+  `CACHE_API_KEY` is unset, unless `--allow-open-writes` is passed explicitly,
+  so a missing environment variable can no longer leave the cache
+  world-writable.
+- **Streaming request-body cap** — request bodies are read in bounded chunks
+  with a running size check, so an unsized (chunked) upload can no longer
+  buffer past the 100 MB limit into memory before it is rejected.
+- **Stricter path validation** — `sanitizePath` now accepts only
+  `[A-Za-z0-9._+-]` names that are neither dotfiles nor Windows reserved device
+  names (`nul`, `con`, `com1`…), rejecting device access, alternate-data-stream
+  syntax, and the temporary-write prefix in addition to traversal.
+- **No internal detail in error responses** — store reads tolerate I/O errors
+  (treated as absence) and any uncaught handler exception maps to a plain 500,
+  so filesystem paths and error text are never returned to clients.
+
+### Bug fixes
+
+- **CRLF-tolerant narinfo parsing** — lines are split on the first colon with a
+  trailing carriage return stripped, so narinfo produced by other tools (or
+  with `\r\n` line endings) parses correctly instead of corrupting text fields
+  or rejecting valid integer fields.
+
 ## 0.3.2.1 — 2026-03-18
 
 - Replace partial `decodeUtf8` with total `decodeLatin1` in `Base64.encode`
