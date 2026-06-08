@@ -102,15 +102,14 @@ resolves runtime paths via `nix-build`, diffs against the server's
 
 Inputs: `cache-url` and `api-key` (required); `paths` and `parallel` (optional).
 
-## Build
+## Build & test
 
 ```bash
-cabal build                          # library
-cabal build -f-compression           # without liblzma
-cabal test                           # tests
-cabal build --ghc-options=-Werror    # warnings as errors
-cabal build --flag server            # with the server
+cabal build
+cabal test
 ```
+
+Optional flags: `-f-compression` skips the `liblzma` dependency, and `--flag server` builds the cache server. Requires GHC 9.8+ and cabal-install 3.10+.
 
 ---
 
