@@ -1,14 +1,16 @@
-# nova-cache
+<div align="center">
+<h1>nova-cache</h1>
+<p><strong>The Nix binary cache protocol, in Haskell.</strong></p>
+<p>nix-base32, NAR archives, narinfo, store paths, and Ed25519 signing — with an optional WAI cache server. A pure core; IO is confined to the compression, storage, and server boundaries.</p>
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
 ![GHC](https://img.shields.io/badge/GHC-9.8-purple)
 ![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 
-A Haskell implementation of the Nix binary cache protocol — nix-base32, NAR
-archives, narinfo, store paths, and Ed25519 signing — with an optional WAI
-cache server. The core is pure; IO is confined to the compression, storage,
-and server boundaries.
+</div>
+
+---
 
 ## Modules
 
