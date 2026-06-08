@@ -12,23 +12,6 @@
 
 ---
 
-## Modules
-
-| Module | Purpose |
-| --- | --- |
-| `NovaCache.Base32` | Nix-specific base32 (`0123456789abcdfghijklmnpqrsvwxyz` alphabet) |
-| `NovaCache.Base64` | Standard base64 encode/decode (re-exported) |
-| `NovaCache.Hash` | SHA-256 hashing, formatted as `sha256:<nix-base32>` |
-| `NovaCache.StorePath` | Store path parsing and rendering with validated hashes |
-| `NovaCache.NAR` | NAR archive serialization and deserialization |
-| `NovaCache.NarInfo` | `.narinfo` text format parsing and rendering |
-| `NovaCache.Signing` | Ed25519 fingerprint signing and verification |
-| `NovaCache.Validate` | Field, content-hash, and signature validation (all errors collected) |
-| `NovaCache.Compression` | xz compression (behind the `compression` flag) |
-| `NovaCache.Store` | Filesystem storage backend for narinfo and NAR files |
-
-The full API is documented on [Hackage](https://hackage.haskell.org/package/nova-cache).
-
 ## Installation
 
 ```cabal
