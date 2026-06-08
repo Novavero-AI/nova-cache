@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Exception (SomeException)
 import Data.Bifunctor (first)
 import Data.ByteArray (constEq)
 import qualified Data.ByteString as BS
@@ -16,12 +17,12 @@ import Network.Wai
     RequestBodyLength (..),
     Response,
     ResponseReceived,
+    getRequestBodyChunk,
     pathInfo,
     requestBodyLength,
     requestHeaders,
     requestMethod,
     responseLBS,
-    strictRequestBody,
   )
 import qualified Network.Wai.Handler.Warp as Warp
 import Network.Wai.Middleware.RequestLogger (logStdout)
@@ -30,6 +31,7 @@ import NovaCache.Signing (SecretKey, parseSecretKey, sign)
 import NovaCache.Store (FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
 import NovaCache.Validate (validateNarInfo)
 import System.Environment (getArgs, lookupEnv)
+import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 import Text.Read (readMaybe)
 
@@ -91,6 +93,7 @@ main = do
       storeRoot = case args of
         ("--store" : s : _) -> s
         _ -> fromMaybe defaultStoreRoot storeEnv
+      allowOpenWrites = "--allow-open-writes" `elem` args
 
   store <- newFileStore storeRoot
   sigKey <- loadSigningKey sigKeyPath
@@ -110,7 +113,24 @@ main = do
   putStrLn ("signing: " ++ maybe "disabled" (const "enabled") sigKey)
   putStrLn ("write auth: " ++ maybe "disabled (open writes!)" (const "enabled") (cfgApiKey cfg))
   putStrLn ("request logging: " ++ if logRequests then "enabled" else "disabled (LOG_REQUESTS=0)")
-  Warp.run port (requestLogger (app cfg))
+
+  case cfgApiKey cfg of
+    Nothing
+      | not allowOpenWrites -> do
+          hPutStrLn stderr $
+            "FATAL: "
+              ++ apiKeyEnvVar
+              ++ " is not set — refusing to start with unauthenticated writes. "
+              ++ "Set "
+              ++ apiKeyEnvVar
+              ++ ", or pass --allow-open-writes to override (not recommended on a public host)."
+          exitFailure
+    _ -> pure ()
+
+  let settings =
+        Warp.setPort port $
+          Warp.setOnExceptionResponse onExceptionResponse Warp.defaultSettings
+  Warp.runSettings settings (requestLogger (app cfg))
 
 -- | Load a signing key from a file, if configured.
 loadSigningKey :: Maybe FilePath -> IO (Maybe SecretKey)
@@ -212,11 +232,20 @@ readBodyLimited :: Request -> IO (Maybe BS.ByteString)
 readBodyLimited req = case requestBodyLength req of
   KnownLength len
     | len > fromIntegral maxBodySize -> pure Nothing
-  _ -> do
-    body <- BL.toStrict <$> strictRequestBody req
-    if BS.length body > maxBodySize
-      then pure Nothing
-      else pure (Just body)
+  _ -> readChunks [] 0
+  where
+    -- Stream the body in chunks, aborting as soon as the running total
+    -- exceeds the cap — so an unsized (chunked) upload can never buffer
+    -- more than 'maxBodySize' into memory.
+    readChunks acc total = do
+      chunk <- getRequestBodyChunk req
+      if BS.null chunk
+        then pure (Just (BS.concat (reverse acc)))
+        else
+          let newTotal = total + BS.length chunk
+           in if newTotal > maxBodySize
+                then pure Nothing
+                else readChunks (chunk : acc) newTotal
 
 -- | Run an action with the limited request body, responding 413 if too large.
 withLimitedBody :: Request -> (Response -> IO ResponseReceived) -> (BS.ByteString -> IO ResponseReceived) -> IO ResponseReceived
@@ -312,6 +341,11 @@ notFound = responseLBS HTTP.status404 textHeaders "not found"
 -- | 400 Bad Request with a text error message.
 badRequest :: Text -> Response
 badRequest msg = responseLBS HTTP.status400 textHeaders (BL.fromStrict (TE.encodeUtf8 msg))
+
+-- | Map any uncaught handler exception to a generic 500, so internal error
+-- detail (filesystem paths, exception text) is never leaked to clients.
+onExceptionResponse :: SomeException -> Response
+onExceptionResponse _ = responseLBS HTTP.status500 textHeaders "internal server error"
 
 -- | Content-Type: text/plain headers.
 textHeaders :: HTTP.ResponseHeaders
