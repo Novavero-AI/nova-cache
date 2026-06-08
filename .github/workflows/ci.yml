@@ -115,7 +115,7 @@ jobs:
   deploy-server:
     name: Deploy Server
     needs: [build]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/deploy-via-access') && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to OCI
