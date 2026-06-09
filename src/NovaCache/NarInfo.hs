@@ -14,6 +14,7 @@ import Data.List (find)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Read as TR
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -163,10 +164,13 @@ require key kvs = case lookupFirst key kvs of
   Nothing -> Left ("missing required key: " ++ T.unpack key)
   Just val -> Right val
 
--- | Parse an integer value from text.
+-- | Parse a non-negative base-10 integer, matching C++ Nix's narinfo parser.
+-- Uses 'TR.decimal' (not 'reads', which also accepts hex/octal/leading space)
+-- and requires the whole field to be consumed, so a non-canonical value cannot
+-- slip through and then be re-signed under the cache's key.
 parseInteger :: Text -> Text -> Either String Integer
-parseInteger key txt = case reads (T.unpack txt) of
-  [(n, "")] -> Right n
+parseInteger key txt = case TR.decimal txt of
+  Right (n, rest) | T.null rest -> Right n
   _ -> Left ("invalid integer for " ++ T.unpack key ++ ": " ++ T.unpack txt)
 
 -- | Show a value as 'Text'.
