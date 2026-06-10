@@ -107,6 +107,8 @@ parseBaseName :: Text -> Either String StorePath
 parseBaseName basename
   | T.length basename < minBaseNameLen =
       Left ("store path too short: " ++ T.unpack basename)
+  -- Safe: minBaseNameLen = storePathHashLen + 1, so the length guard above
+  -- guarantees index storePathHashLen is in bounds.
   | T.index basename storePathHashLen /= hashNameSeparator =
       Left ("expected '-' after hash in store path: " ++ T.unpack basename)
   | not (T.all isBase32Char hashPart) =

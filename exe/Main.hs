@@ -87,12 +87,15 @@ main = do
   sigKeyPath <- lookupEnv signingKeyEnvVar
   logRequestsEnv <- lookupEnv requestLogEnvVar
 
-  let port = case args of
-        ("--port" : p : _) -> fromMaybe defaultPort (readMaybe p)
-        _ -> maybe defaultPort (fromMaybe defaultPort . readMaybe) portEnv
-      storeRoot = case args of
-        ("--store" : s : _) -> s
-        _ -> fromMaybe defaultStoreRoot storeEnv
+  -- Order-independent flag parsing: take the value following a flag wherever it
+  -- appears, so e.g. `--allow-open-writes --port 8080` still honours --port.
+  let argValue flag = case dropWhile (/= flag) args of
+        (_ : v : _) -> Just v
+        _ -> Nothing
+      port = case argValue "--port" >>= readMaybe of
+        Just p -> p
+        Nothing -> maybe defaultPort (fromMaybe defaultPort . readMaybe) portEnv
+      storeRoot = fromMaybe (fromMaybe defaultStoreRoot storeEnv) (argValue "--store")
       allowOpenWrites = "--allow-open-writes" `elem` args
 
   store <- newFileStore storeRoot
