@@ -28,7 +28,7 @@ import qualified Network.Wai.Handler.Warp as Warp
 import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (SecretKey, parseSecretKey, sign)
-import NovaCache.Store (FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
+import NovaCache.Store (CacheInfo (..), FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
 import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
 import System.Environment (getArgs, lookupEnv)
@@ -350,12 +350,12 @@ logWarn req msg =
 -- | Render the nix-cache-info response body.
 renderCacheInfo :: FileStore -> BS.ByteString
 renderCacheInfo store =
-  let (storeDir, wantMassQuery, priority) = getCacheInfo store
+  let info = getCacheInfo store
    in TE.encodeUtf8 $
         T.unlines
-          [ "StoreDir: " <> storeDir,
-            "WantMassQuery: " <> boolText wantMassQuery,
-            "Priority: " <> T.pack (show priority)
+          [ "StoreDir: " <> ciStoreDir info,
+            "WantMassQuery: " <> boolText (ciWantMassQuery info),
+            "Priority: " <> T.pack (show (ciPriority info))
           ]
 
 -- | Render a Bool as @1@ or @0@.

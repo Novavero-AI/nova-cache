@@ -53,7 +53,9 @@ data NarEntry
     NarRegular !Bool !ByteString
   | -- | Symbolic link: target path.
     NarSymlink !Text
-  | -- | Directory: sorted list of (name, entry) pairs.
+  | -- | Directory: list of (name, entry) pairs.  Names must be unique; the
+    -- serializer sorts them and 'deserialise' rejects duplicate or
+    -- out-of-order names.
     NarDirectory ![(Text, NarEntry)]
   deriving (Eq, Show)
 
@@ -370,7 +372,12 @@ buildRegularFile path = do
       contents <- BS.readFile path
       isExec <- checkExecutable path
       pure (NarRegular isExec contents)
-    else pure (NarRegular False BS.empty)
+    else
+      -- Not a symlink, directory, or regular file: a special file (FIFO,
+      -- socket, device) or a path that vanished mid-walk.  Fail loudly rather
+      -- than fabricating an empty regular (which would silently change the NAR
+      -- and its hash) — matching Nix, which aborts on unsupported types.
+      fail ("serialiseFromPath: not a regular file (special or vanished): " ++ path)
 
 -- | Check whether a file has the executable permission set.
 -- Uses 'System.Directory.getPermissions' which is cross-platform:
