@@ -84,7 +84,7 @@ A public instance runs at `cache.novavero.ai`:
 
 ```
 extra-substituters = https://cache.novavero.ai
-extra-trusted-public-keys = cache.novavero.ai-1:2yJK0UZWlDDTpThzEdqfGWaj+j3ljOCGoA50Ims47dM=
+extra-trusted-public-keys = cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
 ```
 
 ## Build & test
