@@ -17,6 +17,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (ord)
+import Data.STRef (newSTRef, readSTRef, writeSTRef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Vector.Unboxed (Vector)
@@ -129,7 +130,7 @@ decode txt
   | T.null txt = Right BS.empty
   | otherwise = do
       values <- traverse lookupChar (T.unpack txt)
-      Right (scatterDecode values inputLen outputLen)
+      scatterDecode values inputLen outputLen
   where
     inputLen = T.length txt
     outputLen = (inputLen * bitsPerChar) `div` bitsPerByte
@@ -148,30 +149,39 @@ lookupChar c
 --
 -- O(n) in the number of input characters. Each character contributes
 -- exactly 5 bits, placed at the correct byte and bit offset.
-scatterDecode :: [Word8] -> Int -> Int -> ByteString
+scatterDecode :: [Word8] -> Int -> Int -> Either String ByteString
 scatterDecode values inputLen outputLen = runST $ do
   arr <- MV.replicate outputLen (0 :: Word8)
-  scatterAll arr 0 values
-  frozen <- V.unsafeFreeze arr
-  pure (BS.pack (V.toList frozen))
+  canonical <- newSTRef True
+  scatterAll arr canonical 0 values
+  ok <- readSTRef canonical
+  if ok
+    then do
+      frozen <- V.unsafeFreeze arr
+      pure (Right (BS.pack (V.toList frozen)))
+    else pure (Left "non-canonical nix-base32: padding bits must be zero")
   where
-    scatterAll _ !_ [] = pure ()
-    scatterAll arr !n (c5 : rest) = do
+    scatterAll _ _ !_ [] = pure ()
+    scatterAll arr canonical !n (c5 : rest) = do
       let bitsStart = bitsPerChar * (inputLen - 1 - n)
-      scatterBits arr c5 bitsStart 0
-      scatterAll arr (n + 1) rest
+      scatterBits arr canonical c5 bitsStart 0
+      scatterAll arr canonical (n + 1) rest
 
-    scatterBits arr c5 bitsStart !bit
+    scatterBits arr canonical c5 bitsStart !bit
       | bit >= bitsPerChar = pure ()
       | otherwise = do
           let b = bitsStart + bit
               byteIdx = b `shiftR` 3
               bitIdx = b .&. byteAlignMask
               bitVal = (c5 `shiftR` bit) .&. 1
-          when (byteIdx < outputLen) $ do
-            old <- MV.unsafeRead arr byteIdx
-            MV.unsafeWrite arr byteIdx (old .|. (bitVal `shiftL` bitIdx))
-          scatterBits arr c5 bitsStart (bit + 1)
+          if byteIdx < outputLen
+            then do
+              old <- MV.unsafeRead arr byteIdx
+              MV.unsafeWrite arr byteIdx (old .|. (bitVal `shiftL` bitIdx))
+            -- A set bit landing outside the output is a non-canonical encoding
+            -- (Nix requires these padding bits to be zero); reject it.
+            else when (bitVal /= 0) (writeSTRef canonical False)
+          scatterBits arr canonical c5 bitsStart (bit + 1)
 
 invalidCharMsg :: Char -> String
 invalidCharMsg c = "invalid nix-base32 character: " ++ [c]
