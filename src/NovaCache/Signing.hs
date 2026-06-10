@@ -158,12 +158,17 @@ sign (SecretKey keyName secretBytes) ni = do
 
 -- | Verify a @keyname:base64sig@ signature against a narinfo and public key.
 --
--- Returns 'False' for any malformed input rather than failing.
+-- The signature's key name must match this key's name (Nix looks the public key
+-- up BY name) before the Ed25519 check runs.  Returns 'False' for any malformed
+-- or non-matching input rather than failing.
 verify :: PublicKey -> NarInfo -> Text -> Bool
-verify (PublicKey _ pubBytes) ni sigLine =
-  case extractSignaturePayload sigLine of
-    Nothing -> False
-    Just sigRaw -> verifyRaw pubBytes (TE.encodeUtf8 (fingerprint ni)) sigRaw
+verify (PublicKey trustedName pubBytes) ni sigLine =
+  case T.breakOn keySeparator sigLine of
+    (sigName, sigRest)
+      | T.null sigRest || sigName /= trustedName -> False
+      | otherwise -> case extractSignaturePayload sigLine of
+          Nothing -> False
+          Just sigRaw -> verifyRaw pubBytes (TE.encodeUtf8 (fingerprint ni)) sigRaw
 
 -- | Extract the raw signature bytes from a @keyname:base64sig@ line.
 extractSignaturePayload :: Text -> Maybe ByteString

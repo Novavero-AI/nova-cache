@@ -14,6 +14,7 @@ module NovaCache.Store
     readNar,
     writeNar,
     listNarInfoHashes,
+    CacheInfo (..),
     getCacheInfo,
     sanitizePath,
   )
@@ -152,9 +153,26 @@ listNarInfoHashes fs =
 -- Cache metadata
 -- ---------------------------------------------------------------------------
 
--- | Cache metadata: (storeDir, wantMassQuery, priority).
-getCacheInfo :: FileStore -> (Text, Bool, Int)
-getCacheInfo fs = (fsStoreDir fs, True, fsPriority fs)
+-- | Cache metadata for the @nix-cache-info@ response.
+data CacheInfo = CacheInfo
+  { ciStoreDir :: !Text,
+    ciWantMassQuery :: !Bool,
+    ciPriority :: !Int
+  }
+  deriving (Eq, Show)
+
+-- | This file-backed cache answers mass-query (path-existence) requests.
+defaultWantMassQuery :: Bool
+defaultWantMassQuery = True
+
+-- | Read the cache's metadata.
+getCacheInfo :: FileStore -> CacheInfo
+getCacheInfo fs =
+  CacheInfo
+    { ciStoreDir = fsStoreDir fs,
+      ciWantMassQuery = defaultWantMassQuery,
+      ciPriority = fsPriority fs
+    }
 
 -- ---------------------------------------------------------------------------
 -- Path sanitization

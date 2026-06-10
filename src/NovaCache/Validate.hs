@@ -97,21 +97,23 @@ validateNarInfo ni =
 -- the declared 'niNarHash'.
 validateNarHash :: NarInfo -> ByteString -> Either ValidationError ()
 validateNarHash ni narBytes =
-  let actual = formatNixHash (hashBytes narBytes)
-      expected = niNarHash ni
-   in if expected == actual
-        then Right ()
-        else Left (NarHashMismatch expected actual)
+  -- Compare DECODED hash bytes, not re-formatted strings, so any valid encoding
+  -- of the declared NarHash (SRI, hex, base32) validates against the same digest.
+  case parseNixHash (niNarHash ni) of
+    Left err -> Left (InvalidNarHash (niNarHash ni) err)
+    Right declared
+      | declared == hashBytes narBytes -> Right ()
+      | otherwise -> Left (NarHashMismatch (niNarHash ni) (formatNixHash (hashBytes narBytes)))
 
 -- | Validate that the SHA-256 hash of compressed file bytes matches
 -- the declared 'niFileHash'.
 validateFileHash :: NarInfo -> ByteString -> Either ValidationError ()
 validateFileHash ni fileBytes =
-  let actual = formatNixHash (hashBytes fileBytes)
-      expected = niFileHash ni
-   in if expected == actual
-        then Right ()
-        else Left (FileHashMismatch expected actual)
+  case parseNixHash (niFileHash ni) of
+    Left err -> Left (InvalidFileHash (niFileHash ni) err)
+    Right declared
+      | declared == hashBytes fileBytes -> Right ()
+      | otherwise -> Left (FileHashMismatch (niFileHash ni) (formatNixHash (hashBytes fileBytes)))
 
 -- ---------------------------------------------------------------------------
 -- Signature validation

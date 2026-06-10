@@ -531,11 +531,11 @@ testFileStore =
       test "cacheInfo defaults" $ do
         tmpDir <- createTestDir
         store <- Store.newFileStore tmpDir
-        let (storeDir, wantMass, priority) = Store.getCacheInfo store
+        let info = Store.getCacheInfo store
         removeDirectoryRecursive tmpDir
-        ok1 <- assertEqual "storeDir" "/nix/store" storeDir
-        ok2 <- assertTrue "wantMassQuery" wantMass
-        ok3 <- assertEqual "priority" 50 priority
+        ok1 <- assertEqual "storeDir" "/nix/store" (Store.ciStoreDir info)
+        ok2 <- assertTrue "wantMassQuery" (Store.ciWantMassQuery info)
+        ok3 <- assertEqual "priority" 50 (Store.ciPriority info)
         pure (ok1 && ok2 && ok3),
       test "sanitizePath rejects traversal" $
         assertEqual "dotdot" Nothing (Store.sanitizePath ".."),
