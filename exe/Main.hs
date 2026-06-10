@@ -383,13 +383,17 @@ landingHtml info signingEnabled pathCount =
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />",
       "<title>cache.novavero.ai - Nix binary cache</title>",
       "<meta name=\"description\" content=\"The Novavero Nix binary cache, serving store paths for nova-nix — the Windows-native Nix.\" />",
+      "<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml," <> novaveroLogoSvgEscaped <> "\" />",
       "<style>",
       "* { margin: 0; padding: 0; box-sizing: border-box; }",
       "body { background: #000; color: #d1d5db; font-family: 'Inter', system-ui, sans-serif; line-height: 1.7; }",
-      ".container { max-width: 720px; margin: 0 auto; padding: 80px 24px; }",
+      "body::before { content: ''; position: fixed; inset: 0 0 auto 0; height: 320px; pointer-events: none; background: radial-gradient(ellipse 70% 100% at 50% -20%, rgba(52,211,153,0.07), transparent 70%); }",
+      ".container { max-width: 720px; margin: 0 auto; padding: 80px 24px; position: relative; }",
       "a { color: #34d399; text-decoration: none; }",
       "a:hover { text-decoration: underline; }",
-      "h1 { color: #fff; font-size: 1.6rem; margin-bottom: 0.5rem; font-family: ui-monospace, Consolas, monospace; }",
+      ".brand { display: flex; align-items: center; gap: 14px; margin-bottom: 0.75rem; }",
+      ".brand svg { width: 44px; height: 44px; border-radius: 10px; }",
+      "h1 { color: #fff; font-size: 1.6rem; font-family: ui-monospace, Consolas, monospace; }",
       ".tagline { color: #9ca3af; margin-bottom: 2.5rem; }",
       ".stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 2.5rem; }",
       ".stat { padding: 16px; border: 1px solid #1f2937; border-radius: 12px; text-align: center; }",
@@ -404,7 +408,7 @@ landingHtml info signingEnabled pathCount =
       "</head>",
       "<body>",
       "<div class=\"container\">",
-      "<h1>cache.novavero.ai</h1>",
+      "<div class=\"brand\">" <> novaveroLogoSvg <> "<h1>cache.novavero.ai</h1></div>",
       "<p class=\"tagline\">Nix binary cache — serving store paths for <a href=\"https://github.com/Novavero-AI/nova-nix\">nova-nix</a>, the Windows-native Nix.</p>",
       "<div class=\"stats\">",
       "<div class=\"stat\"><div class=\"value\">" <> T.pack (show pathCount) <> "</div><div class=\"label\">store paths</div></div>",
@@ -421,6 +425,27 @@ landingHtml info signingEnabled pathCount =
       "</body>",
       "</html>"
     ]
+
+-- | The Novavero mark (the novavero.ai favicon), inlined so the page stays
+-- a single self-contained response with no external assets.
+novaveroLogoSvg :: Text
+novaveroLogoSvg =
+  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\" role=\"img\" aria-label=\"Novavero\">"
+    <> "<g fill=\"#0a0f1a\"><rect width=\"64\" height=\"64\" rx=\"14\" ry=\"14\"/></g>"
+    <> "<g fill=\"#ffffff\"><path d=\"M12 54L19 54L23 10L16 10Z\"/><path d=\"M16 10L23 10L48 54L41 54Z\"/><path d=\"M41 54L48 54L52 10L45 10Z\"/></g>"
+    <> "</svg>"
+
+-- | The same mark, URL-escaped for a data-URI favicon link.
+novaveroLogoSvgEscaped :: Text
+novaveroLogoSvgEscaped =
+  T.concatMap escapeForDataUri novaveroLogoSvg
+  where
+    escapeForDataUri c = case c of
+      '<' -> "%3C"
+      '>' -> "%3E"
+      '"' -> "%22"
+      '#' -> "%23"
+      other -> T.singleton other
 
 -- | Content-Type and caching headers for the landing page.  Stats change as
 -- paths are added, so it stays briefly cacheable but revalidates.
