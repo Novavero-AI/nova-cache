@@ -144,8 +144,10 @@ jobs:
             StrictHostKeyChecking accept-new
           SSHCFG
 
-          # Render service file with API key from GitHub secret
-          cat > /tmp/nova-cache.service <<EOF
+          # Render the service unit.  The API key is not embedded in the
+          # unit: systemd loads it from /etc/nix-cache/env (written below,
+          # root-only), so the unit file carries no credentials.
+          cat > /tmp/nova-cache.service <<'EOF'
           [Unit]
           Description=Nova Cache Server
           After=network.target
@@ -159,14 +161,20 @@ jobs:
           RestartSec=5
           Environment=PORT=5000
           Environment=NIX_CACHE_DIR=/var/lib/nix-cache
-          Environment=CACHE_API_KEY=${CACHE_API_KEY}
           Environment=SIGNING_KEY_FILE=/etc/nix-cache/secret-key
+          EnvironmentFile=/etc/nix-cache/env
 
           [Install]
           WantedBy=multi-user.target
           EOF
 
           scp /tmp/nova-cache.service anv26:/tmp/nova-cache.service
+
+          # Provision the API key as a root-only environment file.  The value
+          # travels over stdin, so it appears in no command line, no log, and
+          # no file on the runner.
+          printf 'CACHE_API_KEY=%s\n' "$CACHE_API_KEY" | ssh anv26 \
+            "sudo sh -c 'umask 077; mkdir -p /etc/nix-cache; cat > /etc/nix-cache/env; chown root:root /etc/nix-cache/env; chmod 600 /etc/nix-cache/env'"
 
           ssh anv26 "\
             source ~/.ghcup/env && \
