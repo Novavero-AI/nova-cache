@@ -166,7 +166,10 @@ deserialise :: ByteString -> Either String NarEntry
 deserialise bs = do
   (magic, rest) <- readStr bs
   expect tokMagic magic
-  fst <$> parseNode rest
+  (entry, rest2) <- parseNode rest
+  if BS.null rest2
+    then Right entry
+    else Left "trailing bytes after NAR root node"
 
 -- | Parse a single NAR node.
 parseNode :: NarParser NarEntry
@@ -204,10 +207,10 @@ parseRegular bs = do
           (rp, final) <- readStr afterContents
           expect tokRParen rp
           pure (NarRegular False contents, final)
-      | tok == tokRParen =
-          pure (NarRegular False BS.empty, rest)
       | otherwise =
-          Left ("expected 'executable', 'contents', or ')' in regular, got: " ++ show tok)
+          -- 'contents' is mandatory (even an empty file serialises with it), so
+          -- a regular node without it is malformed — reject, matching Nix.
+          Left ("expected 'executable' or 'contents' in regular, got: " ++ show tok)
 
 -- | Parse a symlink node.
 parseSymlink :: NarParser NarEntry
@@ -222,9 +225,9 @@ parseSymlink bs = do
 
 -- | Parse a directory node (zero or more child entries).
 parseDirectory :: NarParser NarEntry
-parseDirectory = go []
+parseDirectory = go Nothing []
   where
-    go !acc bs = do
+    go !prev !acc bs = do
       (tok, afterTok) <- readStr bs
       if tok == tokRParen
         then pure (NarDirectory (reverse acc), afterTok)
@@ -241,7 +244,20 @@ parseDirectory = go []
           (rp, afterRp) <- readStr afterEntry
           expect tokRParen rp
           decodedName <- decodeUtf8Safe entryName
-          go ((decodedName, entry) : acc) afterRp
+          _ <- checkName prev decodedName
+          go (Just decodedName) ((decodedName, entry) : acc) afterRp
+    -- NAR directory entries must have safe names in strictly increasing
+    -- (sorted, unique) order.  Enforcing this rejects malformed or hostile
+    -- archives, keeps @serialise . deserialise@ an identity, and forecloses the
+    -- path-traversal surface for any future NAR-extraction consumer.
+    checkName prev name
+      | T.null name = Left "empty NAR directory entry name"
+      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\0') name =
+          Left ("unsafe NAR directory entry name: " ++ T.unpack name)
+      | Just p <- prev,
+        name <= p =
+          Left ("NAR directory entries not strictly increasing: " ++ T.unpack name)
+      | otherwise = Right ()
 
 -- ---------------------------------------------------------------------------
 -- Wire primitives
