@@ -29,6 +29,7 @@ import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (SecretKey, parseSecretKey, sign)
 import NovaCache.Store (FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
+import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure)
@@ -59,9 +60,15 @@ signingKeyEnvVar = "SIGNING_KEY_FILE"
 requestLogEnvVar :: String
 requestLogEnvVar = "LOG_REQUESTS"
 
--- | Maximum allowed request body size (100 MB).
-maxBodySize :: Int
-maxBodySize = 100 * 1024 * 1024
+-- | Maximum narinfo request body — narinfo is small text, so a tight cap.
+maxNarInfoBodySize :: Int
+maxNarInfoBodySize = 4 * 1024 * 1024 -- 4 MB
+
+-- | Maximum NAR request body.  A real store path's NAR can be very large
+-- (toolchains, GHC, LLVM), so this is far higher than the narinfo cap while
+-- still bounding memory.
+maxNarBodySize :: Int
+maxNarBodySize = 4 * 1024 * 1024 * 1024 -- 4 GB
 
 -- ---------------------------------------------------------------------------
 -- Server configuration
@@ -182,23 +189,32 @@ app cfg req respond = case (requestMethod req, pathInfo req) of
   ("PUT", [hashNarinfo])
     | Just hashKey <- T.stripSuffix ".narinfo" hashNarinfo ->
         requireAuth cfg req respond $
-          withLimitedBody req respond $ \body ->
+          withLimitedBody maxNarInfoBodySize req respond $ \body ->
             case decodeAndValidate body of
               Left err -> do
                 logWarn req ("INVALID: " <> T.unpack err)
                 respond (badRequest err)
-              Right ni -> do
-                signed <- signNarInfo (cfgSigningKey cfg) ni
-                ok <- writeNarInfo (cfgStore cfg) hashKey signed
-                if ok
-                  then respond (responseLBS HTTP.status200 textHeaders "ok")
-                  else do
-                    logWarn req "BADPATH"
-                    respond (badRequest "invalid path")
+              Right ni
+                | not (narInfoHashMatches hashKey ni) -> do
+                    logWarn req "HASHMISMATCH"
+                    respond (badRequest "narinfo StorePath hash does not match request")
+                | otherwise -> do
+                    signedResult <- signNarInfo (cfgSigningKey cfg) ni
+                    case signedResult of
+                      Left err -> do
+                        logWarn req ("SIGNFAIL: " <> err)
+                        respond (responseLBS HTTP.status500 textHeaders "signing failed")
+                      Right signed -> do
+                        ok <- writeNarInfo (cfgStore cfg) hashKey signed
+                        if ok
+                          then respond (responseLBS HTTP.status200 textHeaders "ok")
+                          else do
+                            logWarn req "BADPATH"
+                            respond (badRequest "invalid path")
   -- PUT /nar/<file> (auth required)
   ("PUT", ["nar", fileName]) ->
     requireAuth cfg req respond $
-      withLimitedBody req respond $ \body -> do
+      withLimitedBody maxNarBodySize req respond $ \body -> do
         ok <- writeNar (cfgStore cfg) fileName body
         if ok
           then respond (responseLBS HTTP.status200 textHeaders "ok")
@@ -223,37 +239,45 @@ decodeAndValidate body = do
   ni <- first T.pack (parseNarInfo decoded)
   first (T.unlines . map (T.pack . show)) (validateNarInfo ni)
 
+-- | Whether the narinfo's declared StorePath actually carries the requested
+-- hash — so an authenticated writer cannot store a narinfo describing path X
+-- under path Y's key (a cache-poisoning / confused-deputy shape).
+narInfoHashMatches :: Text -> NarInfo -> Bool
+narInfoHashMatches hashKey ni =
+  case parseStorePath defaultStoreDir (niStorePath ni) of
+    Right sp -> storePathHashString sp == hashKey
+    Left _ -> False
+
 -- ---------------------------------------------------------------------------
 -- Request body limiting
 -- ---------------------------------------------------------------------------
 
--- | Read the request body, rejecting payloads over 'maxBodySize'.
+-- | Read the request body, rejecting payloads over the given limit.
 --
--- Returns 'Nothing' if the declared @Content-Length@ exceeds the limit.
--- For chunked transfers the body is read and checked after the fact.
-readBodyLimited :: Request -> IO (Maybe BS.ByteString)
-readBodyLimited req = case requestBodyLength req of
+-- A declared @Content-Length@ over the limit is rejected up front; otherwise
+-- (including unsized/chunked transfers) the body is read in bounded chunks with
+-- a running size check that aborts before exceeding the limit, so memory stays
+-- bounded regardless of the declared length.
+readBodyLimited :: Int -> Request -> IO (Maybe BS.ByteString)
+readBodyLimited limit req = case requestBodyLength req of
   KnownLength len
-    | len > fromIntegral maxBodySize -> pure Nothing
+    | len > fromIntegral limit -> pure Nothing
   _ -> readChunks [] 0
   where
-    -- Stream the body in chunks, aborting as soon as the running total
-    -- exceeds the cap — so an unsized (chunked) upload can never buffer
-    -- more than 'maxBodySize' into memory.
     readChunks acc total = do
       chunk <- getRequestBodyChunk req
       if BS.null chunk
         then pure (Just (BS.concat (reverse acc)))
         else
           let newTotal = total + BS.length chunk
-           in if newTotal > maxBodySize
+           in if newTotal > limit
                 then pure Nothing
                 else readChunks (chunk : acc) newTotal
 
 -- | Run an action with the limited request body, responding 413 if too large.
-withLimitedBody :: Request -> (Response -> IO ResponseReceived) -> (BS.ByteString -> IO ResponseReceived) -> IO ResponseReceived
-withLimitedBody req respond action = do
-  bodyResult <- readBodyLimited req
+withLimitedBody :: Int -> Request -> (Response -> IO ResponseReceived) -> (BS.ByteString -> IO ResponseReceived) -> IO ResponseReceived
+withLimitedBody limit req respond action = do
+  bodyResult <- readBodyLimited limit req
   case bodyResult of
     Nothing -> do
       logWarn req "OVERLIMIT"
@@ -287,17 +311,19 @@ requireAuth cfg req respond action = case cfgApiKey cfg of
 
 -- | Sign a validated 'NarInfo' if a signing key is configured.
 --
--- Logs a warning to stderr if signing fails, then returns the unsigned
--- rendering so the upload is not rejected.
-signNarInfo :: Maybe SecretKey -> NarInfo -> IO BS.ByteString
-signNarInfo Nothing ni = pure (renderNarInfoBytes ni)
+-- With no key, returns the unsigned rendering (intentional — the operator
+-- configured none).  With a key, FAILS CLOSED: a signing error returns 'Left'
+-- so the handler refuses the write rather than persisting an unsigned narinfo
+-- on a cache that is supposed to sign.
+signNarInfo :: Maybe SecretKey -> NarInfo -> IO (Either String BS.ByteString)
+signNarInfo Nothing ni = pure (Right (renderNarInfoBytes ni))
 signNarInfo (Just sk) ni = case sign sk ni of
   Left err -> do
-    hPutStrLn stderr ("WARNING: signNarInfo: sign failed: " ++ err)
-    pure (renderNarInfoBytes ni)
+    hPutStrLn stderr ("ERROR: signNarInfo: sign failed: " ++ err)
+    pure (Left err)
   Right sig ->
     let signed = ni {niSigs = niSigs ni ++ [sig]}
-     in pure (renderNarInfoBytes signed)
+     in pure (Right (renderNarInfoBytes signed))
 
 -- | Render a 'NarInfo' to its UTF-8 encoded wire format.
 renderNarInfoBytes :: NarInfo -> BS.ByteString
@@ -354,14 +380,14 @@ onExceptionResponse _ = responseLBS HTTP.status500 textHeaders "internal server 
 textHeaders :: HTTP.ResponseHeaders
 textHeaders = [(HTTP.hContentType, "text/plain")]
 
--- | Content-Type: application/x-nix-narinfo headers.
--- Narinfo files are content-addressed (keyed by store path hash) and
--- immutable once written, so they are safe to cache indefinitely at the
--- CDN edge.
+-- | Content-Type and caching headers for a narinfo response.
+-- A narinfo body is NOT immutable for a fixed key — re-uploading the same store
+-- path to add or rotate a signature changes it — so it is cacheable but must
+-- stay revalidatable (no @immutable@).
 narInfoHeaders :: HTTP.ResponseHeaders
 narInfoHeaders =
   [ (HTTP.hContentType, "text/x-nix-narinfo"),
-    (HTTP.hCacheControl, "public, max-age=31536000, immutable")
+    (HTTP.hCacheControl, "public, max-age=3600, must-revalidate")
   ]
 
 -- | Content-Type: application/octet-stream headers.
