@@ -6,7 +6,7 @@ import Data.ByteArray (constEq)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -160,6 +160,13 @@ loadSigningKey (Just path) = do
 -- | WAI application implementing the Nix binary cache HTTP protocol.
 app :: Config -> Application
 app cfg req respond = case (requestMethod req, pathInfo req) of
+  -- GET / — human-facing landing page (the protocol lives at the other routes)
+  ("GET", []) -> do
+    pathCount <- length <$> listNarInfoHashes (cfgStore cfg)
+    let info = getCacheInfo (cfgStore cfg)
+        signingEnabled = isJust (cfgSigningKey cfg)
+        body = TE.encodeUtf8 (landingHtml info signingEnabled pathCount)
+    respond (responseLBS HTTP.status200 htmlHeaders (BL.fromStrict body))
   -- GET /nix-cache-info
   ("GET", ["nix-cache-info"]) ->
     respond (responseLBS HTTP.status200 textHeaders (BL.fromStrict (renderCacheInfo (cfgStore cfg))))
@@ -362,6 +369,66 @@ renderCacheInfo store =
 boolText :: Bool -> Text
 boolText True = "1"
 boolText False = "0"
+
+-- | The landing page served at @GET /@.  Static apart from three live
+-- values (store-path count, store dir, signing status); styled to match
+-- novavero.ai.  No user input is interpolated, so no escaping is needed.
+landingHtml :: CacheInfo -> Bool -> Int -> Text
+landingHtml info signingEnabled pathCount =
+  T.unlines
+    [ "<!DOCTYPE html>",
+      "<html lang=\"en\">",
+      "<head>",
+      "<meta charset=\"UTF-8\" />",
+      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />",
+      "<title>cache.novavero.ai - Nix binary cache</title>",
+      "<meta name=\"description\" content=\"The Novavero Nix binary cache, serving store paths for nova-nix — the Windows-native Nix.\" />",
+      "<style>",
+      "* { margin: 0; padding: 0; box-sizing: border-box; }",
+      "body { background: #000; color: #d1d5db; font-family: 'Inter', system-ui, sans-serif; line-height: 1.7; }",
+      ".container { max-width: 720px; margin: 0 auto; padding: 80px 24px; }",
+      "a { color: #34d399; text-decoration: none; }",
+      "a:hover { text-decoration: underline; }",
+      "h1 { color: #fff; font-size: 1.6rem; margin-bottom: 0.5rem; font-family: ui-monospace, Consolas, monospace; }",
+      ".tagline { color: #9ca3af; margin-bottom: 2.5rem; }",
+      ".stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 2.5rem; }",
+      ".stat { padding: 16px; border: 1px solid #1f2937; border-radius: 12px; text-align: center; }",
+      ".stat .value { color: #fff; font-size: 1.4rem; font-weight: 600; }",
+      ".stat .label { color: #6b7280; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }",
+      "h2 { color: #fff; font-size: 1rem; margin: 2rem 0 0.5rem; }",
+      "p { font-size: 0.9rem; margin-bottom: 0.75rem; }",
+      "pre { background: #0a0a0a; border: 1px solid #1f2937; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 0.75rem 0; }",
+      "code { font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem; color: #e5e7eb; }",
+      ".footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #1f2937; font-size: 0.85rem; color: #6b7280; }",
+      "</style>",
+      "</head>",
+      "<body>",
+      "<div class=\"container\">",
+      "<h1>cache.novavero.ai</h1>",
+      "<p class=\"tagline\">Nix binary cache — serving store paths for <a href=\"https://github.com/Novavero-AI/nova-nix\">nova-nix</a>, the Windows-native Nix.</p>",
+      "<div class=\"stats\">",
+      "<div class=\"stat\"><div class=\"value\">" <> T.pack (show pathCount) <> "</div><div class=\"label\">store paths</div></div>",
+      "<div class=\"stat\"><div class=\"value\">" <> (if signingEnabled then "ed25519" else "off") <> "</div><div class=\"label\">signing</div></div>",
+      "<div class=\"stat\"><div class=\"value\">" <> T.pack (show (ciPriority info)) <> "</div><div class=\"label\">priority</div></div>",
+      "</div>",
+      "<h2>Use it</h2>",
+      "<pre><code>substituters = https://cache.novavero.ai</code></pre>",
+      "<p>Store dir: <code>" <> ciStoreDir info <> "</code> &middot; protocol endpoints: <code>/nix-cache-info</code>, <code>/&lt;hash&gt;.narinfo</code>, <code>/nar/&lt;file&gt;</code></p>",
+      "<h2>What this is</h2>",
+      "<p>The binary cache behind the Novavero Nix toolchain. Powered by <a href=\"https://github.com/Novavero-AI/nova-cache\">nova-cache</a>, a Haskell implementation of the Nix binary cache protocol. Read about the first package built by Nix natively on Windows on <a href=\"https://novavero.ai/blog/first-native-windows-nix-build.html\">the blog</a>.</p>",
+      "<div class=\"footer\"><a href=\"https://novavero.ai\">Novavero AI</a> &middot; Waterloo, Canada</div>",
+      "</div>",
+      "</body>",
+      "</html>"
+    ]
+
+-- | Content-Type and caching headers for the landing page.  Stats change as
+-- paths are added, so it stays briefly cacheable but revalidates.
+htmlHeaders :: HTTP.ResponseHeaders
+htmlHeaders =
+  [ (HTTP.hContentType, "text/html; charset=utf-8"),
+    (HTTP.hCacheControl, "public, max-age=300, must-revalidate")
+  ]
 
 -- | 404 Not Found response.
 notFound :: Response
