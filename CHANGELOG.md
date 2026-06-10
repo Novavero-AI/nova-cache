@@ -7,6 +7,25 @@
   protocol endpoint documentation. The cache protocol routes are unchanged;
   the page is briefly cacheable (`max-age=300, must-revalidate`) since its
   stats change as paths are added.
+- **Correctness and hardening sweep** (a post-0.4.0.0 audit; note: shipped in
+  this release without individual entries at tag time — recorded here for the
+  honest history):
+  - `Base32.decode` rejects non-canonical encodings (overflow bits must be zero).
+  - NAR deserialisation is strict on untrusted input: trailing bytes rejected,
+    regular nodes require a `contents` token, directory entry names must be
+    sorted, unique, and safe.
+  - narinfo integer fields parse as strict base-10 (no hex/octal/whitespace),
+    so a non-canonical `NarSize` can no longer be re-signed under the cache key.
+  - Hash validation compares decoded digest bytes, accepting any valid
+    encoding of the same hash.
+  - Ed25519 verification is name-keyed, matching Nix's lookup-by-name.
+  - `decompressXz` re-raises asynchronous exceptions, so timeouts can cancel it.
+  - Server: per-route body caps (narinfo small, NAR large), uploaded narinfos
+    must name the store path of the request URL, signing failures refuse the
+    write instead of storing unsigned, and narinfo responses are revalidatable
+    rather than immutable.
+- **Breaking (should have been a major bump; noted for transparency):**
+  `getCacheInfo` returns a `CacheInfo` record instead of a tuple.
 
 ## 0.4.0.0 — 2026-06-08
 
