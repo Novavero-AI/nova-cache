@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1.1 — 2026-06-10
+
+- Documentation-only release: the 0.4.1.0 entry below now records everything
+  that release actually contained. No code changes.
+
 ## 0.4.1.0 — 2026-06-10
 
 - **Server: landing page at `GET /`** — a human-facing page with live stats
