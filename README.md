@@ -87,21 +87,6 @@ extra-substituters = https://cache.novavero.ai
 extra-trusted-public-keys = cache.novavero.ai-1:2yJK0UZWlDDTpThzEdqfGWaj+j3ljOCGoA50Ims47dM=
 ```
 
-## CI cache seeding
-
-A composite action pushes store paths to a nova-cache server from CI. It
-resolves runtime paths via `nix-build`, diffs against the server's
-`/narinfo-hashes`, and uploads only what is missing.
-
-```yaml
-- uses: Novavero-AI/nova-cache/.github/actions/seed@main
-  with:
-    cache-url: https://cache.example.com
-    api-key: ${{ secrets.CACHE_API_KEY }}
-```
-
-Inputs: `cache-url` and `api-key` (required); `paths` and `parallel` (optional).
-
 ## Build & test
 
 ```bash
