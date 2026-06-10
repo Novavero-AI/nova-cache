@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1.0 — 2026-06-10
+
+- **Server: landing page at `GET /`** — a human-facing page with live stats
+  (store-path count, signing status, priority), the substituter snippet, and
+  protocol endpoint documentation. The cache protocol routes are unchanged;
+  the page is briefly cacheable (`max-age=300, must-revalidate`) since its
+  stats change as paths are added.
+
 ## 0.4.0.0 — 2026-06-08
 
 ### Breaking changes
