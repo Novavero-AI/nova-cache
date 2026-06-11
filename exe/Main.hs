@@ -27,7 +27,7 @@ import Network.Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
-import NovaCache.Signing (SecretKey, parseSecretKey, sign)
+import NovaCache.Signing (SecretKey, normalizeKeyText, parseSecretKey, renderPublicKey, sign, toPublicKey)
 import NovaCache.Store (CacheInfo (..), FileStore, getCacheInfo, listNarInfoHashes, newFileStore, readNar, readNarInfo, writeNar, writeNarInfo)
 import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
@@ -78,7 +78,10 @@ maxNarBodySize = 4 * 1024 * 1024 * 1024 -- 4 GB
 data Config = Config
   { cfgStore :: !FileStore,
     cfgApiKey :: !(Maybe BS.ByteString),
-    cfgSigningKey :: !(Maybe SecretKey)
+    cfgSigningKey :: !(Maybe SecretKey),
+    -- | The rendered @name:base64@ public key line, derived from the
+    -- signing key at startup; shown on the landing page.
+    cfgPublicKey :: !(Maybe Text)
   }
 
 -- ---------------------------------------------------------------------------
@@ -107,12 +110,14 @@ main = do
 
   store <- newFileStore storeRoot
   sigKey <- loadSigningKey sigKeyPath
+  pubKey <- derivePublicKeyLine sigKey
 
   let cfg =
         Config
           { cfgStore = store,
-            cfgApiKey = TE.encodeUtf8 . T.pack <$> apiKeyEnv,
-            cfgSigningKey = sigKey
+            cfgApiKey = TE.encodeUtf8 . normalizeKeyText . T.pack <$> apiKeyEnv,
+            cfgSigningKey = sigKey,
+            cfgPublicKey = pubKey
           }
 
   let logRequests = logRequestsEnv /= Just "0"
@@ -121,6 +126,7 @@ main = do
   putStrLn ("nova-cache-server listening on port " ++ show port)
   putStrLn ("store root: " ++ storeRoot)
   putStrLn ("signing: " ++ maybe "disabled" (const "enabled") sigKey)
+  mapM_ (\k -> putStrLn ("public key: " ++ T.unpack k)) pubKey
   putStrLn ("write auth: " ++ maybe "disabled (open writes!)" (const "enabled") (cfgApiKey cfg))
   putStrLn ("request logging: " ++ if logRequests then "enabled" else "disabled (LOG_REQUESTS=0)")
 
@@ -147,11 +153,22 @@ loadSigningKey :: Maybe FilePath -> IO (Maybe SecretKey)
 loadSigningKey Nothing = pure Nothing
 loadSigningKey (Just path) = do
   raw <- BS.readFile path
-  case first show (TE.decodeUtf8' raw) >>= parseSecretKey . T.strip of
+  case first show (TE.decodeUtf8' raw) >>= parseSecretKey . normalizeKeyText of
     Left err -> do
       hPutStrLn stderr ("WARNING: failed to load signing key: " ++ err)
       pure Nothing
     Right sk -> pure (Just sk)
+
+-- | Derive the rendered public key line from the signing key, if any.
+-- The landing page shows this line, so the published trust anchor always
+-- matches the key in use; on a derivation failure the page omits it.
+derivePublicKeyLine :: Maybe SecretKey -> IO (Maybe Text)
+derivePublicKeyLine Nothing = pure Nothing
+derivePublicKeyLine (Just sk) = case toPublicKey sk of
+  Left err -> do
+    hPutStrLn stderr ("WARNING: cannot derive the public key from the signing key: " ++ err)
+    pure Nothing
+  Right pk -> pure (Just (renderPublicKey pk))
 
 -- ---------------------------------------------------------------------------
 -- WAI application
@@ -165,7 +182,7 @@ app cfg req respond = case (requestMethod req, pathInfo req) of
     pathCount <- length <$> listNarInfoHashes (cfgStore cfg)
     let info = getCacheInfo (cfgStore cfg)
         signingEnabled = isJust (cfgSigningKey cfg)
-        body = TE.encodeUtf8 (landingHtml info signingEnabled pathCount)
+        body = TE.encodeUtf8 (landingHtml info signingEnabled (cfgPublicKey cfg) pathCount)
     respond (responseLBS HTTP.status200 htmlHeaders (BL.fromStrict body))
   -- GET /nix-cache-info
   ("GET", ["nix-cache-info"]) ->
@@ -370,11 +387,12 @@ boolText :: Bool -> Text
 boolText True = "1"
 boolText False = "0"
 
--- | The landing page served at @GET /@.  Static apart from three live
--- values (store-path count, store dir, signing status); styled to match
--- novavero.ai.  No user input is interpolated, so no escaping is needed.
-landingHtml :: CacheInfo -> Bool -> Int -> Text
-landingHtml info signingEnabled pathCount =
+-- | The landing page served at @GET /@.  Static apart from four live
+-- values (store-path count, store dir, signing status, public key); styled
+-- to match novavero.ai.  Nothing user-supplied is interpolated — the key
+-- line is operator configuration — so no escaping is needed.
+landingHtml :: CacheInfo -> Bool -> Maybe Text -> Int -> Text
+landingHtml info signingEnabled pubKey pathCount =
   T.unlines
     [ "<!DOCTYPE html>",
       "<html lang=\"en\">",
@@ -416,7 +434,7 @@ landingHtml info signingEnabled pathCount =
       "<div class=\"stat\"><div class=\"value\">" <> T.pack (show (ciPriority info)) <> "</div><div class=\"label\">priority</div></div>",
       "</div>",
       "<h2>Use it</h2>",
-      "<pre><code>substituters = https://cache.novavero.ai</code></pre>",
+      "<pre><code>substituters = https://cache.novavero.ai" <> trustAnchorLine <> "</code></pre>",
       "<p>Store dir: <code>" <> ciStoreDir info <> "</code> &middot; protocol endpoints: <code>/nix-cache-info</code>, <code>/&lt;hash&gt;.narinfo</code>, <code>/nar/&lt;file&gt;</code></p>",
       "<h2>What this is</h2>",
       "<p>The binary cache behind the Novavero Nix toolchain. Powered by <a href=\"https://github.com/Novavero-AI/nova-cache\">nova-cache</a>, a Haskell implementation of the Nix binary cache protocol. Read about the first package built by Nix natively on Windows on <a href=\"https://novavero.ai/blog/first-native-windows-nix-build.html\">the blog</a>.</p>",
@@ -425,6 +443,8 @@ landingHtml info signingEnabled pathCount =
       "</body>",
       "</html>"
     ]
+  where
+    trustAnchorLine = maybe "" ("\ntrusted-public-keys = " <>) pubKey
 
 -- | The Novavero mark (the novavero.ai favicon), inlined so the page stays
 -- a single self-contained response with no external assets.

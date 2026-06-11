@@ -9,6 +9,9 @@ module NovaCache.Signing
     PublicKey (..),
     parseSecretKey,
     parsePublicKey,
+    normalizeKeyText,
+    toPublicKey,
+    renderPublicKey,
     fingerprint,
     sign,
     verify,
@@ -76,9 +79,23 @@ fingerprintSep = ";"
 referenceSep :: Text
 referenceSep = ","
 
+-- | The Unicode byte-order mark.  Windows tooling (PowerShell pipes and
+-- redirects in particular) prepends it to text in transit; it is never
+-- legal key material.
+bomChar :: Char
+bomChar = '\xFEFF'
+
 -- ---------------------------------------------------------------------------
 -- Key parsing
 -- ---------------------------------------------------------------------------
+
+-- | Normalize key text picked up from an environment variable or a file:
+-- drop byte-order marks and surrounding whitespace.  'T.strip' alone is not
+-- enough — a BOM is not whitespace, so it survives stripping and silently
+-- corrupts the key.  None of the dropped characters can be legitimate key
+-- material, so normalizing is always safe.
+normalizeKeyText :: Text -> Text
+normalizeKeyText = T.strip . T.filter (/= bomChar)
 
 -- | Parse a @name:base64@ secret key string.
 parseSecretKey :: Text -> Either String SecretKey
@@ -93,6 +110,22 @@ parsePublicKey txt = do
   (keyName, decoded) <- splitAndDecode txt "public key"
   expectSize ed25519PublicKeySize "public key" decoded
   pure PublicKey {pkName = keyName, pkBytes = decoded}
+
+-- | Derive the public key corresponding to a secret key, keeping the name.
+--
+-- The 64-byte secret key carries the public half in its second half, but
+-- deriving from the seed through the crypto library validates the key
+-- material instead of trusting it.
+toPublicKey :: SecretKey -> Either String PublicKey
+toPublicKey (SecretKey keyName secretBytes) = do
+  sk <- cryptoSecretKey (BS.take ed25519SeedSize secretBytes)
+  pure PublicKey {pkName = keyName, pkBytes = convert (Ed25519.toPublic sk)}
+
+-- | Render a public key in Nix's @name:base64@ trust-anchor format — the
+-- exact string a client puts in @trusted-public-keys@.
+renderPublicKey :: PublicKey -> Text
+renderPublicKey (PublicKey keyName bytes) =
+  keyName <> keySeparator <> TE.decodeLatin1 (B64.encode bytes)
 
 -- | Split a @name:base64@ string and decode the base64 payload.
 splitAndDecode :: Text -> String -> Either String (Text, ByteString)

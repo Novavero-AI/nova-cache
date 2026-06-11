@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.2.0 — 2026-06-10
+
+- **Signing: public-key derivation and rendering** — new `toPublicKey`
+  (derive the `PublicKey` for a `SecretKey`) and `renderPublicKey` (render
+  the `name:base64` trust-anchor format clients put in
+  `trusted-public-keys`).
+- **Signing: `normalizeKeyText`** — strips byte-order marks and surrounding
+  whitespace from key text. The server applies it to `CACHE_API_KEY` and
+  the signing key file, so keys that picked up a BOM or stray CRLF in
+  transit load byte-clean instead of silently failing auth or signing.
+- **Server: the landing page shows the cache public key**, derived at
+  startup from the live signing key, as a copyable `trusted-public-keys`
+  line. The published trust anchor can no longer drift from the key in
+  use.
+- README: the public cache key now matches the key the server signs with.
+- Removed the CI seed action and its README section; native pushing from
+  nova-nix replaces it.
+
 ## 0.4.1.1 — 2026-06-10
 
 - Documentation-only release: the 0.4.1.0 entry below now records everything

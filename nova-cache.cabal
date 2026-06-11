@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-cache
-version:            0.4.1.1
+version:            0.4.2.0
 synopsis:           Pure-first Nix binary cache protocol library
 description:
   A pure-first library implementing the Nix binary cache protocol —

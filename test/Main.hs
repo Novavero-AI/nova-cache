@@ -472,7 +472,40 @@ testSigning =
             pure False
           Right sig ->
             let tampered = ni {NarInfo.niNarSize = 999999}
-             in assertFalse "verify rejects tampered" (Signing.verify pk tampered sig)
+             in assertFalse "verify rejects tampered" (Signing.verify pk tampered sig),
+      test "toPublicKey derives the verifying key" $ do
+        sk <- generateTestSecretKey
+        case Signing.toPublicKey sk of
+          Left err -> do
+            putStrLn ("  toPublicKey failed: " ++ err)
+            pure False
+          Right pk -> do
+            okName <- assertEqual "key name carried over" (Signing.skName sk) (Signing.pkName pk)
+            okBytes <- assertEqual "matches the stored public half" (BS.drop 32 (Signing.skBytes sk)) (Signing.pkBytes pk)
+            case Signing.sign sk mkTestNarInfo of
+              Left err -> do
+                putStrLn ("  sign failed: " ++ err)
+                pure False
+              Right sig -> do
+                okVerify <- assertTrue "derived key verifies a signature" (Signing.verify pk mkTestNarInfo sig)
+                pure (okName && okBytes && okVerify),
+      test "renderPublicKey round-trips through parsePublicKey" $ do
+        sk <- generateTestSecretKey
+        case Signing.toPublicKey sk of
+          Left err -> do
+            putStrLn ("  toPublicKey failed: " ++ err)
+            pure False
+          Right pk -> case Signing.parsePublicKey (Signing.renderPublicKey pk) of
+            Left err -> do
+              putStrLn ("  parse failed: " ++ err)
+              pure False
+            Right reparsed -> assertEqual "round-trip" pk reparsed,
+      test "normalizeKeyText strips BOM and whitespace" $ do
+        ok1 <- assertEqual "BOM stripped" "test-key:abc" (Signing.normalizeKeyText ("\xFEFF" <> "test-key:abc"))
+        ok2 <- assertEqual "CRLF stripped" "test-key:abc" (Signing.normalizeKeyText "test-key:abc\r\n")
+        ok3 <- assertEqual "spaces stripped" "test-key:abc" (Signing.normalizeKeyText "  test-key:abc  ")
+        ok4 <- assertEqual "clean text unchanged" "test-key:abc" (Signing.normalizeKeyText "test-key:abc")
+        pure (ok1 && ok2 && ok3 && ok4)
     ]
 
 -- | Create a test NarInfo for signing tests.

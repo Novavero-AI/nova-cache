@@ -71,6 +71,7 @@ cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
 
 | Method | Path | Description |
 | --- | --- | --- |
+| `GET` | `/` | Landing page: live stats and the cache public key |
 | `GET` | `/nix-cache-info` | Cache metadata |
 | `GET` | `/narinfo-hashes` | All cached narinfo hashes, newline-delimited |
 | `GET` | `/<hash>.narinfo` | Fetch a narinfo |
