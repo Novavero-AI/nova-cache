@@ -184,7 +184,7 @@ getCacheInfo fs =
 -- dot and are not a Windows reserved device name. This rejects directory
 -- separators, @.@\/@..@ traversal, dotfiles (including the temp-write prefix),
 -- NUL bytes, alternate-data-stream (@name:stream@) syntax, and device names
--- like @nul@ — so a client-supplied hash or NAR filename can never escape the
+-- like @nul@ - so a client-supplied hash or NAR filename can never escape the
 -- store directory or resolve to a device, on any platform.
 sanitizePath :: Text -> Maybe FilePath
 sanitizePath txt
@@ -217,7 +217,7 @@ isReservedName txt = T.toLower (T.takeWhile (/= '.') txt) `elem` reservedNames
 -- | Write a file atomically via write-to-temp-then-rename.
 --
 -- Writes to a temporary file in the same directory, then renames to
--- the target path. On POSIX, @rename@ is atomic — readers see either
+-- the target path. On POSIX, @rename@ is atomic - readers see either
 -- the old content or the new content, never a partial write.
 -- Cleans up the temporary file on failure.
 atomicWriteFile :: FilePath -> ByteString -> IO ()

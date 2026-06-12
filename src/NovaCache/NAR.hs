@@ -211,7 +211,7 @@ parseRegular bs = do
           pure (NarRegular False contents, final)
       | otherwise =
           -- 'contents' is mandatory (even an empty file serialises with it), so
-          -- a regular node without it is malformed — reject, matching Nix.
+          -- a regular node without it is malformed - reject, matching Nix.
           Left ("expected 'executable' or 'contents' in regular, got: " ++ show tok)
 
 -- | Parse a symlink node.
@@ -376,7 +376,7 @@ buildRegularFile path = do
       -- Not a symlink, directory, or regular file: a special file (FIFO,
       -- socket, device) or a path that vanished mid-walk.  Fail loudly rather
       -- than fabricating an empty regular (which would silently change the NAR
-      -- and its hash) — matching Nix, which aborts on unsupported types.
+      -- and its hash) - matching Nix, which aborts on unsupported types.
       fail ("serialiseFromPath: not a regular file (special or vanished): " ++ path)
 
 -- | Check whether a file has the executable permission set.

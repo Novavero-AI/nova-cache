@@ -60,7 +60,7 @@ signingKeyEnvVar = "SIGNING_KEY_FILE"
 requestLogEnvVar :: String
 requestLogEnvVar = "LOG_REQUESTS"
 
--- | Maximum narinfo request body — narinfo is small text, so a tight cap.
+-- | Maximum narinfo request body - narinfo is small text, so a tight cap.
 maxNarInfoBodySize :: Int
 maxNarInfoBodySize = 4 * 1024 * 1024 -- 4 MB
 
@@ -136,7 +136,7 @@ main = do
           hPutStrLn stderr $
             "FATAL: "
               ++ apiKeyEnvVar
-              ++ " is not set — refusing to start with unauthenticated writes. "
+              ++ " is not set - refusing to start with unauthenticated writes. "
               ++ "Set "
               ++ apiKeyEnvVar
               ++ ", or pass --allow-open-writes to override (not recommended on a public host)."
@@ -177,7 +177,7 @@ derivePublicKeyLine (Just sk) = case toPublicKey sk of
 -- | WAI application implementing the Nix binary cache HTTP protocol.
 app :: Config -> Application
 app cfg req respond = case (requestMethod req, pathInfo req) of
-  -- GET / — human-facing landing page (the protocol lives at the other routes)
+  -- GET / - human-facing landing page (the protocol lives at the other routes)
   ("GET", []) -> do
     pathCount <- length <$> listNarInfoHashes (cfgStore cfg)
     let info = getCacheInfo (cfgStore cfg)
@@ -264,7 +264,7 @@ decodeAndValidate body = do
   first (T.unlines . map (T.pack . show)) (validateNarInfo ni)
 
 -- | Whether the narinfo's declared StorePath actually carries the requested
--- hash — so an authenticated writer cannot store a narinfo describing path X
+-- hash - so an authenticated writer cannot store a narinfo describing path X
 -- under path Y's key (a cache-poisoning / confused-deputy shape).
 narInfoHashMatches :: Text -> NarInfo -> Bool
 narInfoHashMatches hashKey ni =
@@ -335,7 +335,7 @@ requireAuth cfg req respond action = case cfgApiKey cfg of
 
 -- | Sign a validated 'NarInfo' if a signing key is configured.
 --
--- With no key, returns the unsigned rendering (intentional — the operator
+-- With no key, returns the unsigned rendering (intentional - the operator
 -- configured none).  With a key, FAILS CLOSED: a signing error returns 'Left'
 -- so the handler refuses the write rather than persisting an unsigned narinfo
 -- on a cache that is supposed to sign.
@@ -389,8 +389,8 @@ boolText False = "0"
 
 -- | The landing page served at @GET /@.  Static apart from four live
 -- values (store-path count, store dir, signing status, public key); styled
--- to match novavero.ai.  Nothing user-supplied is interpolated — the key
--- line is operator configuration — so no escaping is needed.
+-- to match novavero.ai.  Nothing user-supplied is interpolated - the key
+-- line is operator configuration - so no escaping is needed.
 landingHtml :: CacheInfo -> Bool -> Maybe Text -> Int -> Text
 landingHtml info signingEnabled pubKey pathCount =
   T.unlines
@@ -400,7 +400,7 @@ landingHtml info signingEnabled pubKey pathCount =
       "<meta charset=\"UTF-8\" />",
       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />",
       "<title>cache.novavero.ai - Nix binary cache</title>",
-      "<meta name=\"description\" content=\"The Novavero Nix binary cache, serving store paths for nova-nix — the Windows-native Nix.\" />",
+      "<meta name=\"description\" content=\"The Novavero Nix binary cache, serving store paths for nova-nix - the Windows-native Nix.\" />",
       "<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml," <> novaveroLogoSvgEscaped <> "\" />",
       "<style>",
       "* { margin: 0; padding: 0; box-sizing: border-box; }",
@@ -427,7 +427,7 @@ landingHtml info signingEnabled pubKey pathCount =
       "<body>",
       "<div class=\"container\">",
       "<div class=\"brand\">" <> novaveroLogoSvg <> "<h1>cache.novavero.ai</h1></div>",
-      "<p class=\"tagline\">Nix binary cache — serving store paths for <a href=\"https://github.com/Novavero-AI/nova-nix\">nova-nix</a>, the Windows-native Nix.</p>",
+      "<p class=\"tagline\">Nix binary cache - serving store paths for <a href=\"https://github.com/Novavero-AI/nova-nix\">nova-nix</a>, the Windows-native Nix.</p>",
       "<div class=\"stats\">",
       "<div class=\"stat\"><div class=\"value\">" <> T.pack (show pathCount) <> "</div><div class=\"label\">store paths</div></div>",
       "<div class=\"stat\"><div class=\"value\">" <> (if signingEnabled then "ed25519" else "off") <> "</div><div class=\"label\">signing</div></div>",
@@ -493,8 +493,8 @@ textHeaders :: HTTP.ResponseHeaders
 textHeaders = [(HTTP.hContentType, "text/plain")]
 
 -- | Content-Type and caching headers for a narinfo response.
--- A narinfo body is NOT immutable for a fixed key — re-uploading the same store
--- path to add or rotate a signature changes it — so it is cacheable but must
+-- A narinfo body is NOT immutable for a fixed key - re-uploading the same store
+-- path to add or rotate a signature changes it - so it is cacheable but must
 -- stay revalidatable (no @immutable@).
 narInfoHeaders :: HTTP.ResponseHeaders
 narInfoHeaders =

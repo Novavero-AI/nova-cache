@@ -1,16 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.2.1 - 2026-06-12
 
 - **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under their original licenses.
+- **Source is now ASCII-only**, enforced by a CI check. Removes some mis-encoded characters from comments and keeps the tree clean and portable.
 
-## 0.4.2.0 — 2026-06-10
+## 0.4.2.0 - 2026-06-10
 
-- **Signing: public-key derivation and rendering** — new `toPublicKey`
+- **Signing: public-key derivation and rendering** - new `toPublicKey`
   (derive the `PublicKey` for a `SecretKey`) and `renderPublicKey` (render
   the `name:base64` trust-anchor format clients put in
   `trusted-public-keys`).
-- **Signing: `normalizeKeyText`** — strips byte-order marks and surrounding
+- **Signing: `normalizeKeyText`** - strips byte-order marks and surrounding
   whitespace from key text. The server applies it to `CACHE_API_KEY` and
   the signing key file, so keys that picked up a BOM or stray CRLF in
   transit load byte-clean instead of silently failing auth or signing.
@@ -22,20 +23,20 @@
 - Removed the CI seed action and its README section; native pushing from
   nova-nix replaces it.
 
-## 0.4.1.1 — 2026-06-10
+## 0.4.1.1 - 2026-06-10
 
 - Documentation-only release: the 0.4.1.0 entry below now records everything
   that release actually contained. No code changes.
 
-## 0.4.1.0 — 2026-06-10
+## 0.4.1.0 - 2026-06-10
 
-- **Server: landing page at `GET /`** — a human-facing page with live stats
+- **Server: landing page at `GET /`** - a human-facing page with live stats
   (store-path count, signing status, priority), the substituter snippet, and
   protocol endpoint documentation. The cache protocol routes are unchanged;
   the page is briefly cacheable (`max-age=300, must-revalidate`) since its
   stats change as paths are added.
 - **Correctness and hardening sweep** (a post-0.4.0.0 audit; note: shipped in
-  this release without individual entries at tag time — recorded here for the
+  this release without individual entries at tag time - recorded here for the
   honest history):
   - `Base32.decode` rejects non-canonical encodings (overflow bits must be zero).
   - NAR deserialisation is strict on untrusted input: trailing bytes rejected,
@@ -54,114 +55,114 @@
 - **Breaking (should have been a major bump; noted for transparency):**
   `getCacheInfo` returns a `CacheInfo` record instead of a tuple.
 
-## 0.4.0.0 — 2026-06-08
+## 0.4.0.0 - 2026-06-08
 
 ### Breaking changes
 
-- **`NarInfo` drops the `niSystem` field** — `System` is not part of the Nix
+- **`NarInfo` drops the `niSystem` field** - `System` is not part of the Nix
   narinfo wire format (Nix ignores unknown keys), so it is removed from the
   exported record and `renderNarInfo` no longer emits a `System:` line.
 
 ### Security
 
-- **API key required for writes** — the server refuses to start when
+- **API key required for writes** - the server refuses to start when
   `CACHE_API_KEY` is unset, unless `--allow-open-writes` is passed explicitly,
   so a missing environment variable can no longer leave the cache
   world-writable.
-- **Streaming request-body cap** — request bodies are read in bounded chunks
+- **Streaming request-body cap** - request bodies are read in bounded chunks
   with a running size check, so an unsized (chunked) upload can no longer
   buffer past the 100 MB limit into memory before it is rejected.
-- **Stricter path validation** — `sanitizePath` now accepts only
+- **Stricter path validation** - `sanitizePath` now accepts only
   `[A-Za-z0-9._+-]` names that are neither dotfiles nor Windows reserved device
-  names (`nul`, `con`, `com1`…), rejecting device access, alternate-data-stream
+  names (`nul`, `con`, `com1`...), rejecting device access, alternate-data-stream
   syntax, and the temporary-write prefix in addition to traversal.
-- **No internal detail in error responses** — store reads tolerate I/O errors
+- **No internal detail in error responses** - store reads tolerate I/O errors
   (treated as absence) and any uncaught handler exception maps to a plain 500,
   so filesystem paths and error text are never returned to clients.
 
 ### Bug fixes
 
-- **CRLF-tolerant narinfo parsing** — lines are split on the first colon with a
+- **CRLF-tolerant narinfo parsing** - lines are split on the first colon with a
   trailing carriage return stripped, so narinfo produced by other tools (or
   with `\r\n` line endings) parses correctly instead of corrupting text fields
   or rejecting valid integer fields.
 
-## 0.3.2.1 — 2026-03-18
+## 0.3.2.1 - 2026-03-18
 
 - Replace partial `decodeUtf8` with total `decodeLatin1` in `Base64.encode`
-  and `Signing.sign` — provably safe on base64 ASCII output, eliminates last
+  and `Signing.sign` - provably safe on base64 ASCII output, eliminates last
   partial function usage
 - Fix redundant `T.breakOn` call in `NarInfo.parseLine`
 - No API changes
 
-## 0.3.2.0 — 2026-03-18
+## 0.3.2.0 - 2026-03-18
 
 ### Server logging
 
-- **Request logging** — Apache Combined format via `wai-extra` middleware,
+- **Request logging** - Apache Combined format via `wai-extra` middleware,
   configurable with `LOG_REQUESTS=0` to disable.
-- **Error logging** — auth rejections, validation failures, oversized uploads,
+- **Error logging** - auth rejections, validation failures, oversized uploads,
   and bad paths now logged to stderr with request method and path context.
-- **`withLimitedBody` combinator** — extracted common body-limiting pattern from
+- **`withLimitedBody` combinator** - extracted common body-limiting pattern from
   PUT handlers, reducing duplication.
-- **`notFound` named constant** — replaces three inline 404 responses.
+- **`notFound` named constant** - replaces three inline 404 responses.
 - Fixed `loadSigningKey` warnings going to stdout instead of stderr.
 
 ### Seed action fixes
 
-- **Resolve runtime outputs, not derivations** — `nix-instantiate` replaced
+- **Resolve runtime outputs, not derivations** - `nix-instantiate` replaced
   with `nix-build --no-out-link` so the cache stores actual binaries instead of
   `.drv` build recipes.
-- **Filter uploads to diff-only** — `nix copy` exports transitive deps; uploads
+- **Filter uploads to diff-only** - `nix copy` exports transitive deps; uploads
   now filtered against the missing-hashes diff to avoid re-uploading cached paths.
-- **Fix broken pipe** — `find | xargs` with `pipefail` caused spurious failures;
+- **Fix broken pipe** - `find | xargs` with `pipefail` caused spurious failures;
   now writes to intermediate files.
-- **Fix xargs line-too-long** — large path lists passed via file instead of inline.
-- **Diagnostic output** — upload failure HTTP codes now printed; `nix copy` errors
+- **Fix xargs line-too-long** - large path lists passed via file instead of inline.
+- **Diagnostic output** - upload failure HTTP codes now printed; `nix copy` errors
   no longer silenced.
-- **Parallelism** — per-upload `--max-time` added (120s for NARs, 30s for narinfos).
+- **Parallelism** - per-upload `--max-time` added (120s for NARs, 30s for narinfos).
 
 ### Server validation
 
-- **Reject derivation narinfos** — `validateNarInfo` now rejects any narinfo
+- **Reject derivation narinfos** - `validateNarInfo` now rejects any narinfo
   where StorePath ends in `.drv` with a new `DerivationStorePath` error. Binary
   caches serve build outputs, not build recipes.
 - 1 new test (75 total)
 
-## 0.3.1.0 — 2026-03-07
+## 0.3.1.0 - 2026-03-07
 
 ### Drop `memory` dependency, use `ram`
 
-- **`memory` → `ram`** — Replaced `memory` package with `ram` (modern, minimal replacement). Same `Data.ByteArray` API, drops the heavy `basement` transitive dependency. Fixes build failure with `crypton >= 1.1` which switched from `memory` to `ram` internally — `Data.ByteArray.ByteArrayAccess` instances were no longer compatible across packages.
-- **`crypton >= 1.1` required** — Lower bound bumped from `1.0` to `1.1` so that `crypton` and `nova-cache` both link against `ram` for `ByteArrayAccess` instances. Older `crypton` versions used `memory`, causing instance mismatches at link time.
-- All imports remain `Data.ByteArray` — no source-level changes needed for downstream consumers.
+- **`memory` -> `ram`** - Replaced `memory` package with `ram` (modern, minimal replacement). Same `Data.ByteArray` API, drops the heavy `basement` transitive dependency. Fixes build failure with `crypton >= 1.1` which switched from `memory` to `ram` internally - `Data.ByteArray.ByteArrayAccess` instances were no longer compatible across packages.
+- **`crypton >= 1.1` required** - Lower bound bumped from `1.0` to `1.1` so that `crypton` and `nova-cache` both link against `ram` for `ByteArrayAccess` instances. Older `crypton` versions used `memory`, causing instance mismatches at link time.
+- All imports remain `Data.ByteArray` - no source-level changes needed for downstream consumers.
 
-## 0.3.0.0 — 2026-02-28
+## 0.3.0.0 - 2026-02-28
 
 ### Breaking changes
 
 - **`decompressXz`** signature changed from `ByteString -> ByteString` to
-  `ByteString -> IO (Either String ByteString)` — catches lzma exceptions
+  `ByteString -> IO (Either String ByteString)` - catches lzma exceptions
   instead of crashing on malformed input
-- **`writeNarInfo`** / **`writeNar`** now return `IO Bool` instead of `IO ()` —
+- **`writeNarInfo`** / **`writeNar`** now return `IO Bool` instead of `IO ()` -
   `False` indicates a rejected path (traversal, empty)
 
 ### Security
 
-- **Request body size limit** — PUT endpoints reject bodies over 100 MB with
+- **Request body size limit** - PUT endpoints reject bodies over 100 MB with
   413 Payload Too Large (prevents memory exhaustion)
-- **Constant-time auth comparison** — API key check uses `constEq` from
+- **Constant-time auth comparison** - API key check uses `constEq` from
   `Data.ByteArray` instead of `==` (prevents timing side-channel)
 
 ### Bug fixes
 
-- **Safe UTF-8 decoding in NAR deserializer** — `decodeUtf8` replaced with
+- **Safe UTF-8 decoding in NAR deserializer** - `decodeUtf8` replaced with
   `decodeUtf8'`; malformed UTF-8 in symlink targets or directory entry names
   now returns a parse error instead of throwing
 
 ### New features
 
-- **`GET /narinfo-hashes`** endpoint — returns all cached narinfo hashes as
+- **`GET /narinfo-hashes`** endpoint - returns all cached narinfo hashes as
   newline-delimited text, enabling efficient cache diffing
 - **`listNarInfoHashes`** function added to `NovaCache.Store`
 
@@ -177,24 +178,24 @@
 - Seed action: replaced per-path HEAD checks with single `GET /narinfo-hashes`
   call and local diff for dramatically faster cache seeding
 
-## 0.2.4.1 — 2026-02-26
+## 0.2.4.1 - 2026-02-26
 
 - License changed from MIT to BSD-3-Clause
 
-## 0.2.4.0 — 2026-02-25
+## 0.2.4.0 - 2026-02-25
 
-- New module: `NovaCache.Base64` — base64 encode/decode re-exported so
+- New module: `NovaCache.Base64` - base64 encode/decode re-exported so
   downstream consumers don't need a direct `base64-bytestring` dependency
 - No changes to existing modules
 
-## 0.2.3.0 — 2026-02-23
+## 0.2.3.0 - 2026-02-23
 
-- Drop `unix` dependency — `checkExecutable` now uses cross-platform
+- Drop `unix` dependency - `checkExecutable` now uses cross-platform
   `System.Directory.getPermissions` instead of `System.Posix.Files`
 - Fixes Windows build (the `unix` package is not available on Windows)
 - No API changes
 
-## 0.2.2.0 — 2026-02-23
+## 0.2.2.0 - 2026-02-23
 
 - Gate `NovaCache.Compression` and `lzma` dependency behind a `compression`
   cabal flag (default on, backwards compatible)
@@ -203,9 +204,9 @@
 - Compression tests moved to separate test suite (`nova-cache-compression-test`)
 - No changes to any library source modules
 
-## 0.2.1.0 — 2026-02-22
+## 0.2.1.0 - 2026-02-22
 
-- Server: `validateNarInfo` wired into PUT handler — rejects malformed uploads
+- Server: `validateNarInfo` wired into PUT handler - rejects malformed uploads
   with 400 Bad Request and collected validation errors
 - Server: `Cache-Control: public, max-age=31536000, immutable` on narinfo and
   NAR GET responses for CDN edge caching
@@ -215,22 +216,22 @@
   now verifies StorePath field, signature presence, and NAR fetchability
 - Public binary cache documented with key and nix.conf instructions
 
-## 0.2.0.0 — 2026-02-22
+## 0.2.0.0 - 2026-02-22
 
-- New module: `NovaCache.Validate` — pure protocol validation layer
+- New module: `NovaCache.Validate` - pure protocol validation layer
 - `ValidationError` sum type with 10 constructors covering sizes, store paths,
   hash formats, content hashes, and Ed25519 signatures
-- `validateNarInfo` — field semantic validation (non-negative sizes, parseable
+- `validateNarInfo` - field semantic validation (non-negative sizes, parseable
   store paths/hashes/references), collects all errors instead of short-circuiting
-- `validateNarHash` / `validateFileHash` — SHA-256 content hash verification
+- `validateNarHash` / `validateFileHash` - SHA-256 content hash verification
   against declared narinfo values
-- `validateSignature` — Ed25519 signature verification against a trusted public
+- `validateSignature` - Ed25519 signature verification against a trusted public
   key (at-least-one semantics, matching Nix behaviour)
-- `validateFull` — composes all four stages, collecting errors across all
+- `validateFull` - composes all four stages, collecting errors across all
 - 17 new tests (74 total across 9 groups)
 - No new dependencies
 
-## 0.1.0.0 — 2026-02-21
+## 0.1.0.0 - 2026-02-21
 
 - Initial release (renamed from gb-nix-cache)
 - Nix-base32 encoding/decoding

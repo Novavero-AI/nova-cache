@@ -91,7 +91,7 @@ bomChar = '\xFEFF'
 
 -- | Normalize key text picked up from an environment variable or a file:
 -- drop byte-order marks and surrounding whitespace.  'T.strip' alone is not
--- enough — a BOM is not whitespace, so it survives stripping and silently
+-- enough - a BOM is not whitespace, so it survives stripping and silently
 -- corrupts the key.  None of the dropped characters can be legitimate key
 -- material, so normalizing is always safe.
 normalizeKeyText :: Text -> Text
@@ -121,7 +121,7 @@ toPublicKey (SecretKey keyName secretBytes) = do
   sk <- cryptoSecretKey (BS.take ed25519SeedSize secretBytes)
   pure PublicKey {pkName = keyName, pkBytes = convert (Ed25519.toPublic sk)}
 
--- | Render a public key in Nix's @name:base64@ trust-anchor format — the
+-- | Render a public key in Nix's @name:base64@ trust-anchor format - the
 -- exact string a client puts in @trusted-public-keys@.
 renderPublicKey :: PublicKey -> Text
 renderPublicKey (PublicKey keyName bytes) =

@@ -157,7 +157,7 @@ testBase32 =
       test "decode invalid character" $
         assertLeft "invalid char" (Base32.decode "hello!"),
       test "encode length for 32 bytes" $
-        -- 32 bytes -> ceil(32*8/5) = ceil(51.2) = 52 chars
+        -- 32 bytes gives ceil(32*8/5) = ceil(51.2) = 52 chars
         let bs = BS.replicate 32 0x42
             encoded = Base32.encode bs
          in assertEqual "encoded length" 52 (T.length encoded),

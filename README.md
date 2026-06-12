@@ -1,7 +1,7 @@
 <div align="center">
 <h1>nova-cache</h1>
 <p><strong>The Nix binary cache protocol, in Haskell.</strong></p>
-<p>nix-base32, NAR archives, narinfo, store paths, and Ed25519 signing — with an optional WAI cache server. A pure core; IO is confined to the compression, storage, and server boundaries.</p>
+<p>nix-base32, NAR archives, narinfo, store paths, and Ed25519 signing - with an optional WAI cache server. A pure core; IO is confined to the compression, storage, and server boundaries.</p>
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
@@ -99,4 +99,4 @@ Optional flags: `-f-compression` skips the `liblzma` dependency, and `--flag ser
 
 ---
 
-<p align="center"><sub>Apache-2.0 · <a href="https://github.com/Novavero-AI">Novavero AI Inc.</a></sub></p>
+<p align="center"><sub>Apache-2.0 - <a href="https://github.com/Novavero-AI">Novavero AI Inc.</a></sub></p>

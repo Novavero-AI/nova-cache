@@ -2,7 +2,7 @@
 --
 -- Validates narinfo field semantics (sizes, store paths, hash formats),
 -- NAR/file content hashes against declared values, and Ed25519 signatures.
--- All functions are pure — no IO, no side effects.
+-- All functions are pure - no IO, no side effects.
 module NovaCache.Validate
   ( ValidationError (..),
     validateNarInfo,
@@ -47,7 +47,7 @@ data ValidationError
     SignatureInvalid !Text
   | -- | The narinfo has zero signatures.
     NoSignatures
-  | -- | StorePath is a derivation (.drv) — binary caches serve build outputs only.
+  | -- | StorePath is a derivation (.drv) - binary caches serve build outputs only.
     DerivationStorePath !Text
   deriving (Eq, Show)
 
@@ -120,7 +120,7 @@ validateFileHash ni fileBytes =
 -- ---------------------------------------------------------------------------
 
 -- | Validate signatures against a trusted public key. At least one signature
--- must verify (matches Nix behaviour — any trusted key suffices).
+-- must verify (matches Nix behaviour - any trusted key suffices).
 -- Returns 'Left [NoSignatures]' when there are no signatures at all.
 validateSignature :: PublicKey -> NarInfo -> Either [ValidationError] ()
 validateSignature pk ni

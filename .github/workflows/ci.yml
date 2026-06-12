@@ -19,8 +19,21 @@ concurrency:
 # ---------------------------------------------------------------------------
 
 jobs:
+  ascii:
+    name: ASCII source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Source must be ASCII-only
+        run: |
+          if git grep -nP '[^\x00-\x7F]' -- '*.hs' '*.cabal' '*.md' '*.nix' '*.sh'; then
+            echo "Non-ASCII characters found above; keep the source ASCII-only (no smart quotes, em-dashes, or Unicode arrows)."
+            exit 1
+          fi
+
   lint:
     name: HLint
+    needs: [ascii]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +47,7 @@ jobs:
 
   format:
     name: Ormolu
+    needs: [ascii]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
