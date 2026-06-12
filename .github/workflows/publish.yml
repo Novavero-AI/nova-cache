@@ -17,7 +17,7 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set version from tag
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
@@ -25,8 +25,8 @@ jobs:
           echo "Set version to $TAG_VERSION"
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.8.4'
-          cabal-version: '3.14'
+          ghc-version: '9.8'
+          cabal-version: 'latest'
       - run: cabal sdist
       - name: Upload to Hackage
         run: |
