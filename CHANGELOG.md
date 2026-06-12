@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under their original licenses.
+
 ## 0.4.2.0 — 2026-06-10
 
 - **Signing: public-key derivation and rendering** — new `toPublicKey`

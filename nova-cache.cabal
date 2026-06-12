@@ -7,8 +7,9 @@ description:
   nix-base32, NAR serialization, narinfo parsing, Ed25519 signing, store
   path handling, and content validation — with an optional WAI server.
 
-license:            BSD-3-Clause
+license:            Apache-2.0
 license-file:       LICENSE
+copyright:          2026 Novavero AI Inc.
 author:             Devon Tomlin
 maintainer:         devon.tomlin@novavero.ai
 homepage:           https://github.com/Novavero-AI/nova-cache
