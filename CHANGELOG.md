@@ -4,6 +4,8 @@
 
 - **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under their original licenses.
 - **Source is now ASCII-only**, enforced by a CI check. Removes some mis-encoded characters from comments and keeps the tree clean and portable.
+- Widened the `containers` upper bound to allow `containers` 0.8.
+- Server: the landing page wraps the config snippet and reflows the stats grid on small screens.
 
 ## 0.4.2.0 - 2026-06-10
 
