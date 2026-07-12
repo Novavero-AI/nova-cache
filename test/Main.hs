@@ -427,6 +427,22 @@ testSigning =
          in assertTrue
               "reference is a full /nix/store path in the fingerprint"
               (T.isInfixOf "/nix/store/00000000000000000000000000000000-glibc-2.40" fp),
+      test "fingerprint sorts and dedupes references" $
+        let ni =
+              mkTestNarInfo
+                { NarInfo.niReferences =
+                    [ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-zlib-1.3",
+                      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40",
+                      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-zlib-1.3"
+                    ]
+                }
+            fp = Signing.fingerprint ni
+         in assertTrue
+              "references sorted by basename and deduplicated (C++ Nix parity)"
+              ( T.isSuffixOf
+                  "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40,/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-zlib-1.3"
+                  fp
+              ),
       test "parseSecretKey valid" $
         let keyBytes = BS.pack ([1 .. 32] ++ [33 .. 64])
             keyB64 = TE.decodeUtf8 (B64.encode keyBytes)

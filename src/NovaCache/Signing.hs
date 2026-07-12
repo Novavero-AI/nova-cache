@@ -24,6 +24,7 @@ import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -167,13 +168,17 @@ fingerprint ni =
       niStorePath ni,
       niNarHash ni,
       T.pack (show (niNarSize ni)),
-      T.intercalate referenceSep (map (storeDir <>) (niReferences ni))
+      T.intercalate referenceSep (map (storeDir <>) sortedReferences)
     ]
   where
     -- References in a narinfo are basenames, but the fingerprint signs them as
     -- full store paths (/nix/store/<hash>-<name>), matching C++ Nix.  The store
     -- directory is the leading path of the (already absolute) niStorePath.
     storeDir = T.dropWhileEnd (/= '/') (niStorePath ni)
+    -- C++ Nix fingerprints a StorePathSet - references sorted by basename,
+    -- deduplicated - so the narinfo's file order must not leak into the
+    -- signature: real Nix clients always verify against the sorted form.
+    sortedReferences = Set.toAscList (Set.fromList (niReferences ni))
 
 -- ---------------------------------------------------------------------------
 -- Signing and verification
