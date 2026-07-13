@@ -75,13 +75,10 @@ jobs:
         include:
           - os: ubuntu-latest
             name: Linux
-            compression: true
           - os: macos-latest
             name: macOS
-            compression: true
           - os: windows-latest
             name: Windows
-            compression: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -99,15 +96,13 @@ jobs:
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-cache.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
-      - name: Install liblzma (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y liblzma-dev
-
+      # all + -f server + --enable-tests so the server executable and the
+      # test suites hit the same -Werror bar as the library on every OS.
       - name: Build
-        run: cabal build --ghc-options="-Werror" ${{ matrix.compression == false && '-f-compression' || '' }}
+        run: cabal build all -f server --enable-tests --ghc-options="-Werror"
 
       - name: Test
-        run: cabal test ${{ matrix.compression == false && '-f-compression' || '' }}
+        run: cabal test -f server --ghc-options="-Werror"
 
   # ---------------------------------------------------------------------------
   # Packaging check (Linux-only)
@@ -124,6 +119,40 @@ jobs:
           ghc-version: '9.8'
           cabal-version: 'latest'
       - run: cabal check
+
+  # ---------------------------------------------------------------------------
+  # Build from the sdist, exactly as a Hackage user does (Linux-only).
+  # CI otherwise builds the git tree; the tarball is what users install,
+  # and any divergence (files missing from the sdist, dev-only project
+  # settings) is invisible without this job.
+  # ---------------------------------------------------------------------------
+
+  sdist:
+    name: Build from sdist
+    needs: [lint, format]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-sdist-${{ hashFiles('nova-cache.cabal') }}
+          restore-keys: cabal-sdist-
+
+      - name: Build the tarball a Hackage user gets
+        run: |
+          cabal sdist -o "$RUNNER_TEMP/sdist"
+          tar -xzf "$RUNNER_TEMP"/sdist/nova-cache-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/nova-cache-*/
+          cabal build all -f server --enable-tests
 
   # ---------------------------------------------------------------------------
   # Deploy (Linux, main branch only)
