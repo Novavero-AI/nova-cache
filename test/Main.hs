@@ -20,7 +20,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectory, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 
