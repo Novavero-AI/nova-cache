@@ -1,6 +1,8 @@
 module Main (main) where
 
+import Control.Exception (SomeException, try)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
+import Data.Bits (shiftR, (.&.))
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -9,6 +11,7 @@ import Data.List (sort)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Word (Word8)
 import qualified NovaCache.Base32 as Base32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -17,7 +20,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive)
+import System.Directory (createDirectory, createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 
@@ -162,10 +165,17 @@ testBase32 =
             encoded = Base32.encode bs
          in assertEqual "encoded length" 52 (T.length encoded),
       test "nix known vector" $
-        -- SHA-256 of empty string in nix-base32 should be 52 chars
-        let Hash.NixHash raw = Hash.hashBytes BS.empty
-            encoded = Base32.encode raw
-         in assertEqual "sha256 of empty in base32 length" 52 (T.length encoded)
+        -- SHA-256 of the empty string exactly as real Nix renders it.  A
+        -- wrong alphabet or bit order stays self-consistent in roundtrips;
+        -- only an external vector catches it.
+        assertEqual
+          "sha256 of empty in nix-base32"
+          "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+          (Hash.formatNixHash (Hash.hashBytes BS.empty)),
+      test "decode rejects nonzero padding bits" $
+        -- 52 chars carry 260 bits for a 256-bit value; the 4 spare bits
+        -- must be zero in canonical nix-base32.
+        assertLeft "nonzero padding" (Base32.decode (T.replicate 52 "z"))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -311,7 +321,74 @@ testNAR =
             h2 = NAR.narHash (NAR.NarRegular False (BS.pack [2]))
          in assertTrue "different hashes" (h1 /= h2),
       test "deserialise garbage fails" $
-        assertLeft "garbage" (NAR.deserialise (BS.pack [0, 0, 0, 0, 0, 0, 0, 0]))
+        assertLeft "garbage" (NAR.deserialise (BS.pack [0, 0, 0, 0, 0, 0, 0, 0])),
+      test "roundtrip edge: empty directory" $
+        let entry = NAR.NarDirectory []
+         in assertRight "empty dir" entry (NAR.deserialise (NAR.serialise entry)),
+      test "roundtrip edge: contents a multiple of 8 (zero padding)" $
+        let entry = NAR.NarRegular False (BS.replicate 8 0x41)
+         in assertRight "8-byte contents" entry (NAR.deserialise (NAR.serialise entry)),
+      test "roundtrip edge: executable empty file" $
+        let entry = NAR.NarRegular True BS.empty
+         in assertRight "exec empty" entry (NAR.deserialise (NAR.serialise entry)),
+      -- Cache-served archives are untrusted input: every name that could
+      -- traverse out of an extraction root must fail the parse.
+      test "unsafe directory entry names rejected" $
+        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
+            names = ["..", ".", "", "a/b", "a\\b", "a\0b"]
+            rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
+         in assertTrue "all unsafe names rejected" (all (rejected . evil) names),
+      test "duplicate directory entries rejected" $
+        let dup =
+              NAR.serialise
+                ( NAR.NarDirectory
+                    [ ("same", NAR.NarRegular False "1"),
+                      ("same", NAR.NarRegular False "2")
+                    ]
+                )
+         in assertLeft "duplicate entries" (NAR.deserialise dup),
+      test "out-of-order directory entries rejected" $
+        assertLeft "unsorted entries" (NAR.deserialise outOfOrderDirNar),
+      test "trailing bytes after the root node rejected" $
+        let valid = NAR.serialise (NAR.NarRegular False "x")
+         in assertLeft "trailing bytes" (NAR.deserialise (valid <> "junk1234")),
+      test "nonzero string padding rejected" $
+        assertLeft "nonzero padding" (NAR.deserialise badPaddingNar)
+    ]
+
+-- | Encode one NAR wire string with a chosen padding byte.  The spec
+-- demands zero padding, so a nonzero byte builds archives the parser
+-- must reject - and 'NAR.serialise' (rightly) cannot produce them.
+narWireStr :: Word8 -> ByteString -> ByteString
+narWireStr padByte str = lenLE <> str <> BS.replicate padLen padByte
+  where
+    n = BS.length str
+    lenLE = BS.pack [fromIntegral ((n `shiftR` (8 * i)) .&. 0xff) | i <- [0 .. 7]]
+    padLen = (8 - n `mod` 8) `mod` 8
+
+-- | A directory NAR whose entries arrive out of sorted order - again not
+-- producible via 'NAR.serialise', which sorts on write.
+outOfOrderDirNar :: ByteString
+outOfOrderDirNar =
+  BS.concat
+    ( map
+        (narWireStr 0)
+        ( ["nix-archive-1", "(", "type", "directory"]
+            ++ entryFor "b"
+            ++ entryFor "a"
+            ++ [")"]
+        )
+    )
+  where
+    entryFor name = ["entry", "(", "name", name, "node", "(", "type", "regular", "contents", "", ")", ")"]
+
+-- | A regular-file NAR whose contents padding is nonzero.
+badPaddingNar :: ByteString
+badPaddingNar =
+  BS.concat
+    [ BS.concat (map (narWireStr 0) ["nix-archive-1", "(", "type", "regular", "contents"]),
+      narWireStr 1 "abc",
+      narWireStr 0 ")"
     ]
 
 -- ---------------------------------------------------------------------------
@@ -347,7 +424,7 @@ testNarInfo =
             ok1 <- assertEqual "storePath" "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0" (NarInfo.niStorePath ni)
             ok2 <- assertEqual "url" "nar/1234abcd.nar.xz" (NarInfo.niUrl ni)
             ok3 <- assertEqual "compression" "xz" (NarInfo.niCompression ni)
-            ok4 <- assertEqual "fileSize" 12345 (NarInfo.niFileSize ni)
+            ok4 <- assertEqual "fileSize" (Just 12345) (NarInfo.niFileSize ni)
             ok5 <- assertEqual "narSize" 67890 (NarInfo.niNarSize ni)
             ok6 <- assertEqual "refs count" 2 (length (NarInfo.niReferences ni))
             ok7 <- assertEqual "deriver" (Just "cccccccccccccccccccccccccccccccc-hello-1.0.drv") (NarInfo.niDeriver ni)
@@ -388,6 +465,44 @@ testNarInfo =
                 ok3 <- assertEqual "ca" Nothing (NarInfo.niCA ni)
                 ok4 <- assertEqual "refs" [] (NarInfo.niReferences ni)
                 pure (ok1 && ok2 && ok3 && ok4),
+      test "CRLF-terminated narinfo parses identically" $
+        assertEqual
+          "crlf tolerated"
+          (NarInfo.parseNarInfo sampleNarInfoText)
+          (NarInfo.parseNarInfo (T.replace "\n" "\r\n" sampleNarInfoText)),
+      test "upstream-optional fields default as upstream" $
+        -- Only StorePath, URL, NarHash, NarSize are mandatory upstream;
+        -- Compression defaults to bzip2 and FileHash/FileSize stay absent.
+        let bare =
+              T.unlines
+                [ "StorePath: /nix/store/aaaa-test",
+                  "URL: nar/test.nar.xz",
+                  "NarHash: sha256:def",
+                  "NarSize: 200"
+                ]
+         in case NarInfo.parseNarInfo bare of
+              Left err -> do
+                putStrLn ("  parse failed: " ++ err)
+                pure False
+              Right ni -> do
+                ok1 <- assertEqual "compression default" "bzip2" (NarInfo.niCompression ni)
+                ok2 <- assertEqual "fileHash absent" Nothing (NarInfo.niFileHash ni)
+                ok3 <- assertEqual "fileSize absent" Nothing (NarInfo.niFileSize ni)
+                pure (ok1 && ok2 && ok3),
+      test "CA field parse/render roundtrip" $
+        let withCA = sampleNarInfoText <> "CA: fixed:r:sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n"
+         in case NarInfo.parseNarInfo withCA of
+              Left err -> do
+                putStrLn ("  parse failed: " ++ err)
+                pure False
+              Right ni -> do
+                ok1 <-
+                  assertEqual
+                    "ca parsed"
+                    (Just "fixed:r:sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73")
+                    (NarInfo.niCA ni)
+                ok2 <- assertRight "ca survives render" ni (NarInfo.parseNarInfo (NarInfo.renderNarInfo ni))
+                pure (ok1 && ok2),
       test "parse missing required key fails" $
         let incomplete = T.unlines ["StorePath: /nix/store/aaaa-test", "URL: nar/test.nar.xz"]
          in assertLeft "missing key" (NarInfo.parseNarInfo incomplete),
@@ -465,6 +580,40 @@ testSigning =
                 assertEqual "key name" "test-key" (Signing.pkName pk),
       test "parseSecretKey no colon fails" $
         assertLeft "no colon" (Signing.parseSecretKey "nokeyname"),
+      test "empty key name rejected" $
+        -- An empty-named key would emit :sig lines no named trust anchor
+        -- matches; the misconfiguration must fail at load time.
+        let material = TE.decodeUtf8 (B64.encode (BS.pack [1 .. 64]))
+         in assertLeft "empty name" (Signing.parseSecretKey (":" <> material)),
+      test "empty key material rejected" $
+        assertLeft "empty material" (Signing.parsePublicKey "test-key:"),
+      test "signature from a different keypair rejected" $ do
+        signingKey <- generateTestSecretKey
+        otherKey <- generateTestSecretKey
+        let verifier = deriveTestPublicKey otherKey
+        case Signing.sign signingKey mkTestNarInfo of
+          Left err -> do
+            putStrLn ("  sign failed: " ++ err)
+            pure False
+          Right signed ->
+            assertTrue "cross-key rejected" (not (Signing.verify verifier mkTestNarInfo signed)),
+      test "valid signature under a renamed trust anchor rejected" $ do
+        signingKey <- generateTestSecretKey
+        let renamed = (deriveTestPublicKey signingKey) {Signing.pkName = "some-other-cache"}
+        case Signing.sign signingKey mkTestNarInfo of
+          Left err -> do
+            putStrLn ("  sign failed: " ++ err)
+            pure False
+          Right signed ->
+            assertTrue "name mismatch rejected" (not (Signing.verify renamed mkTestNarInfo signed)),
+      test "malformed signature lines rejected" $ do
+        signingKey <- generateTestSecretKey
+        let verifier = deriveTestPublicKey signingKey
+            wrongSize = "test-key:" <> TE.decodeUtf8 (B64.encode (BS.pack [1 .. 16]))
+            badLines = ["test-key:!!!not-base64!!!", wrongSize, "test-key:", "no-colon-at-all"]
+        assertTrue
+          "all malformed rejected"
+          (not (any (Signing.verify verifier mkTestNarInfo) badLines)),
       test "parsePublicKey wrong size fails" $
         let keyStr = "test-key:" <> TE.decodeUtf8 (B64.encode (BS.pack [1 .. 16]))
          in assertLeft "wrong size" (Signing.parsePublicKey keyStr),
@@ -531,8 +680,8 @@ mkTestNarInfo =
     { NarInfo.niStorePath = "/nix/store/aaaa-hello-1.0",
       NarInfo.niUrl = "nar/test.nar.xz",
       NarInfo.niCompression = "xz",
-      NarInfo.niFileHash = "sha256:abc",
-      NarInfo.niFileSize = 100,
+      NarInfo.niFileHash = Just "sha256:abc",
+      NarInfo.niFileSize = Just 100,
       NarInfo.niNarHash = "sha256:def",
       NarInfo.niNarSize = 200,
       NarInfo.niReferences = ["aaaa-hello-1.0"],
@@ -654,8 +803,8 @@ mkValidNarInfo =
     { NarInfo.niStorePath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0",
       NarInfo.niUrl = "nar/test.nar.xz",
       NarInfo.niCompression = "xz",
-      NarInfo.niFileHash = Hash.formatNixHash (Hash.hashBytes validFileBytes),
-      NarInfo.niFileSize = 5,
+      NarInfo.niFileHash = Just (Hash.formatNixHash (Hash.hashBytes validFileBytes)),
+      NarInfo.niFileSize = Just 5,
       NarInfo.niNarHash = Hash.formatNixHash (Hash.hashBytes validNarBytes),
       NarInfo.niNarSize = 5,
       NarInfo.niReferences = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0"],
@@ -674,7 +823,7 @@ testValidate =
           (Right mkValidNarInfo)
           (Validate.validateNarInfo mkValidNarInfo),
       test "validateNarInfo negative FileSize" $
-        let ni = mkValidNarInfo {NarInfo.niFileSize = -1}
+        let ni = mkValidNarInfo {NarInfo.niFileSize = Just (-1)}
          in assertEqual
               "negative filesize"
               (Left [Validate.NegativeFileSize (-1)])
@@ -703,7 +852,7 @@ testValidate =
                 putStrLn ("    expected Left [InvalidStorePath ..], got: " ++ show other)
                 pure False,
       test "validateNarInfo bad FileHash" $
-        let ni = mkValidNarInfo {NarInfo.niFileHash = "md5:bogus"}
+        let ni = mkValidNarInfo {NarInfo.niFileHash = Just "md5:bogus"}
          in case Validate.validateNarInfo ni of
               Left [Validate.InvalidFileHash raw _] ->
                 assertEqual "raw value" "md5:bogus" raw
@@ -729,7 +878,7 @@ testValidate =
       test "validateNarInfo multiple errors collected" $
         let ni =
               mkValidNarInfo
-                { NarInfo.niFileSize = -1,
+                { NarInfo.niFileSize = Just (-1),
                   NarInfo.niNarSize = -1,
                   NarInfo.niStorePath = "bad"
                 }
@@ -804,7 +953,7 @@ testValidate =
       test "validateFull multiple failures" $ do
         sk <- generateTestSecretKey
         let pk = deriveTestPublicKey sk
-            ni = mkValidNarInfo {NarInfo.niFileSize = -1, NarInfo.niNarSize = -1}
+            ni = mkValidNarInfo {NarInfo.niFileSize = Just (-1), NarInfo.niNarSize = -1}
         case Validate.validateFull pk ni (BS.pack [99]) (BS.pack [99]) of
           Left errs -> assertTrue "at least 4 errors" (length errs >= 4)
           Right _ -> do
@@ -817,11 +966,21 @@ testValidate =
 -- ---------------------------------------------------------------------------
 
 -- | Create a temporary test directory.
+-- | A fresh, unique directory under the system temp dir.  A fixed
+-- machine-global path poisons later runs whenever cleanup is skipped and
+-- races concurrent checkouts; probing numbered names until createDirectory
+-- succeeds gives uniqueness against both.
 createTestDir :: IO FilePath
 createTestDir = do
-  let dir = "/tmp/nova-cache-test"
-  createDirectoryIfMissing True dir
-  pure dir
+  base <- getTemporaryDirectory
+  probe base (0 :: Int)
+  where
+    probe base n = do
+      let dir = base ++ "/nova-cache-test-" ++ show n
+      made <- try (createDirectory dir) :: IO (Either SomeException ())
+      case made of
+        Right () -> pure dir
+        Left _ -> probe base (n + 1)
 
 -- | Generate a test Ed25519 secret key using crypton.
 generateTestSecretKey :: IO Signing.SecretKey

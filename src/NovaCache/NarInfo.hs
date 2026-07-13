@@ -21,12 +21,17 @@ import qualified Data.Text.Read as TR
 -- ---------------------------------------------------------------------------
 
 -- | A parsed @.narinfo@ record. All fields are strict.
+--
+-- Field optionality mirrors upstream Nix's parser: only StorePath, URL,
+-- NarHash, and NarSize are mandatory; Compression defaults to bzip2 when
+-- absent, and FileHash\/FileSize describe the compressed blob only when
+-- the cache provides them.
 data NarInfo = NarInfo
   { niStorePath :: !Text,
     niUrl :: !Text,
     niCompression :: !Text,
-    niFileHash :: !Text,
-    niFileSize :: !Integer,
+    niFileHash :: !(Maybe Text),
+    niFileSize :: !(Maybe Integer),
     niNarHash :: !Text,
     niNarSize :: !Integer,
     niReferences :: ![Text],
@@ -69,23 +74,29 @@ fieldColon = ":"
 -- Parsing
 -- ---------------------------------------------------------------------------
 
--- | Parse a narinfo text body into a 'NarInfo'.
+-- | Compression assumed when the narinfo omits the field, as upstream's
+-- parser does.
+defaultCompression :: Text
+defaultCompression = "bzip2"
+
+-- | Parse a narinfo text body into a 'NarInfo'.  Only StorePath, URL,
+-- NarHash, and NarSize are required, matching upstream Nix; a valid
+-- narinfo from a foreign cache must not be rejected over an absent
+-- optional field.
 parseNarInfo :: Text -> Either String NarInfo
 parseNarInfo txt = do
   let kvs = mapMaybe parseLine (T.lines txt)
   storePath <- require keyStorePath kvs
   url <- require keyUrl kvs
-  compression <- require keyCompression kvs
-  fileHash <- require keyFileHash kvs
-  fileSize <- require keyFileSize kvs >>= parseInteger keyFileSize
+  fileSize <- traverse (parseInteger keyFileSize) (lookupFirst keyFileSize kvs)
   narHashVal <- require keyNarHash kvs
   narSize <- require keyNarSize kvs >>= parseInteger keyNarSize
   pure
     NarInfo
       { niStorePath = storePath,
         niUrl = url,
-        niCompression = compression,
-        niFileHash = fileHash,
+        niCompression = fromMaybe defaultCompression (lookupFirst keyCompression kvs),
+        niFileHash = lookupFirst keyFileHash kvs,
         niFileSize = fileSize,
         niNarHash = narHashVal,
         niNarSize = narSize,
@@ -112,13 +123,14 @@ renderNarInfo ni =
   T.unlines $
     [ kv keyStorePath (niStorePath ni),
       kv keyUrl (niUrl ni),
-      kv keyCompression (niCompression ni),
-      kv keyFileHash (niFileHash ni),
-      kv keyFileSize (showT (niFileSize ni)),
-      kv keyNarHash (niNarHash ni),
-      kv keyNarSize (showT (niNarSize ni)),
-      kv keyReferences (T.unwords (niReferences ni))
+      kv keyCompression (niCompression ni)
     ]
+      ++ optionalKV keyFileHash (niFileHash ni)
+      ++ optionalKV keyFileSize (showT <$> niFileSize ni)
+      ++ [ kv keyNarHash (niNarHash ni),
+           kv keyNarSize (showT (niNarSize ni)),
+           kv keyReferences (T.unwords (niReferences ni))
+         ]
       ++ optionalKV keyDeriver (niDeriver ni)
       ++ map (kv keySig) (niSigs ni)
       ++ optionalKV keyCA (niCA ni)

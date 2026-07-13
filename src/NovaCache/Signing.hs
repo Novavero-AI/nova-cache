@@ -129,15 +129,22 @@ renderPublicKey (PublicKey keyName bytes) =
   keyName <> keySeparator <> TE.decodeLatin1 (B64.encode bytes)
 
 -- | Split a @name:base64@ string and decode the base64 payload.
+-- An empty name or empty payload is corrupt, as upstream's Key
+-- constructor treats it: an empty-named key would sign every narinfo
+-- with @:sig@ lines no client's named trust anchor can ever match, so
+-- the misconfiguration must fail at key-load time, not as silent
+-- signature rejection downstream.
 splitAndDecode :: Text -> String -> Either String (Text, ByteString)
 splitAndDecode txt label = case T.breakOn keySeparator txt of
-  (_, rest)
+  (keyName, rest)
     | T.null rest -> Left (label ++ " missing ':' separator")
+    | T.null keyName -> Left (label ++ " has an empty name before ':'")
+    | T.null encoded -> Left (label ++ " has empty key material after ':'")
     | otherwise -> do
-        let encoded = T.drop 1 rest
-            keyName = fst (T.breakOn keySeparator txt)
         decoded <- decodeBase64 encoded
         pure (keyName, decoded)
+    where
+      encoded = T.drop 1 rest
 
 -- | Assert that decoded bytes have the expected size.
 expectSize :: Int -> String -> ByteString -> Either String ()
