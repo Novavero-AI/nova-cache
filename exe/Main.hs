@@ -148,15 +148,17 @@ main = do
           Warp.setOnExceptionResponse onExceptionResponse Warp.defaultSettings
   Warp.runSettings settings (requestLogger (app cfg))
 
--- | Load a signing key from a file, if configured.
+-- | Load a signing key from a file, if configured.  A configured key that
+-- fails to load is FATAL: falling back to unsigned would persist narinfos
+-- no trust anchor can verify (the same fail-closed policy as 'signNarInfo').
 loadSigningKey :: Maybe FilePath -> IO (Maybe SecretKey)
 loadSigningKey Nothing = pure Nothing
 loadSigningKey (Just path) = do
   raw <- BS.readFile path
   case first show (TE.decodeUtf8' raw) >>= parseSecretKey . normalizeKeyText of
     Left err -> do
-      hPutStrLn stderr ("WARNING: failed to load signing key: " ++ err)
-      pure Nothing
+      hPutStrLn stderr ("FATAL: cannot load the signing key from " ++ path ++ ": " ++ err)
+      exitFailure
     Right sk -> pure (Just sk)
 
 -- | Derive the rendered public key line from the signing key, if any.
