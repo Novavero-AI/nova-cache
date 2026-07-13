@@ -175,7 +175,10 @@ jobs:
         run: |
           # Install cloudflared and reach the box through Cloudflare Access:
           # its public port 22 is closed, so SSH is Access-only now.
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          # Pinned version + checksum: the deploy must not run whatever
+          # binary "latest" serves on a given day.
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-amd64 -o /tmp/cloudflared
+          echo "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1  /tmp/cloudflared" | sha256sum -c -
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
 
           mkdir -p ~/.ssh

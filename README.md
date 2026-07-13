@@ -54,11 +54,16 @@ case validateFull publicKey ni narBytes fileBytes of
 cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
 ```
 
+The protocol itself lives in the `NovaCache.Server` library module as a WAI
+`Application`, so any operator can embed the cache in their own server with
+their own root page; the bundled executable is one such embedding.
+
 ### Configuration
 
 | Variable | Description |
 | --- | --- |
-| `PORT` | Listen port (default: 5000) |
+| `PORT` | Listen port (default: 5000; also `--port`) |
+| `HOST` | Bind host (default: all interfaces; also `--host`) |
 | `NIX_CACHE_DIR` | Store directory (default: `./nix-cache`) |
 | `CACHE_API_KEY` | Bearer token required for `PUT`. The server refuses to start without it unless `--allow-open-writes` is passed. |
 | `SIGNING_KEY_FILE` | Ed25519 secret key file for server-side narinfo signing |
@@ -70,11 +75,13 @@ cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
 | --- | --- | --- |
 | `GET` | `/` | Landing page: live stats and the cache public key |
 | `GET` | `/nix-cache-info` | Cache metadata |
-| `GET` | `/narinfo-hashes` | All cached narinfo hashes, newline-delimited |
+| `GET` | `/narinfo-hashes` | All cached narinfo hashes, newline-delimited (authenticated) |
 | `GET` | `/<hash>.narinfo` | Fetch a narinfo |
-| `GET` | `/nar/<file>` | Fetch a NAR |
+| `GET` | `/nar/<file>` | Fetch a NAR (streamed from disk) |
 | `PUT` | `/<hash>.narinfo` | Upload a narinfo (authenticated, validated) |
-| `PUT` | `/nar/<file>` | Upload a NAR (authenticated) |
+| `PUT` | `/nar/<file>` | Upload a NAR (authenticated, streamed to disk) |
+
+`HEAD` is answered wherever `GET` is.
 
 ### Public cache
 
