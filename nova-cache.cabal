@@ -24,7 +24,7 @@ extra-doc-files:
     README.md
 
 flag server
-  description: Build the cache server executable (pulls in warp/wai)
+  description: Build the cache server executable (pulls in warp and wai-extra)
   default:     False
   manual:      True
 
