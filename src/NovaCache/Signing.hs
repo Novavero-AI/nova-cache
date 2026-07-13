@@ -24,6 +24,7 @@ import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -128,15 +129,22 @@ renderPublicKey (PublicKey keyName bytes) =
   keyName <> keySeparator <> TE.decodeLatin1 (B64.encode bytes)
 
 -- | Split a @name:base64@ string and decode the base64 payload.
+-- An empty name or empty payload is corrupt, as upstream's Key
+-- constructor treats it: an empty-named key would sign every narinfo
+-- with @:sig@ lines no client's named trust anchor can ever match, so
+-- the misconfiguration must fail at key-load time, not as silent
+-- signature rejection downstream.
 splitAndDecode :: Text -> String -> Either String (Text, ByteString)
 splitAndDecode txt label = case T.breakOn keySeparator txt of
-  (_, rest)
+  (keyName, rest)
     | T.null rest -> Left (label ++ " missing ':' separator")
+    | T.null keyName -> Left (label ++ " has an empty name before ':'")
+    | T.null encoded -> Left (label ++ " has empty key material after ':'")
     | otherwise -> do
-        let encoded = T.drop 1 rest
-            keyName = fst (T.breakOn keySeparator txt)
         decoded <- decodeBase64 encoded
         pure (keyName, decoded)
+    where
+      encoded = T.drop 1 rest
 
 -- | Assert that decoded bytes have the expected size.
 expectSize :: Int -> String -> ByteString -> Either String ()
@@ -167,13 +175,17 @@ fingerprint ni =
       niStorePath ni,
       niNarHash ni,
       T.pack (show (niNarSize ni)),
-      T.intercalate referenceSep (map (storeDir <>) (niReferences ni))
+      T.intercalate referenceSep (map (storeDir <>) sortedReferences)
     ]
   where
     -- References in a narinfo are basenames, but the fingerprint signs them as
     -- full store paths (/nix/store/<hash>-<name>), matching C++ Nix.  The store
     -- directory is the leading path of the (already absolute) niStorePath.
     storeDir = T.dropWhileEnd (/= '/') (niStorePath ni)
+    -- C++ Nix fingerprints a StorePathSet - references sorted by basename,
+    -- deduplicated - so the narinfo's file order must not leak into the
+    -- signature: real Nix clients always verify against the sorted form.
+    sortedReferences = Set.toAscList (Set.fromList (niReferences ni))
 
 -- ---------------------------------------------------------------------------
 -- Signing and verification

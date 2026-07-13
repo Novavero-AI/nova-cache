@@ -254,7 +254,10 @@ parseDirectory = go Nothing []
     -- path-traversal surface for any future NAR-extraction consumer.
     checkName prev name
       | T.null name = Left "empty NAR directory entry name"
-      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\0') name =
+      -- Backslash is a directory separator on Windows - this library's
+      -- primary consumer - so a name like "..\out.exe" is as much a
+      -- traversal vector as one with '/'.
+      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\\' || c == '\0') name =
           Left ("unsafe NAR directory entry name: " ++ T.unpack name)
       | Just p <- prev,
         name <= p =
@@ -287,12 +290,17 @@ readStr bs
             ++ " exceeds remaining "
             ++ show (BS.length payload)
         )
+  -- Nix's reader rejects nonzero padding; accepting it would let archives
+  -- that upstream tooling refuses round-trip through this library.
+  | BS.any (/= 0) padding =
+      Left "nonzero padding bytes in NAR string"
   | otherwise =
       Right (BS.take (fromIntegral len) payload, BS.drop totalLen payload)
   where
     len = readWord64LE bs
     payload = BS.drop wordSize bs
     totalLen = fromIntegral len + narPad (fromIntegral len)
+    padding = BS.take (totalLen - fromIntegral len) (BS.drop (fromIntegral len) payload)
 
 -- | Read a little-endian 'Word64' from the first 8 bytes.
 readWord64LE :: ByteString -> Word64

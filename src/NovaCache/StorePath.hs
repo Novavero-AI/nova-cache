@@ -9,6 +9,8 @@ module NovaCache.StorePath
     StorePathHash (..),
     StorePathName (..),
     parseStorePath,
+    parseStorePathBaseName,
+    parseAbsoluteStorePath,
     renderStorePath,
     storePathHashString,
     storePathBaseName,
@@ -16,7 +18,7 @@ module NovaCache.StorePath
   )
 where
 
-import Data.Char (isAlphaNum)
+import Data.Char (isAlphaNum, isAscii)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -69,16 +71,22 @@ minBaseNameLen = storePathHashLen + 1
 hashNameSeparator :: Char
 hashNameSeparator = '-'
 
+-- | Maximum length of a store path name, as enforced by Nix.
+maxNameLen :: Int
+maxNameLen = 211
+
 -- ---------------------------------------------------------------------------
 -- Validation
 -- ---------------------------------------------------------------------------
 
 -- | Characters allowed in the name component of a store path.
 --
--- Alphanumeric plus @-._+?=@, matching the Nix specification.
+-- ASCII alphanumeric plus @-._+?=@, matching the Nix specification.  The
+-- ASCII restriction matters: Nix rejects non-ASCII letters and digits, so
+-- accepting them here would sign and store paths no Nix client can parse.
 validNameChar :: Char -> Bool
 validNameChar c =
-  isAlphaNum c
+  (isAscii c && isAlphaNum c)
     || c == '-'
     || c == '_'
     || c == '.'
@@ -93,9 +101,30 @@ validNameChar c =
 -- | Parse a store path from a full path or bare basename.
 --
 -- Accepts @\/nix\/store\/\<hash\>-\<name\>@ or just @\<hash\>-\<name\>@.
+-- Wire-format fields have a REQUIRED spelling; use 'parseStorePathBaseName'
+-- (narinfo References, Deriver) or 'parseAbsoluteStorePath' (narinfo
+-- StorePath) to enforce it.
 parseStorePath :: StoreDir -> Text -> Either String StorePath
 parseStorePath (StoreDir dir) txt =
   parseBaseName (stripDirPrefix dir txt)
+
+-- | Parse a bare @\<hash\>-\<name\>@ basename, rejecting any path separator.
+-- Narinfo References and Deriver are basenames on the wire; upstream Nix
+-- rejects tokens containing @\/@ outright.
+parseStorePathBaseName :: Text -> Either String StorePath
+parseStorePathBaseName txt
+  | T.any (== '/') txt =
+      Left ("expected a store path basename, got a path: " ++ T.unpack txt)
+  | otherwise = parseBaseName txt
+
+-- | Parse a full @\<store-dir\>\/\<hash\>-\<name\>@ path, rejecting a bare
+-- basename.  The narinfo StorePath field is absolute on the wire.
+parseAbsoluteStorePath :: StoreDir -> Text -> Either String StorePath
+parseAbsoluteStorePath (StoreDir dir) txt =
+  case T.stripPrefix (T.pack dir <> "/") txt of
+    Just basename -> parseBaseName basename
+    Nothing ->
+      Left ("expected an absolute store path under " ++ dir ++ ": " ++ T.unpack txt)
 
 -- | Strip the store directory prefix if present.
 stripDirPrefix :: FilePath -> Text -> Text
@@ -115,6 +144,8 @@ parseBaseName basename
       Left ("invalid nix-base32 hash in store path: " ++ T.unpack hashPart)
   | T.null name =
       Left ("empty name in store path: " ++ T.unpack basename)
+  | T.length name > maxNameLen =
+      Left ("store path name longer than " ++ show maxNameLen ++ " characters: " ++ T.unpack name)
   | not (T.all validNameChar name) =
       Left ("invalid characters in store path name: " ++ T.unpack name)
   | otherwise =

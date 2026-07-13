@@ -19,7 +19,7 @@ import qualified Data.Text as T
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 import NovaCache.NarInfo (NarInfo (..))
 import NovaCache.Signing (PublicKey, verify)
-import NovaCache.StorePath (defaultStoreDir, parseStorePath)
+import NovaCache.StorePath (defaultStoreDir, parseAbsoluteStorePath, parseStorePathBaseName)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -65,19 +65,26 @@ validateNarInfo ni =
     errs -> Left errs
   where
     sizeErrors =
-      [NegativeFileSize (niFileSize ni) | niFileSize ni < 0]
+      [NegativeFileSize declared | Just declared <- [niFileSize ni], declared < 0]
         ++ [NegativeNarSize (niNarSize ni) | niNarSize ni < 0]
 
     drvErrors =
       [DerivationStorePath (niStorePath ni) | ".drv" `T.isSuffixOf` niStorePath ni]
 
-    storePathErrors = case parseStorePath defaultStoreDir (niStorePath ni) of
+    -- The wire format fixes each field's spelling: StorePath is absolute,
+    -- References and Deriver are basenames.  Accepting the other spelling
+    -- would sign narinfos (bare StorePath, absolute references) that every
+    -- real Nix client rejects at parse time - and a bare StorePath also
+    -- derives an empty store dir in the signed fingerprint.
+    storePathErrors = case parseAbsoluteStorePath defaultStoreDir (niStorePath ni) of
       Left err -> [InvalidStorePath (niStorePath ni) err]
       Right _ -> []
 
-    fileHashErrors = case parseNixHash (niFileHash ni) of
-      Left err -> [InvalidFileHash (niFileHash ni) err]
-      Right _ -> []
+    fileHashErrors = case niFileHash ni of
+      Nothing -> []
+      Just declared -> case parseNixHash declared of
+        Left err -> [InvalidFileHash declared err]
+        Right _ -> []
 
     narHashErrors = case parseNixHash (niNarHash ni) of
       Left err -> [InvalidNarHash (niNarHash ni) err]
@@ -85,7 +92,7 @@ validateNarInfo ni =
 
     refErrors = concatMap checkRef (niReferences ni)
 
-    checkRef ref = case parseStorePath defaultStoreDir ref of
+    checkRef ref = case parseStorePathBaseName ref of
       Left err -> [InvalidReference ref err]
       Right _ -> []
 
@@ -97,8 +104,11 @@ validateNarInfo ni =
 -- the declared 'niNarHash'.
 validateNarHash :: NarInfo -> ByteString -> Either ValidationError ()
 validateNarHash ni narBytes =
-  -- Compare DECODED hash bytes, not re-formatted strings, so any valid encoding
-  -- of the declared NarHash (SRI, hex, base32) validates against the same digest.
+  -- Compare DECODED hash bytes, not re-formatted strings.  Only the
+  -- canonical sha256:<nix-base32> spelling parses - deliberately strict,
+  -- since the fingerprint signs the NarHash TEXT verbatim; accepting other
+  -- encodings on the read side arrives with the foreign-cache substitution
+  -- feature that needs them.
   case parseNixHash (niNarHash ni) of
     Left err -> Left (InvalidNarHash (niNarHash ni) err)
     Right declared
@@ -106,14 +116,17 @@ validateNarHash ni narBytes =
       | otherwise -> Left (NarHashMismatch (niNarHash ni) (formatNixHash (hashBytes narBytes)))
 
 -- | Validate that the SHA-256 hash of compressed file bytes matches
--- the declared 'niFileHash'.
+-- the declared 'niFileHash'.  An absent FileHash declares nothing to
+-- check (upstream treats the field as optional); integrity then rests on
+-- the always-required NarHash.
 validateFileHash :: NarInfo -> ByteString -> Either ValidationError ()
-validateFileHash ni fileBytes =
-  case parseNixHash (niFileHash ni) of
-    Left err -> Left (InvalidFileHash (niFileHash ni) err)
+validateFileHash ni fileBytes = case niFileHash ni of
+  Nothing -> Right ()
+  Just declaredText -> case parseNixHash declaredText of
+    Left err -> Left (InvalidFileHash declaredText err)
     Right declared
       | declared == hashBytes fileBytes -> Right ()
-      | otherwise -> Left (FileHashMismatch (niFileHash ni) (formatNixHash (hashBytes fileBytes)))
+      | otherwise -> Left (FileHashMismatch declaredText (formatNixHash (hashBytes fileBytes)))
 
 -- ---------------------------------------------------------------------------
 -- Signature validation

@@ -13,6 +13,9 @@ module NovaCache.Store
     writeNarInfo,
     readNar,
     writeNar,
+    NarWriteResult (..),
+    writeNarStreaming,
+    narFilePath,
     listNarInfoHashes,
     CacheInfo (..),
     getCacheInfo,
@@ -135,6 +138,56 @@ writeNar :: FileStore -> Text -> ByteString -> IO Bool
 writeNar fs fileName body = case sanitizePath fileName of
   Nothing -> pure False
   Just safe -> atomicWriteFile (fsRoot fs </> narSubdir </> safe) body >> pure True
+
+-- | Outcome of a streaming NAR write.
+data NarWriteResult
+  = -- | Fully written and atomically renamed into place.
+    NarWriteOk
+  | -- | The chunk stream exceeded the size cap; the partial temp file
+    -- was deleted and nothing changed in the store.
+    NarWriteTooLarge
+  | -- | The filename failed 'sanitizePath'; nothing was written.
+    NarWriteBadPath
+  deriving (Eq, Show)
+
+-- | Stream a NAR to disk from a chunk source (an empty chunk means end of
+-- input), enforcing a total-size cap as bytes arrive so the body is never
+-- held in memory.  Same atomic temp-then-rename discipline as 'writeNar':
+-- readers see the old file or the complete new one, never a partial write.
+writeNarStreaming :: FileStore -> Text -> Int -> IO ByteString -> IO NarWriteResult
+writeNarStreaming fs fileName limit nextChunk = case sanitizePath fileName of
+  Nothing -> pure NarWriteBadPath
+  Just safe -> do
+    let target = fsRoot fs </> narSubdir </> safe
+    (tmpPath, handle) <- openBinaryTempFile (takeDirectory target) tempFilePrefix
+    let cleanup = do
+          ignoringExceptions (hClose handle)
+          ignoringExceptions (removeFile tmpPath)
+        consume !total = do
+          chunk <- nextChunk
+          if BS.null chunk
+            then do
+              hClose handle
+              renameFile tmpPath target
+              pure NarWriteOk
+            else
+              let grown = total + BS.length chunk
+               in if grown > limit
+                    then cleanup >> pure NarWriteTooLarge
+                    else BS.hPut handle chunk >> consume grown
+    consume 0 `onException` cleanup
+
+-- | The on-disk path of a stored NAR, if present.  Lets a server hand the
+-- file to its transport layer (e.g. WAI's @responseFile@, which streams
+-- from disk) instead of buffering the bytes; the name passes the same
+-- 'sanitizePath' contract as 'readNar'.
+narFilePath :: FileStore -> Text -> IO (Maybe FilePath)
+narFilePath fs fileName = case sanitizePath fileName of
+  Nothing -> pure Nothing
+  Just safe -> do
+    let path = fsRoot fs </> narSubdir </> safe
+    exists <- doesFileExist path
+    pure (if exists then Just path else Nothing)
 
 -- ---------------------------------------------------------------------------
 -- Listing

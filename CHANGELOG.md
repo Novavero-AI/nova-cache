@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0.0 - 2026-07-12
+
+- **Signing: fingerprints sort and deduplicate references.** C++ Nix computes and verifies narinfo fingerprints over a sorted, deduplicated store-path set; signing in the narinfo's file order produced signatures real Nix clients reject while nova-cache's own `verify` (recomputing from the same order) passed and masked the divergence. References are now sorted by basename and deduplicated before signing.
+- **Removed `NovaCache.Compression`, the `compression` flag, and the `lzma` dependency.** The module had no consumer, and the default-on manual flag made every Hackage install require system liblzma dev files, which plain Windows and minimal Linux machines lack - `cabal install` of downstream packages failed while CI (which pins the flag off inside the repo) stayed green. xz support returns with its first real consumer as a size-bounded decoder suitable for untrusted cache data.
+- **Wire-format strictness now matches upstream Nix.** `validateNarInfo` requires the StorePath field to be absolute and references to be bare basenames (the other spellings produce narinfos real clients reject at parse time, and a bare StorePath also derived an empty store dir inside the signed fingerprint); store-path names are ASCII-only and capped at 211 characters; NAR parsing rejects backslashes in entry names (the Windows traversal vector) and nonzero string padding; and key parsing rejects an empty name or empty key material at load time instead of producing signatures no trust anchor can match. New `parseStorePathBaseName` and `parseAbsoluteStorePath` expose the per-field parsers.
+- **Upstream-optional narinfo fields are now optional.** Only StorePath, URL, NarHash, and NarSize are required; `Compression` defaults to bzip2 as upstream, and `FileHash`/`FileSize` are `Maybe` (breaking record change, covered by the major bump). Valid narinfos from foreign caches no longer fail to parse over absent optional fields.
+- **New `NovaCache.Server` module: the cache's HTTP protocol as a WAI `Application`.** Routing, write authentication, request-body limits, and the narinfo validation/signing pipeline move from the server executable into tested library API. Deployment branding stays out of the library: embedders supply their own root-page response, and the bundled executable carries its landing page itself. Adds `wai` and `http-types` to the library dependencies.
+- **`GET /narinfo-hashes` requires the write key and is `Cache-Control: no-store`.** The listing enumerates the whole store - something the public cache protocol deliberately never offers - and lists a directory per hit; it exists only for the push tool, which already holds the write key.
+- **NAR bodies no longer transit memory.** Uploads stream to a temp file under a running size cap and rename into place atomically (`NovaCache.Store.writeNarStreaming`); downloads are served from disk via WAI's `responseFile` (`NovaCache.Store.narFilePath`). A multi-GB NAR previously occupied that much RAM per request in both directions.
+- **`HEAD` is answered wherever `GET` is.** Clients probing narinfo existence with `HEAD` previously got 404.
+- **The server refuses to start when `CACHE_API_KEY` normalizes to empty** (BOM or whitespace only - the copy-paste artifact). An empty armed key would authenticate an empty bearer token.
+- **The server refuses to start when a configured signing key fails to load.** It previously logged a warning and ran unsigned, persisting narinfos no trust anchor can verify - the same misconfiguration class the key parser now rejects, closed at the process boundary too.
+- **Configurable bind host: `--host` / `HOST`.** The default stays all interfaces, so existing deployments do not silently rebind.
+- The deploy workflow pins cloudflared by version and checksum instead of pulling `latest`.
+- **The sdist ships `NOTICE`.** Apache-2.0 section 4(d) asks redistributions to carry it; the file existed in the repo but not in the released tarball.
+- **CI builds from the sdist in isolation**, so tree-vs-tarball divergences (files missing from the tarball, dev-only project settings) fail the pipeline instead of surfacing at install time. CI also compiles the server executable and test suites under `-Werror` on every platform.
+- Dropped the server executable's unused `crypton` dependency.
+- Workflows run with a read-only `GITHUB_TOKEN`.
+
 ## 0.4.2.1 - 2026-06-12
 
 - **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under their original licenses.
