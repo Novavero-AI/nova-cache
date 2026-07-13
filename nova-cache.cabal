@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nova-cache
-version:            0.4.2.1
+version:            0.5.0.0
 synopsis:           Pure-first Nix binary cache protocol library
 description:
   A pure-first library implementing the Nix binary cache protocol -
@@ -20,16 +20,12 @@ build-type:         Simple
 tested-with:        GHC == 9.8.4
 extra-doc-files:
     CHANGELOG.md
+    NOTICE
     README.md
 
 flag server
   description: Build the cache server executable (pulls in warp/wai)
   default:     False
-  manual:      True
-
-flag compression
-  description: Enable LZMA/XZ compression (requires system liblzma)
-  default:     True
   manual:      True
 
 library
@@ -43,10 +39,6 @@ library
     NovaCache.Store
     NovaCache.StorePath
     NovaCache.Validate
-
-  if flag(compression)
-    exposed-modules: NovaCache.Compression
-    build-depends:   lzma >= 0.0.1 && < 0.1
 
   build-depends:
       base                >= 4.16 && < 5
@@ -86,7 +78,6 @@ executable nova-cache-server
   build-depends:
       base                >= 4.16 && < 5
     , bytestring          >= 0.11 && < 0.13
-    , crypton             >= 1.1 && < 2
     , nova-cache
     , ram                 >= 0.20 && < 1
     , http-types          >= 0.12 && < 0.13
@@ -113,23 +104,6 @@ test-suite nova-cache-test
     , nova-cache
     , ram                 >= 0.20 && < 1
     , text                >= 2.0 && < 2.2
-
-test-suite nova-cache-compression-test
-  if !flag(compression)
-    buildable: False
-
-  type:             exitcode-stdio-1.0
-  main-is:          CompressionTest.hs
-  hs-source-dirs:   test
-  default-language: Haskell2010
-  default-extensions:
-    OverloadedStrings
-  ghc-options:      -Wall -Wcompat
-
-  build-depends:
-      base                >= 4.16 && < 5
-    , bytestring          >= 0.11 && < 0.13
-    , nova-cache
 
 source-repository head
   type:     git

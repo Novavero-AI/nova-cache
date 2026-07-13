@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0.0 - 2026-07-12
+
+- **Signing: fingerprints sort and deduplicate references.** C++ Nix computes and verifies narinfo fingerprints over a sorted, deduplicated store-path set; signing in the narinfo's file order produced signatures real Nix clients reject while nova-cache's own `verify` (recomputing from the same order) passed and masked the divergence. References are now sorted by basename and deduplicated before signing.
+- **Removed `NovaCache.Compression`, the `compression` flag, and the `lzma` dependency.** The module had no consumer, and the default-on manual flag made every Hackage install require system liblzma dev files, which plain Windows and minimal Linux machines lack - `cabal install` of downstream packages failed while CI (which pins the flag off inside the repo) stayed green. xz support returns with its first real consumer as a size-bounded decoder suitable for untrusted cache data.
+- **The sdist ships `NOTICE`.** Apache-2.0 section 4(d) asks redistributions to carry it; the file existed in the repo but not in the released tarball.
+- **CI builds from the sdist in isolation**, so tree-vs-tarball divergences (files missing from the tarball, dev-only project settings) fail the pipeline instead of surfacing at install time. CI also compiles the server executable and test suites under `-Werror` on every platform.
+- Dropped the server executable's unused `crypton` dependency.
+- Workflows run with a read-only `GITHUB_TOKEN`.
+
 ## 0.4.2.1 - 2026-06-12
 
 - **Relicensed from BSD-3-Clause to Apache-2.0.** Apache adds an explicit patent grant and trademark terms, and a `NOTICE` file now carries the copyright (Novavero AI Inc.). Earlier releases on Hackage remain under their original licenses.
