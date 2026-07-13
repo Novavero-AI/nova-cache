@@ -13,7 +13,7 @@
 - **The server refuses to start when `CACHE_API_KEY` normalizes to empty** (BOM or whitespace only - the copy-paste artifact). An empty armed key would authenticate an empty bearer token.
 - **The server refuses to start when a configured signing key fails to load.** It previously logged a warning and ran unsigned, persisting narinfos no trust anchor can verify - the same misconfiguration class the key parser now rejects, closed at the process boundary too.
 - **Configurable bind host: `--host` / `HOST`.** The default stays all interfaces, so existing deployments do not silently rebind.
-- The deploy workflow pins cloudflared by version and checksum instead of pulling `latest`.
+- The deploy workflow pins cloudflared by version and checksum instead of pulling `latest`, and builds the server on GitHub's hosted arm64 image (same Ubuntu as the production box), shipping the binary over the Access tunnel - the production host deliberately carries no compiler toolchain.
 - **The sdist ships `NOTICE`.** Apache-2.0 section 4(d) asks redistributions to carry it; the file existed in the repo but not in the released tarball.
 - **CI builds from the sdist in isolation**, so tree-vs-tarball divergences (files missing from the tarball, dev-only project settings) fail the pipeline instead of surfacing at install time. CI also compiles the server executable and test suites under `-Werror` on every platform.
 - Dropped the server executable's unused `crypton` dependency.
