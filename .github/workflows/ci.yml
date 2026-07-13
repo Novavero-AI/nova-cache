@@ -155,15 +155,38 @@ jobs:
           cabal build all -f server --enable-tests
 
   # ---------------------------------------------------------------------------
-  # Deploy (Linux, main branch only)
+  # Deploy (main branch only): build on the hosted arm64 image, ship the
+  # binary.  anv26 is an Ampere box on the same Ubuntu 24.04, so the
+  # runner's glibc matches - and the production host deliberately carries
+  # no compiler toolchain.
   # ---------------------------------------------------------------------------
 
   deploy-server:
     name: Deploy Server
     needs: [build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-deploy-arm-${{ hashFiles('nova-cache.cabal') }}
+          restore-keys: cabal-deploy-arm-
+
+      - name: Build the server binary (arm64)
+        run: |
+          cabal build --flag server --ghc-options="-Wall -Werror"
+          cp "$(cabal list-bin --flag server nova-cache-server)" /tmp/nova-cache-server
+
       - name: Deploy to OCI
         env:
           OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
@@ -173,12 +196,13 @@ jobs:
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          # Install cloudflared and reach the box through Cloudflare Access:
-          # its public port 22 is closed, so SSH is Access-only now.
+          # Install cloudflared (the arm64 asset - this runner is arm) and
+          # reach the box through Cloudflare Access: its public port 22 is
+          # closed, so SSH is Access-only now.
           # Pinned version + checksum: the deploy must not run whatever
           # binary "latest" serves on a given day.
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-amd64 -o /tmp/cloudflared
-          echo "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1  /tmp/cloudflared" | sha256sum -c -
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-arm64 -o /tmp/cloudflared
+          echo "18f2c9bfc7a67a971bd96f1a5a1935def3c1e52aa386626f1566f04e9b5478d6  /tmp/cloudflared" | sha256sum -c -
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
 
           mkdir -p ~/.ssh
@@ -218,6 +242,10 @@ jobs:
           EOF
 
           scp /tmp/nova-cache.service anv26:/tmp/nova-cache.service
+          # The binary rides the same Access tunnel as everything else; the
+          # service keeps serving during the transfer and stops only for
+          # the install below.
+          scp /tmp/nova-cache-server anv26:/tmp/nova-cache-server
 
           # Provision the API key as a root-only environment file.  The value
           # travels over stdin, so it appears in no command line, no log, and
@@ -226,16 +254,8 @@ jobs:
             "sudo sh -c 'umask 077; mkdir -p /etc/nix-cache; cat > /etc/nix-cache/env; chown root:root /etc/nix-cache/env; chmod 600 /etc/nix-cache/env'"
 
           ssh anv26 "\
-            source ~/.ghcup/env && \
-            cd ~/nova-cache && \
-            git pull && \
-            cabal update && \
-            cabal clean && \
-            cabal build --flag server --ghc-options='-Wall -Werror' && \
-            BINARY=\$(cabal list-bin --flag server nova-cache-server) && \
             sudo systemctl stop nova-cache.service && \
-            sudo cp \"\$BINARY\" /usr/local/bin/nova-cache-server && \
-            sudo chmod +x /usr/local/bin/nova-cache-server && \
+            sudo install -m 0755 /tmp/nova-cache-server /usr/local/bin/nova-cache-server && \
             sudo cp /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
             sudo systemctl daemon-reload && \
             sudo systemctl start nova-cache.service && \
