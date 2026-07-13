@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 module Main (main) where
 
 import Control.Exception (SomeException, try)
@@ -7,20 +9,27 @@ import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Lazy as BL
+import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (sort)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
+import qualified Network.HTTP.Types as HTTP
+import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, requestBodyLength, requestHeaders, requestMethod)
+import qualified Network.Wai.Test as WT
 import qualified NovaCache.Base32 as Base32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
+import qualified NovaCache.Server as Server
 import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectory, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 
@@ -126,7 +135,8 @@ main = do
       testNarInfo,
       testSigning,
       testFileStore,
-      testValidate
+      testValidate,
+      testServer
     ]
 
 -- ---------------------------------------------------------------------------
@@ -962,10 +972,288 @@ testValidate =
     ]
 
 -- ---------------------------------------------------------------------------
+-- Server (WAI) tests
+-- ---------------------------------------------------------------------------
+
+-- | The write key the authenticated-server tests configure.
+serverTestApiKey :: ByteString
+serverTestApiKey = "test-api-key"
+
+-- | The Authorization header 'serverTestApiKey' expects.
+serverAuthHeader :: HTTP.Header
+serverAuthHeader = (HTTP.hAuthorization, "Bearer " <> serverTestApiKey)
+
+-- | Store-path hash of 'validServerNarInfo' (32 nix-base32 zeros).
+validNarInfoHashKey :: Text
+validNarInfoHashKey = T.replicate 32 "0"
+
+-- | A canonical all-zero sha256 in nix-base32: 52 digits, and the 4
+-- spare bits of the 260-bit encoding are zero, so it parses.
+zeroNarHash :: Text
+zeroNarHash = "sha256:" <> T.replicate 52 "0"
+
+-- | A narinfo that passes 'Validate.validateNarInfo' end to end, keyed
+-- under 'validNarInfoHashKey'.
+validServerNarInfo :: NarInfo.NarInfo
+validServerNarInfo =
+  NarInfo.NarInfo
+    { NarInfo.niStorePath = "/nix/store/" <> validNarInfoHashKey <> "-hello-1.0",
+      NarInfo.niUrl = "nar/test.nar",
+      NarInfo.niCompression = "none",
+      NarInfo.niFileHash = Nothing,
+      NarInfo.niFileSize = Nothing,
+      NarInfo.niNarHash = zeroNarHash,
+      NarInfo.niNarSize = 200,
+      NarInfo.niReferences = [validNarInfoHashKey <> "-hello-1.0"],
+      NarInfo.niDeriver = Nothing,
+      NarInfo.niSigs = [],
+      NarInfo.niCA = Nothing
+    }
+
+-- | Rendered wire form of 'validServerNarInfo'.
+validServerNarInfoBytes :: BL.ByteString
+validServerNarInfoBytes =
+  BL.fromStrict (TE.encodeUtf8 (NarInfo.renderNarInfo validServerNarInfo))
+
+-- | Run one test against a fresh server (configurable write key and
+-- signing key), removing the store directory afterwards.
+withServer :: Maybe ByteString -> Maybe Signing.SecretKey -> (Server.ServerConfig -> IO Bool) -> IO Bool
+withServer apiKey sigKey body = do
+  tmpDir <- createTestDir
+  store <- Store.newFileStore tmpDir
+  passed <-
+    body
+      Server.ServerConfig
+        { Server.scStore = store,
+          Server.scApiKey = apiKey,
+          Server.scSigningKey = sigKey,
+          Server.scRootResponse = Server.defaultRootResponse
+        }
+  removeDirectoryRecursive tmpDir
+  pure passed
+
+-- | 'withServer' with write auth armed and no signing - the common case.
+withAuthedServer :: (Server.ServerConfig -> IO Bool) -> IO Bool
+withAuthedServer = withServer (Just serverTestApiKey) Nothing
+
+-- | Execute a single request against the server.
+serverRequest :: Server.ServerConfig -> BS.ByteString -> [Text] -> [HTTP.Header] -> BL.ByteString -> IO WT.SResponse
+serverRequest cfg method segments headers body =
+  WT.runSession (WT.srequest (WT.SRequest req body)) (Server.cacheApp cfg)
+  where
+    req =
+      defaultRequest
+        { requestMethod = method,
+          pathInfo = segments,
+          requestHeaders = headers
+        }
+
+-- | Like 'serverRequest', with a declared Content-Length - for the
+-- reject-before-reading limit checks.
+serverRequestSized :: Server.ServerConfig -> BS.ByteString -> [Text] -> [HTTP.Header] -> Word -> IO WT.SResponse
+serverRequestSized cfg method segments headers declared =
+  WT.runSession (WT.srequest (WT.SRequest req "")) (Server.cacheApp cfg)
+  where
+    req =
+      defaultRequest
+        { requestMethod = method,
+          pathInfo = segments,
+          requestHeaders = headers,
+          requestBodyLength = KnownLength (fromIntegral declared)
+        }
+
+-- | A chunk source yielding the given chunks, then empty (end of input).
+chunkSource :: [ByteString] -> IO (IO ByteString)
+chunkSource chunks = do
+  remaining <- newIORef chunks
+  pure $
+    atomicModifyIORef' remaining $ \case
+      [] -> ([], BS.empty)
+      (c : cs) -> (cs, c)
+
+-- | Body bytes as strict ByteString, for infix assertions.
+strictBody :: WT.SResponse -> ByteString
+strictBody = BL.toStrict . WT.simpleBody
+
+testServer :: IO Bool
+testServer =
+  runGroup
+    "Server"
+    [ test "GET / serves the default root response" $
+        withServer Nothing Nothing $ \cfg -> do
+          resp <- serverRequest cfg "GET" [] [] ""
+          ok1 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
+          ok2 <- assertEqual "body" "nova-cache: a Nix binary cache\n" (WT.simpleBody resp)
+          pure (ok1 && ok2),
+      test "GET /nix-cache-info renders cache metadata" $
+        withServer Nothing Nothing $ \cfg -> do
+          resp <- serverRequest cfg "GET" ["nix-cache-info"] [] ""
+          ok1 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
+          ok2 <- assertTrue "StoreDir line" (BS.isInfixOf "StoreDir: /nix/store" (strictBody resp))
+          pure (ok1 && ok2),
+      test "unknown route is 404" $
+        withServer Nothing Nothing $ \cfg -> do
+          resp <- serverRequest cfg "GET" ["no", "such", "route"] [] ""
+          assertEqual "status" HTTP.status404 (WT.simpleStatus resp),
+      -- HEAD is routed exactly like GET (upstream clients probe narinfo
+      -- existence with HEAD; it used to fall through to 404).
+      test "HEAD is served wherever GET is" $
+        withServer Nothing Nothing $ \cfg -> do
+          okResp <- serverRequest cfg "HEAD" ["nix-cache-info"] [] ""
+          missingResp <- serverRequest cfg "HEAD" [validNarInfoHashKey <> ".narinfo"] [] ""
+          ok1 <- assertEqual "present" HTTP.status200 (WT.simpleStatus okResp)
+          ok2 <- assertEqual "absent" HTTP.status404 (WT.simpleStatus missingResp)
+          pure (ok1 && ok2),
+      -- Write authentication
+      test "PUT narinfo without auth is 401" $
+        withAuthedServer $ \cfg -> do
+          resp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [] validServerNarInfoBytes
+          assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
+      test "PUT narinfo with the wrong key is 401" $
+        withAuthedServer $ \cfg -> do
+          let wrongAuth = (HTTP.hAuthorization, "Bearer not-the-key")
+          resp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [wrongAuth] validServerNarInfoBytes
+          assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
+      test "PUT then GET narinfo roundtrip" $
+        withAuthedServer $ \cfg -> do
+          putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
+          getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
+          ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "GET status" HTTP.status200 (WT.simpleStatus getResp)
+          ok3 <- assertTrue "StorePath present" (BS.isInfixOf (TE.encodeUtf8 validNarInfoHashKey) (strictBody getResp))
+          ok4 <-
+            assertEqual
+              "revalidatable, never immutable"
+              (Just "public, max-age=3600, must-revalidate")
+              (lookup HTTP.hCacheControl (WT.simpleHeaders getResp))
+          pure (ok1 && ok2 && ok3 && ok4),
+      test "PUT narinfo signs when a key is configured" $ do
+        sigKey <- generateTestSecretKey
+        withServer (Just serverTestApiKey) (Just sigKey) $ \cfg -> do
+          putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
+          getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
+          ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
+          ok2 <- assertTrue "Sig line present" (BS.isInfixOf "Sig: test-key:" (strictBody getResp))
+          pure (ok1 && ok2),
+      -- The confused-deputy gate: a narinfo describing path X cannot be
+      -- stored under path Y's key.
+      test "PUT narinfo under a mismatched hash is 400" $
+        withAuthedServer $ \cfg -> do
+          let otherKey = T.replicate 32 "1" <> ".narinfo"
+          resp <- serverRequest cfg "PUT" [otherKey] [serverAuthHeader] validServerNarInfoBytes
+          assertEqual "status" HTTP.status400 (WT.simpleStatus resp),
+      test "PUT malformed narinfo is 400" $
+        withAuthedServer $ \cfg -> do
+          resp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] "not a narinfo"
+          assertEqual "status" HTTP.status400 (WT.simpleStatus resp),
+      test "PUT narinfo with an oversized declared length is 413" $
+        withAuthedServer $ \cfg -> do
+          resp <-
+            serverRequestSized
+              cfg
+              "PUT"
+              [validNarInfoHashKey <> ".narinfo"]
+              [serverAuthHeader]
+              (fromIntegral Server.maxNarInfoBodySize + 1)
+          assertEqual "status" HTTP.status413 (WT.simpleStatus resp),
+      -- The hash listing is push-tool plumbing: authenticated, uncacheable.
+      test "GET /narinfo-hashes without auth is 401" $
+        withAuthedServer $ \cfg -> do
+          resp <- serverRequest cfg "GET" ["narinfo-hashes"] [] ""
+          assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
+      test "GET /narinfo-hashes with auth lists hashes, uncacheable" $
+        withAuthedServer $ \cfg -> do
+          putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
+          resp <- serverRequest cfg "GET" ["narinfo-hashes"] [serverAuthHeader] ""
+          ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
+          ok3 <- assertTrue "uploaded hash listed" (BS.isInfixOf (TE.encodeUtf8 validNarInfoHashKey) (strictBody resp))
+          ok4 <- assertEqual "no-store" (Just "no-store") (lookup HTTP.hCacheControl (WT.simpleHeaders resp))
+          pure (ok1 && ok2 && ok3 && ok4),
+      test "GET /narinfo-hashes in open mode needs no auth" $
+        withServer Nothing Nothing $ \cfg -> do
+          resp <- serverRequest cfg "GET" ["narinfo-hashes"] [] ""
+          assertEqual "status" HTTP.status200 (WT.simpleStatus resp),
+      -- NAR transfer
+      test "PUT then GET and HEAD a NAR" $
+        withAuthedServer $ \cfg -> do
+          putResp <- serverRequest cfg "PUT" ["nar", "test.nar"] [serverAuthHeader] "nar-payload-bytes"
+          getResp <- serverRequest cfg "GET" ["nar", "test.nar"] [] ""
+          headResp <- serverRequest cfg "HEAD" ["nar", "test.nar"] [] ""
+          ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "GET status" HTTP.status200 (WT.simpleStatus getResp)
+          ok3 <- assertEqual "GET body" "nar-payload-bytes" (WT.simpleBody getResp)
+          ok4 <-
+            assertEqual
+              "immutable content address"
+              (Just "public, max-age=31536000, immutable")
+              (lookup HTTP.hCacheControl (WT.simpleHeaders getResp))
+          ok5 <- assertEqual "HEAD status" HTTP.status200 (WT.simpleStatus headResp)
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "PUT NAR without auth is 401" $
+        withAuthedServer $ \cfg -> do
+          resp <- serverRequest cfg "PUT" ["nar", "test.nar"] [] "nar-payload-bytes"
+          assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
+      test "PUT NAR with a traversal name is 400" $
+        withAuthedServer $ \cfg -> do
+          resp <- serverRequest cfg "PUT" ["nar", ".."] [serverAuthHeader] "escape"
+          assertEqual "status" HTTP.status400 (WT.simpleStatus resp),
+      test "PUT NAR with an oversized declared length is 413" $
+        withAuthedServer $ \cfg -> do
+          resp <-
+            serverRequestSized
+              cfg
+              "PUT"
+              ["nar", "test.nar"]
+              [serverAuthHeader]
+              (fromIntegral Server.maxNarBodySize + 1)
+          assertEqual "status" HTTP.status413 (WT.simpleStatus resp),
+      test "GET absent NAR is 404" $
+        withServer Nothing Nothing $ \cfg -> do
+          resp <- serverRequest cfg "GET" ["nar", "absent.nar"] [] ""
+          assertEqual "status" HTTP.status404 (WT.simpleStatus resp),
+      -- Streaming write, at the store layer
+      test "writeNarStreaming writes chunks and lands atomically" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        source <- chunkSource ["ab", "cd", "ef"]
+        result <- Store.writeNarStreaming store "streamed.nar" 16 source
+        stored <- Store.readNar store "streamed.nar"
+        located <- Store.narFilePath store "streamed.nar"
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "result" Store.NarWriteOk result
+        ok2 <- assertEqual "content" (Just "abcdef") stored
+        ok3 <- assertTrue "narFilePath resolves" (isJust located)
+        pure (ok1 && ok2 && ok3),
+      test "writeNarStreaming over the cap deletes the partial file" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        source <- chunkSource ["four", "more", "over"]
+        result <- Store.writeNarStreaming store "big.nar" 8 source
+        leftovers <- listDirectory (tmpDir ++ "/nar")
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "result" Store.NarWriteTooLarge result
+        ok2 <- assertEqual "no partial files" [] leftovers
+        pure (ok1 && ok2),
+      test "writeNarStreaming rejects a traversal name" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        source <- chunkSource ["x"]
+        result <- Store.writeNarStreaming store "../escape" 8 source
+        removeDirectoryRecursive tmpDir
+        assertEqual "result" Store.NarWriteBadPath result,
+      test "narFilePath rejects a traversal name" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        located <- Store.narFilePath store "../escape"
+        removeDirectoryRecursive tmpDir
+        assertEqual "path" Nothing located
+    ]
+
+-- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Create a temporary test directory.
 -- | A fresh, unique directory under the system temp dir.  A fixed
 -- machine-global path poisons later runs whenever cleanup is skipped and
 -- races concurrent checkouts; probing numbered names until createDirectory
