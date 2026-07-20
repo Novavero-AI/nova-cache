@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0.0 - 2026-07-20
+
+- **NAR serialisation understands upstream's case-hack.** A case-folding store filesystem (Windows NTFS, default macOS APFS) cannot hold two sibling names differing only by case, so an extractor there materializes the collision with upstream's reversible `~nix~case~hack~<N>` suffix. `serialiseFromPath` now strips the suffix on those platforms - entries are emitted under their NAR names, ordered by them - so a hacked tree reproduces its original NAR bytes; two on-disk names stripping to the same entry fail loudly. New `serialiseFromPathWith` takes the mode explicitly (`CaseHack`, `defaultCaseHack`, `caseHackSuffix` exported); on other platforms a file legitimately named with the suffix still serialises verbatim. The platform-dependent default of `serialiseFromPath` is the behavior change behind the major bump.
+- **NAR entry names are checked against Windows resolution hazards.** `checkName` now also rejects a colon anywhere (drive prefix `C:evil`, alternate data stream `a:b`), Windows reserved device names (`nul`, `con`, `com1`..., matched on the portion before the first dot), and names ending in a dot or space (NTFS strips both, so the on-disk name would silently diverge from the NAR name). An extractor relying on `checkName` can no longer be steered outside its target directory or into a device by an archive entry name.
+- **`sanitizePath` rejects a trailing dot.** The store-key allowlist already excluded spaces and leading dots; a trailing dot slipped through and NTFS would strip it, landing the file under a different name than the one validated. The Windows-unsafe categories now live in one shared module, `NovaCache.SafeName`, used by both the store-key and NAR entry-name guards.
+
 ## 0.5.0.0 - 2026-07-12
 
 - **Signing: fingerprints sort and deduplicate references.** C++ Nix computes and verifies narinfo fingerprints over a sorted, deduplicated store-path set; signing in the narinfo's file order produced signatures real Nix clients reject while nova-cache's own `verify` (recomputing from the same order) passed and masked the divergence. References are now sorted by basename and deduplicated before signing.

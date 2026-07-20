@@ -29,6 +29,7 @@ import qualified Data.ByteString as BS
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
+import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
@@ -234,34 +235,25 @@ getCacheInfo fs =
 -- | Validate a path component for safe filesystem use via a positive allowlist.
 --
 -- Accepts only non-empty names of @[A-Za-z0-9._+-]@ that do not start with a
--- dot and are not a Windows reserved device name. This rejects directory
+-- dot, do not end with a dot (NTFS strips it, silently renaming the file),
+-- and are not a Windows reserved device name. This rejects directory
 -- separators, @.@\/@..@ traversal, dotfiles (including the temp-write prefix),
 -- NUL bytes, alternate-data-stream (@name:stream@) syntax, and device names
 -- like @nul@ - so a client-supplied hash or NAR filename can never escape the
--- store directory or resolve to a device, on any platform.
+-- store directory, resolve to a device, or land under a different name, on
+-- any platform.  The Windows-specific categories are shared with the NAR
+-- entry-name guard via "NovaCache.SafeName".
 sanitizePath :: Text -> Maybe FilePath
 sanitizePath txt
   | T.null txt = Nothing
   | T.isPrefixOf "." txt = Nothing
   | T.any (not . isSafeChar) txt = Nothing
-  | isReservedName txt = Nothing
+  | isReservedDeviceName txt = Nothing
+  | hasTrailingDotOrSpace txt = Nothing
   | otherwise = Just (T.unpack txt)
   where
     isSafeChar c =
       isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-+" :: [Char])
-
--- | Is the name a Windows reserved device (@con@, @prn@, @aux@, @nul@,
--- @com1@-@com9@, @lpt1@-@lpt9@)? Matched case-insensitively on the portion
--- before the first dot, since @nul.txt@ also opens the device. Enforced on
--- every platform so a Windows-hosted cache is safe too.
-isReservedName :: Text -> Bool
-isReservedName txt = T.toLower (T.takeWhile (/= '.') txt) `elem` reservedNames
-  where
-    reservedNames =
-      ["con", "prn", "aux", "nul"]
-        ++ ["com" <> n | n <- digits]
-        ++ ["lpt" <> n | n <- digits]
-    digits = [T.pack (show n) | n <- [1 .. 9 :: Int]]
 
 -- ---------------------------------------------------------------------------
 -- Internal

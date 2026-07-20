@@ -17,6 +17,10 @@ module NovaCache.NAR
     deserialise,
     narHash,
     serialiseFromPath,
+    serialiseFromPathWith,
+    CaseHack (..),
+    defaultCaseHack,
+    caseHackSuffix,
   )
 where
 
@@ -32,6 +36,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word64)
 import qualified NovaCache.Hash as Hash
+import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 import System.Directory
   ( doesDirectoryExist,
     doesFileExist,
@@ -42,6 +47,7 @@ import System.Directory
     pathIsSymbolicLink,
   )
 import System.FilePath ((</>))
+import qualified System.Info
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -256,9 +262,19 @@ parseDirectory = go Nothing []
       | T.null name = Left "empty NAR directory entry name"
       -- Backslash is a directory separator on Windows - this library's
       -- primary consumer - so a name like "..\out.exe" is as much a
-      -- traversal vector as one with '/'.
-      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\\' || c == '\0') name =
+      -- traversal vector as one with '/'.  A colon is a drive prefix
+      -- ("C:evil") or an NTFS alternate data stream ("a:b"), either of
+      -- which resolves the write somewhere other than a file of this name.
+      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\\' || c == '\0' || c == ':') name =
           Left ("unsafe NAR directory entry name: " ++ T.unpack name)
+      -- Windows-unsafe categories, shared with the store-key allowlist
+      -- (NovaCache.SafeName): a device name resolves to the device, and
+      -- NTFS strips a trailing dot or space so the on-disk name would
+      -- silently diverge from the NAR name.
+      | isReservedDeviceName name =
+          Left ("Windows reserved device name as NAR directory entry: " ++ T.unpack name)
+      | hasTrailingDotOrSpace name =
+          Left ("NAR directory entry name ends with a dot or space: " ++ T.unpack name)
       | Just p <- prev,
         name <= p =
           Left ("NAR directory entries not strictly increasing: " ++ T.unpack name)
@@ -344,32 +360,100 @@ narHash = Hash.hashBytes . serialise
 -- Filesystem to NarEntry (IO boundary)
 -- ---------------------------------------------------------------------------
 
--- | Walk a filesystem path and build a 'NarEntry'.
+-- | Whether the serialiser strips upstream's case-hack suffix from
+-- on-disk names.  A case-folding store filesystem cannot hold two
+-- sibling names differing only by case, so an extractor there
+-- materializes the second with a reversible suffix; serialisation must
+-- strip it for the tree to reproduce its original NAR bytes.
+data CaseHack = CaseHackEnabled | CaseHackDisabled
+  deriving (Eq, Show)
+
+-- | The platform default 'serialiseFromPath' uses: enabled where the
+-- store filesystem folds case (Windows NTFS, default macOS APFS),
+-- disabled elsewhere - a Linux file legitimately named with the suffix
+-- must serialise verbatim.  Matches upstream's use-case-hack defaults.
+defaultCaseHack :: CaseHack
+defaultCaseHack = case System.Info.os of
+  "mingw32" -> CaseHackEnabled
+  "darwin" -> CaseHackEnabled
+  _ -> CaseHackDisabled
+
+-- | Upstream's reversible collision suffix (its @caseHackSuffix@): an
+-- extractor appends @~nix~case~hack~<N>@ to a sibling whose name
+-- case-folds onto an earlier one, and serialisation strips from the
+-- suffix onward to recover the NAR name.
+caseHackSuffix :: Text
+caseHackSuffix = "~nix~case~hack~"
+
+-- | Walk a filesystem path and build a 'NarEntry' under
+-- 'defaultCaseHack'.
 --
--- This is the sole IO function in the module. It classifies each path
--- as symlink, directory, or regular file, then delegates to pure
--- constructors.
+-- This is the module's IO boundary. It classifies each path as symlink,
+-- directory, or regular file, then delegates to pure constructors.
 serialiseFromPath :: FilePath -> IO NarEntry
-serialiseFromPath path = do
+serialiseFromPath = serialiseFromPathWith defaultCaseHack
+
+-- | 'serialiseFromPath' with the case-hack mode explicit, for callers
+-- and tests that need behavior independent of the host platform.
+serialiseFromPathWith :: CaseHack -> FilePath -> IO NarEntry
+serialiseFromPathWith mode path = do
   isSym <- pathIsSymbolicLink path
   if isSym
     then NarSymlink . T.pack <$> getSymbolicLinkTarget path
     else do
       isDir <- doesDirectoryExist path
       if isDir
-        then buildDirectory path
+        then buildDirectory mode path
         else buildRegularFile path
 
--- | Build a directory entry by recursively walking children.
-buildDirectory :: FilePath -> IO NarEntry
-buildDirectory path = do
+-- | Build a directory entry by recursively walking children.  Under
+-- 'CaseHackEnabled', each on-disk name is stripped of the case-hack
+-- suffix and entries are ordered by the STRIPPED name (the NAR name);
+-- two on-disk names stripping to the same entry name fail loudly, as
+-- upstream's serialiser does - continuing would emit an archive with
+-- duplicate entries no parser accepts.
+buildDirectory :: CaseHack -> FilePath -> IO NarEntry
+buildDirectory mode path = do
   names <- sort <$> listDirectory path
-  entries <- traverse walkChild names
-  pure (NarDirectory entries)
+  case unhackedDirNames mode names of
+    Left (first, second) ->
+      fail
+        ( "serialiseFromPath: file name collision between '"
+            ++ (path </> first)
+            ++ "' and '"
+            ++ (path </> second)
+            ++ "' after case-hack stripping"
+        )
+    Right resolved -> do
+      entries <- traverse walkChild resolved
+      pure (NarDirectory entries)
   where
-    walkChild name = do
-      entry <- serialiseFromPath (path </> name)
-      pure (T.pack name, entry)
+    walkChild (entryName, diskName) = do
+      entry <- serialiseFromPathWith mode (path </> diskName)
+      pure (entryName, entry)
+
+-- | Resolve on-disk child names to (NAR entry name, on-disk name) pairs,
+-- ordered by entry name.  Under 'CaseHackDisabled' names pass through
+-- verbatim (already sorted by the caller).  Under 'CaseHackEnabled' the
+-- case-hack suffix is stripped; @Left@ carries the first pair of disk
+-- names whose stripped entry names coincide.
+unhackedDirNames :: CaseHack -> [FilePath] -> Either (FilePath, FilePath) [(Text, FilePath)]
+unhackedDirNames CaseHackDisabled names = Right [(T.pack name, name) | name <- names]
+unhackedDirNames CaseHackEnabled names =
+  detectCollision (sortBy (comparing fst) (map resolve names))
+  where
+    resolve diskName =
+      let (unhacked, rest) = T.breakOn caseHackSuffix (T.pack diskName)
+       in if T.null rest
+            then (T.pack diskName, diskName)
+            else (unhacked, diskName)
+    detectCollision resolved =
+      case [ (diskA, diskB)
+           | ((entryA, diskA), (entryB, diskB)) <- zip resolved (drop 1 resolved),
+             entryA == entryB
+           ] of
+        ((diskA, diskB) : _) -> Left (diskA, diskB)
+        [] -> Right resolved
 
 -- | Build a regular file entry, checking the executable bit.
 buildRegularFile :: FilePath -> IO NarEntry
