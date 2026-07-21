@@ -402,8 +402,9 @@ caseHackSuffix = "~nix~case~hack~"
 -- | Walk a filesystem path and build a 'NarEntry' under
 -- 'defaultCaseHack'.
 --
--- This is the module's IO boundary. It classifies each path as symlink,
--- directory, or regular file, then delegates to pure constructors.
+-- This is the module's IO boundary: the platform-native walk
+-- ('walkPath') classifies each path as symlink, directory, or regular
+-- file and delegates to pure constructors.
 serialiseFromPath :: FilePath -> IO NarEntry
 serialiseFromPath = serialiseFromPathWith defaultCaseHack
 
