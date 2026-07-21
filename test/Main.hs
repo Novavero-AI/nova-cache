@@ -363,8 +363,62 @@ testNAR =
         let valid = NAR.serialise (NAR.NarRegular False "x")
          in assertLeft "trailing bytes" (NAR.deserialise (valid <> "junk1234")),
       test "nonzero string padding rejected" $
-        assertLeft "nonzero padding" (NAR.deserialise badPaddingNar)
+        assertLeft "nonzero padding" (NAR.deserialise badPaddingNar),
+      -- Windows resolves these names to something other than a file of
+      -- this spelling (drive/stream colon, device, NTFS dot/space strip).
+      test "Windows-hazard entry names rejected" $
+        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
+            names = ["C:evil", "a:b", "nul", "NUL", "com1", "nul.txt", "foo.", "foo "]
+            rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
+         in assertTrue "all hazard names rejected" (all (rejected . evil) names),
+      test "near-miss names still parse" $
+        let plain name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
+            names = ["nul2", "com10", "conx", "foo.bar", "a.b.c", "lpt0"]
+            accepted bytes = either (const False) (const True) (NAR.deserialise bytes)
+         in assertTrue "all near-miss names accepted" (all (accepted . plain) names),
+      -- The case-hack strip: a tree materialized with upstream's
+      -- collision suffix serialises back under its NAR names.
+      test "serialiseFromPathWith strips the case-hack suffix" $ do
+        dir <- caseHackFixture "nova-cache-test-casehack"
+        BS.writeFile (dir <> "/Foo") "upper"
+        BS.writeFile (dir <> "/foo~nix~case~hack~1") "lower"
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackEnabled dir
+        removeDirectoryRecursive dir
+        let expected =
+              NAR.NarDirectory
+                [ ("Foo", NAR.NarRegular False "upper"),
+                  ("foo", NAR.NarRegular False "lower")
+                ]
+        roundTrip <- assertRight "stripped tree reparses" expected (NAR.deserialise (NAR.serialise entry))
+        pure (entry == expected && roundTrip),
+      test "serialiseFromPathWith keeps the suffix verbatim when disabled" $ do
+        dir <- caseHackFixture "nova-cache-test-casehack-off"
+        BS.writeFile (dir <> "/foo~nix~case~hack~1") "kept"
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+        removeDirectoryRecursive dir
+        assertEqual
+          "verbatim name"
+          (NAR.NarDirectory [("foo~nix~case~hack~1", NAR.NarRegular False "kept")])
+          entry,
+      test "serialiseFromPathWith fails loudly on an unhack collision" $ do
+        dir <- caseHackFixture "nova-cache-test-casehack-clash"
+        BS.writeFile (dir <> "/foo") "plain"
+        BS.writeFile (dir <> "/foo~nix~case~hack~1") "hacked"
+        outcome <- try (NAR.serialiseFromPathWith NAR.CaseHackEnabled dir)
+        removeDirectoryRecursive dir
+        pure $ case (outcome :: Either SomeException NAR.NarEntry) of
+          Left _ -> True
+          Right _ -> False
     ]
+
+-- | A fresh, empty fixture directory under the system temp dir.
+caseHackFixture :: String -> IO FilePath
+caseHackFixture name = do
+  tmpBase <- getTemporaryDirectory
+  let dir = tmpBase <> "/" <> name
+  _ <- try (removeDirectoryRecursive dir) :: IO (Either SomeException ())
+  createDirectory dir
+  pure dir
 
 -- | Encode one NAR wire string with a chosen padding byte.  The spec
 -- demands zero padding, so a nonzero byte builds archives the parser
@@ -759,6 +813,10 @@ testFileStore =
         assertEqual "device nul" Nothing (Store.sanitizePath "nul"),
       test "sanitizePath rejects dotfile" $
         assertEqual "dotfile" Nothing (Store.sanitizePath ".hidden"),
+      test "sanitizePath rejects a trailing dot" $
+        assertEqual "trailing dot" Nothing (Store.sanitizePath "foo."),
+      test "sanitizePath keeps interior dots valid" $
+        assertEqual "interior dots" (Just "foo.nar.xz") (Store.sanitizePath "foo.nar.xz"),
       test "read rejects traversal" $ do
         tmpDir <- createTestDir
         store <- Store.newFileStore tmpDir
