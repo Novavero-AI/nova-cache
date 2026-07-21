@@ -12,13 +12,17 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai (Response, responseLBS)
-import NovaCache.Store (CacheInfo (..), FileStore, getCacheInfo, listNarInfoHashes)
+import NovaCache.Store (CacheInfo (..), FileStore, getCacheInfo)
 
 -- | Build the @GET \/@ response: the branded page around live values
 -- (store-path count, store dir, signing status, public key).
-landingResponse :: FileStore -> Bool -> Maybe Text -> IO Response
-landingResponse store signingEnabled pubKey = do
-  pathCount <- length <$> listNarInfoHashes store
+--
+-- The count comes from the injected action, not a store scan here: this
+-- route is unauthenticated, so its per-request work must stay bounded -
+-- the caller supplies a TTL-cached counter ('NovaCache.Server.newTTLCache').
+landingResponse :: IO Int -> FileStore -> Bool -> Maybe Text -> IO Response
+landingResponse countPaths store signingEnabled pubKey = do
+  pathCount <- countPaths
   let body = TE.encodeUtf8 (landingHtml (getCacheInfo store) signingEnabled pubKey pathCount)
   pure (responseLBS HTTP.status200 htmlHeaders (BL.fromStrict body))
 

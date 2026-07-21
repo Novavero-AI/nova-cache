@@ -146,6 +146,14 @@ parseBaseName basename
       Left ("empty name in store path: " ++ T.unpack basename)
   | T.length name > maxNameLen =
       Left ("store path name longer than " ++ show maxNameLen ++ " characters: " ++ T.unpack name)
+  -- Upstream's checkName dot rule: the FIRST dash-separated component may
+  -- not be "." or "..", rejecting the traversal names and their ".-x" /
+  -- "..-y" prefixed forms alike, while other dot-leading names
+  -- (".config-1.0") stay valid.  Same rule nova-nix enforces at its
+  -- construction and parse boundaries; a dot name accepted here would be
+  -- stored and signed although no Nix client parses it.
+  | firstDashComponent == "." || firstDashComponent == ".." =
+      Left ("store path name may not begin with a dot segment: " ++ T.unpack name)
   | not (T.all validNameChar name) =
       Left ("invalid characters in store path name: " ++ T.unpack name)
   | otherwise =
@@ -153,6 +161,7 @@ parseBaseName basename
   where
     hashPart = T.take storePathHashLen basename
     name = T.drop minBaseNameLen basename
+    firstDashComponent = T.takeWhile (/= '-') name
 
 -- ---------------------------------------------------------------------------
 -- Rendering

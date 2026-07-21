@@ -262,7 +262,24 @@ testStorePath =
       test "reject invalid name chars" $
         let storeDir = StorePath.defaultStoreDir
             input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello world"
-         in assertLeft "invalid chars" (StorePath.parseStorePath storeDir input)
+         in assertLeft "invalid chars" (StorePath.parseStorePath storeDir input),
+      -- Upstream's dot rule: the first dash-separated component may not
+      -- be "." or ".."; other dot-leading names stay valid.
+      test "reject dot-segment names" $
+        let hash = T.replicate 32 "a"
+            rejected name = assertLeft (T.unpack name) (StorePath.parseStorePathBaseName (hash <> "-" <> name))
+         in do
+              ok1 <- rejected "."
+              ok2 <- rejected ".."
+              ok3 <- rejected ".-x"
+              ok4 <- rejected "..-y"
+              pure (ok1 && ok2 && ok3 && ok4),
+      test "dotfile-style names stay valid" $
+        let hash = T.replicate 32 "a"
+         in do
+              ok1 <- assertTrue "dotfile" (either (const False) (const True) (StorePath.parseStorePathBaseName (hash <> "-.config-1.0")))
+              ok2 <- assertTrue "interior dots" (either (const False) (const True) (StorePath.parseStorePathBaseName (hash <> "-x.y.z")))
+              pure (ok1 && ok2)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -364,6 +381,16 @@ testNAR =
          in assertLeft "trailing bytes" (NAR.deserialise (valid <> "junk1234")),
       test "nonzero string padding rejected" $
         assertLeft "nonzero padding" (NAR.deserialise badPaddingNar),
+      -- The format fixes the executable marker's value as empty; upstream
+      -- rejects a nonempty value, and NAR.serialise cannot produce one.
+      test "nonempty executable marker rejected" $
+        let marked =
+              BS.concat
+                ( map
+                    (narWireStr 0)
+                    ["nix-archive-1", "(", "type", "regular", "executable", "X", "contents", "hi", ")"]
+                )
+         in assertLeft "nonempty marker" (NAR.deserialise marked),
       -- Windows resolves these names to something other than a file of
       -- this spelling (drive/stream colon, device, NTFS dot/space strip).
       test "Windows-hazard entry names rejected" $
@@ -582,7 +609,52 @@ testNarInfo =
                   "NarSize: 200",
                   "References: "
                 ]
-         in assertLeft "bad integer" (NarInfo.parseNarInfo bad)
+         in assertLeft "bad integer" (NarInfo.parseNarInfo bad),
+      -- Sizes are uint64 on the wire: at most 20 digits.  A longer field
+      -- rejects before the quadratic bignum accumulation.
+      test "parse rejects an overlong size field" $
+        let long =
+              T.unlines
+                [ "StorePath: /nix/store/aaaa-test",
+                  "URL: nar/test.nar.xz",
+                  "NarHash: sha256:def",
+                  "NarSize: 123456789012345678901"
+                ]
+         in assertLeft "overlong size" (NarInfo.parseNarInfo long),
+      test "a 20-digit size field still parses" $
+        let capped =
+              T.unlines
+                [ "StorePath: /nix/store/aaaa-test",
+                  "URL: nar/test.nar.xz",
+                  "NarHash: sha256:def",
+                  "NarSize: 18446744073709551615"
+                ]
+         in case NarInfo.parseNarInfo capped of
+              Left err -> do
+                putStrLn ("  parse failed: " ++ err)
+                pure False
+              Right ni -> assertEqual "uint64 max" 18446744073709551615 (NarInfo.niNarSize ni),
+      -- Upstream assigns fields as it reads, so a duplicated scalar key
+      -- resolves to the LAST value (Sig stays the repeatable exception).
+      test "duplicate scalar keys resolve last-wins" $
+        let dup =
+              T.unlines
+                [ "StorePath: /nix/store/aaaa-test",
+                  "URL: nar/first.nar",
+                  "URL: nar/last.nar",
+                  "Compression: xz",
+                  "Compression: zstd",
+                  "NarHash: sha256:def",
+                  "NarSize: 200"
+                ]
+         in case NarInfo.parseNarInfo dup of
+              Left err -> do
+                putStrLn ("  parse failed: " ++ err)
+                pure False
+              Right ni -> do
+                ok1 <- assertEqual "url last" "nar/last.nar" (NarInfo.niUrl ni)
+                ok2 <- assertEqual "compression last" "zstd" (NarInfo.niCompression ni)
+                pure (ok1 && ok2)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -618,10 +690,26 @@ testSigning =
             fp = Signing.fingerprint ni
          in assertTrue
               "references sorted by basename and deduplicated (C++ Nix parity)"
+              -- The leading field separator pins the WHOLE references
+              -- field: without it, the pre-fix "zlib,glibc,zlib"
+              -- rendering also ends in "...glibc...,...zlib..." and the
+              -- assertion cannot fail on a regression to unsorted output.
               ( T.isSuffixOf
-                  "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40,/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-zlib-1.3"
+                  ";/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40,/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-zlib-1.3"
                   fp
               ),
+      test "SecretKey Show redacts the key bytes" $
+        let sk = Signing.SecretKey {Signing.skName = "test-key", Signing.skBytes = BS.pack ([1 .. 32] ++ [33 .. 64])}
+         in assertEqual "redacted" "SecretKey \"test-key\" <redacted>" (show sk),
+      test "SecretKey equality compares name and bytes" $
+        let bytesA = BS.pack ([1 .. 32] ++ [33 .. 64])
+            skA = Signing.SecretKey "k" bytesA
+            skB = Signing.SecretKey "k" bytesA
+            skC = Signing.SecretKey "k" (BS.pack (0 : [2 .. 64]))
+         in do
+              ok1 <- assertTrue "equal keys" (skA == skB)
+              ok2 <- assertTrue "different bytes differ" (skA /= skC)
+              pure (ok1 && ok2),
       test "parseSecretKey valid" $
         let keyBytes = BS.pack ([1 .. 32] ++ [33 .. 64])
             keyB64 = TE.decodeUtf8 (B64.encode keyBytes)
@@ -1143,6 +1231,20 @@ testServer =
           ok1 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
           ok2 <- assertEqual "body" "nova-cache: a Nix binary cache\n" (WT.simpleBody resp)
           pure (ok1 && ok2),
+      -- newTTLCache: within the TTL the action runs once; a zero TTL
+      -- never satisfies the freshness check, so every call re-runs.
+      test "newTTLCache memoizes within the TTL and re-runs past it" $ do
+        counter <- newIORef (0 :: Int)
+        let bump = atomicModifyIORef' counter (\n -> (n + 1, n + 1))
+        cachedHour <- Server.newTTLCache 3600 bump
+        firstRead <- cachedHour
+        secondRead <- cachedHour
+        cachedNever <- Server.newTTLCache 0 bump
+        thirdRead <- cachedNever
+        fourthRead <- cachedNever
+        ok1 <- assertEqual "memoized" (1, 1) (firstRead, secondRead)
+        ok2 <- assertEqual "re-run each call" (2, 3) (thirdRead, fourthRead)
+        pure (ok1 && ok2),
       test "GET /nix-cache-info renders cache metadata" $
         withServer Nothing Nothing $ \cfg -> do
           resp <- serverRequest cfg "GET" ["nix-cache-info"] [] ""

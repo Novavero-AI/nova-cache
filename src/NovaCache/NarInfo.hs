@@ -10,7 +10,7 @@ module NovaCache.NarInfo
   )
 where
 
-import Data.List (find)
+import Data.List (foldl')
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -88,22 +88,22 @@ parseNarInfo txt = do
   let kvs = mapMaybe parseLine (T.lines txt)
   storePath <- require keyStorePath kvs
   url <- require keyUrl kvs
-  fileSize <- traverse (parseInteger keyFileSize) (lookupFirst keyFileSize kvs)
+  fileSize <- traverse (parseInteger keyFileSize) (lookupLast keyFileSize kvs)
   narHashVal <- require keyNarHash kvs
   narSize <- require keyNarSize kvs >>= parseInteger keyNarSize
   pure
     NarInfo
       { niStorePath = storePath,
         niUrl = url,
-        niCompression = fromMaybe defaultCompression (lookupFirst keyCompression kvs),
-        niFileHash = lookupFirst keyFileHash kvs,
+        niCompression = fromMaybe defaultCompression (lookupLast keyCompression kvs),
+        niFileHash = lookupLast keyFileHash kvs,
         niFileSize = fileSize,
         niNarHash = narHashVal,
         niNarSize = narSize,
-        niReferences = parseRefs (lookupFirst keyReferences kvs),
-        niDeriver = lookupFirst keyDeriver kvs,
+        niReferences = parseRefs (lookupLast keyReferences kvs),
+        niDeriver = lookupLast keyDeriver kvs,
         niSigs = lookupAll keySig kvs,
-        niCA = lookupFirst keyCA kvs
+        niCA = lookupLast keyCA kvs
       }
 
 -- | Parse a space-separated references field.
@@ -163,8 +163,14 @@ optionalKV _ Nothing = []
 optionalKV key (Just val) = [kv key val]
 
 -- | Look up the first occurrence of a key.
-lookupFirst :: Text -> [(Text, Text)] -> Maybe Text
-lookupFirst key kvs = snd <$> find ((== key) . fst) kvs
+-- | Look up the LAST occurrence of a scalar key: upstream's parser
+-- assigns each field as it reads, so a duplicated key resolves to the
+-- final value.  (@Sig@ is the one intentionally repeatable key -
+-- 'lookupAll'.)
+lookupLast :: Text -> [(Text, Text)] -> Maybe Text
+lookupLast key = foldl' pick Nothing
+  where
+    pick acc (k, v) = if k == key then Just v else acc
 
 -- | Look up all occurrences of a key.
 lookupAll :: Text -> [(Text, Text)] -> [Text]
@@ -172,18 +178,30 @@ lookupAll key = map snd . filter ((== key) . fst)
 
 -- | Require a key to be present.
 require :: Text -> [(Text, Text)] -> Either String Text
-require key kvs = case lookupFirst key kvs of
+require key kvs = case lookupLast key kvs of
   Nothing -> Left ("missing required key: " ++ T.unpack key)
   Just val -> Right val
+
+-- | Sizes on the wire are uint64 in Nix: at most 20 digits.  A longer
+-- field is rejected before the bignum parse, because 'TR.decimal'
+-- accumulates digit by digit - quadratic in the field length - so an
+-- unbounded field costs quadratic CPU and a proportional allocation
+-- before any consumer looks at the value.
+maxSizeFieldDigits :: Int
+maxSizeFieldDigits = 20
 
 -- | Parse a non-negative base-10 integer, matching C++ Nix's narinfo parser.
 -- Uses 'TR.decimal' (not 'reads', which also accepts hex/octal/leading space)
 -- and requires the whole field to be consumed, so a non-canonical value cannot
--- slip through and then be re-signed under the cache's key.
+-- slip through and then be re-signed under the cache's key.  The length is
+-- bounded first ('maxSizeFieldDigits'), so the parse cost is constant.
 parseInteger :: Text -> Text -> Either String Integer
-parseInteger key txt = case TR.decimal txt of
-  Right (n, rest) | T.null rest -> Right n
-  _ -> Left ("invalid integer for " ++ T.unpack key ++ ": " ++ T.unpack txt)
+parseInteger key txt
+  | T.length txt > maxSizeFieldDigits =
+      Left ("integer field for " ++ T.unpack key ++ " is " ++ show (T.length txt) ++ " characters, above the " ++ show maxSizeFieldDigits ++ " maximum")
+  | otherwise = case TR.decimal txt of
+      Right (n, rest) | T.null rest -> Right n
+      _ -> Left ("invalid integer for " ++ T.unpack key ++ ": " ++ T.unpack txt)
 
 -- | Show a value as 'Text'.
 showT :: (Show a) => a -> Text

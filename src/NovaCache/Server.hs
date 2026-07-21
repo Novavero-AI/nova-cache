@@ -24,6 +24,7 @@ module NovaCache.Server
   ( -- * Configuration
     ServerConfig (..),
     defaultRootResponse,
+    newTTLCache,
 
     -- * Application
     cacheApp,
@@ -50,9 +51,11 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import GHC.Clock (getMonotonicTime)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai
   ( Application,
@@ -128,6 +131,30 @@ data ServerConfig = ServerConfig
 defaultRootResponse :: IO Response
 defaultRootResponse =
   pure (responseLBS HTTP.status200 textHeaders "nova-cache: a Nix binary cache\n")
+
+-- | Memoize an action's result for a time-to-live, in seconds
+-- (monotonic clock, so wall-time jumps cannot starve the refresh).
+--
+-- An unauthenticated route must do bounded work per request: a root
+-- response that counts the store, for example, must not scan the whole
+-- narinfo directory per hit.  Wrap the expensive read once at startup
+-- and hand the returned action to 'scRootResponse'.
+--
+-- Concurrent requests near expiry may run the action more than once;
+-- the last write wins.  Acceptable for idempotent reads, which is the
+-- intended use.
+newTTLCache :: Double -> IO a -> IO (IO a)
+newTTLCache ttlSeconds action = do
+  ref <- newIORef Nothing
+  pure $ do
+    now <- getMonotonicTime
+    cached <- readIORef ref
+    case cached of
+      Just (refreshedAt, held) | now - refreshedAt < ttlSeconds -> pure held
+      _ -> do
+        fresh <- action
+        writeIORef ref (Just (now, fresh))
+        pure fresh
 
 -- ---------------------------------------------------------------------------
 -- WAI application
