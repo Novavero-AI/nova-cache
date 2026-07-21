@@ -20,7 +20,7 @@ where
 
 import Crypto.Error (CryptoFailable (..))
 import qualified Crypto.PubKey.Ed25519 as Ed25519
-import Data.ByteArray (convert)
+import Data.ByteArray (constEq, convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
@@ -39,7 +39,20 @@ data SecretKey = SecretKey
   { skName :: !Text,
     skBytes :: !ByteString
   }
-  deriving (Eq, Show)
+
+-- | Renders the key NAME only.  The secret bytes must never be
+-- reachable through 'Show': any enclosing type deriving 'Show' (a
+-- config record, a debug trace, an error formatter) would otherwise
+-- render them.  Deliberately not read-back-able.
+instance Show SecretKey where
+  show (SecretKey keyName _) = "SecretKey " ++ show keyName ++ " <redacted>"
+
+-- | The name compares normally (it is public); the key bytes compare in
+-- constant time - equality over secret material must not be
+-- timing-dependent.
+instance Eq SecretKey where
+  SecretKey nameA bytesA == SecretKey nameB bytesB =
+    nameA == nameB && constEq bytesA bytesB
 
 -- | An Ed25519 public key with its key name.
 data PublicKey = PublicKey

@@ -203,7 +203,12 @@ parseRegular bs = do
   where
     regular tok rest
       | tok == tokExecutable = do
-          (_, afterEmpty) <- readStr rest
+          (marker, afterEmpty) <- readStr rest
+          -- The format fixes the executable marker's value as the empty
+          -- string; upstream rejects a nonempty value.
+          if BS.null marker
+            then Right ()
+            else Left ("executable marker must be empty, got: " ++ show marker)
           (cTok, afterCTok) <- readStr afterEmpty
           expect tokContents cTok
           (contents, afterContents) <- readStr afterCTok

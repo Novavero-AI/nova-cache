@@ -11,9 +11,9 @@ import qualified Data.Text.Encoding as TE
 import LandingPage (landingResponse)
 import qualified Network.Wai.Handler.Warp as Warp
 import Network.Wai.Middleware.RequestLogger (logStdout)
-import NovaCache.Server (ServerConfig (..), cacheApp, onExceptionResponse)
+import NovaCache.Server (ServerConfig (..), cacheApp, newTTLCache, onExceptionResponse)
 import NovaCache.Signing (SecretKey, normalizeKeyText, parseSecretKey, renderPublicKey, toPublicKey)
-import NovaCache.Store (newFileStore)
+import NovaCache.Store (listNarInfoHashes, newFileStore)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
@@ -37,6 +37,13 @@ defaultBindHost = "*"
 -- | Default store directory.
 defaultStoreRoot :: FilePath
 defaultStoreRoot = "./nix-cache"
+
+-- | How long the landing page's store-path count may serve stale, in
+-- seconds.  The count is a display stat; a minute of staleness is
+-- invisible, and the bound keeps the unauthenticated root route at
+-- constant cost regardless of request rate or store size.
+pathCountTTLSeconds :: Double
+pathCountTTLSeconds = 60
 
 -- | Environment variable for the server port.
 portEnvVar :: String
@@ -92,13 +99,16 @@ main = do
   apiKey <- loadApiKey apiKeyEnv
   sigKey <- loadSigningKey sigKeyPath
   pubKey <- derivePublicKeyLine sigKey
+  -- The landing page's store-path count rescans at most once per TTL;
+  -- the unauthenticated root route must not pay a full store scan per hit.
+  countPaths <- newTTLCache pathCountTTLSeconds (length <$> listNarInfoHashes store)
 
   let cfg =
         ServerConfig
           { scStore = store,
             scApiKey = apiKey,
             scSigningKey = sigKey,
-            scRootResponse = landingResponse store (isJust sigKey) pubKey
+            scRootResponse = landingResponse countPaths store (isJust sigKey) pubKey
           }
 
   let logRequests = logRequestsEnv /= Just "0"
