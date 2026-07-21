@@ -32,6 +32,7 @@ import qualified NovaCache.Validate as Validate
 import System.Directory (createDirectory, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
+import qualified System.Info
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -403,6 +404,36 @@ testNAR =
             names = ["nul2", "com10", "conx", "foo.bar", "a.b.c", "lpt0"]
             accepted bytes = either (const False) (const True) (NAR.deserialise bytes)
          in assertTrue "all near-miss names accepted" (all (accepted . plain) names),
+      -- Upstream carries names and targets as raw bytes: entries that
+      -- do not decode as UTF-8 parse and round-trip.
+      test "non-UTF-8 entry name round-trips" $
+        let entry = NAR.NarDirectory [(BS.pack [0x66, 0xFF], NAR.NarRegular False "x")]
+         in assertRight "raw-byte name" entry (NAR.deserialise (NAR.serialise entry)),
+      test "non-UTF-8 symlink target round-trips" $
+        let entry = NAR.NarSymlink (BS.pack [0x2F, 0x74, 0x6D, 0x70, 0x2F, 0xFF])
+         in assertRight "raw-byte target" entry (NAR.deserialise (NAR.serialise entry)),
+      test "entries sort bytewise, non-UTF-8 names included" $
+        let entry =
+              NAR.NarDirectory
+                [ (BS.pack [0xFF], NAR.NarRegular False "hi"),
+                  ("b", NAR.NarRegular False "lo")
+                ]
+         in case NAR.deserialise (NAR.serialise entry) of
+              Left err -> do
+                putStrLn ("  deserialise failed: " ++ err)
+                pure False
+              Right (NAR.NarDirectory entries) ->
+                assertEqual "byte order" ["b", BS.pack [0xFF]] (map fst entries)
+              Right other -> do
+                putStrLn ("  expected directory, got: " ++ show other)
+                pure False,
+      -- The hazard checks are ASCII-structural, so they fire inside
+      -- names that do not decode as text.
+      test "hazards inside non-UTF-8 names still rejected" $
+        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
+            names = ["nul." <> BS.pack [0xFF], BS.pack [0xFF, 0x2E], BS.pack [0xFF] <> ":x"]
+            rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
+         in assertTrue "all hazard bytes rejected" (all (rejected . evil) names),
       -- The case-hack strip: a tree materialized with upstream's
       -- collision suffix serialises back under its NAR names.
       test "serialiseFromPathWith strips the case-hack suffix" $ do
@@ -435,7 +466,35 @@ testNAR =
         removeDirectoryRecursive dir
         pure $ case (outcome :: Either SomeException NAR.NarEntry) of
           Left _ -> True
-          Right _ -> False
+          Right _ -> False,
+      -- The walk's boundary encoding: a Unicode disk name enters the
+      -- archive as its UTF-8 bytes on every platform.
+      test "serialiseFromPath encodes a Unicode disk name as UTF-8" $ do
+        dir <- caseHackFixture "nova-cache-test-uniname"
+        BS.writeFile (dir <> "/caf\233") "au lait"
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+        removeDirectoryRecursive dir
+        assertEqual
+          "utf8 name"
+          (NAR.NarDirectory [(BS.pack [0x63, 0x61, 0x66, 0xC3, 0xA9], NAR.NarRegular False "au lait")])
+          entry,
+      -- POSIX names are bytes; one that is not valid UTF-8 must archive
+      -- verbatim (it used to be silently rewritten with replacement
+      -- characters).  Linux-gated: NTFS and APFS names are Unicode, so
+      -- the fixture cannot exist there.  "\56575" is the lone surrogate
+      -- GHC's filesystem encoding round-trips to byte 0xFF.
+      test "serialiseFromPath carries a non-UTF-8 disk name verbatim" $
+        if System.Info.os /= "linux"
+          then pure True
+          else do
+            dir <- caseHackFixture "nova-cache-test-rawname"
+            BS.writeFile (dir <> "/f\56575") "raw"
+            entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+            removeDirectoryRecursive dir
+            assertEqual
+              "raw byte name"
+              (NAR.NarDirectory [(BS.pack [0x66, 0xFF], NAR.NarRegular False "raw")])
+              entry
     ]
 
 -- | A fresh, empty fixture directory under the system temp dir.

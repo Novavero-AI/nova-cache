@@ -29,6 +29,7 @@ import qualified Data.ByteString as BS
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 import System.Directory
   ( createDirectoryIfMissing,
@@ -248,10 +249,14 @@ sanitizePath txt
   | T.null txt = Nothing
   | T.isPrefixOf "." txt = Nothing
   | T.any (not . isSafeChar) txt = Nothing
-  | isReservedDeviceName txt = Nothing
-  | hasTrailingDotOrSpace txt = Nothing
+  | isReservedDeviceName keyBytes = Nothing
+  | hasTrailingDotOrSpace keyBytes = Nothing
   | otherwise = Just (T.unpack txt)
   where
+    -- The shared hazard predicates take the byte form NAR entry names
+    -- have; a store key is ASCII by the allowlist above, so its UTF-8
+    -- encoding is the same spelling.
+    keyBytes = TE.encodeUtf8 txt
     isSafeChar c =
       isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-+" :: [Char])
 
