@@ -6,7 +6,7 @@
 - **`serialiseFromPath` walks the filesystem byte-true.** The walk moves to the platform-native path type (`System.Directory.OsPath`). On POSIX, names and symlink targets enter the archive as the raw bytes the filesystem reports - previously a non-UTF-8 on-disk name was silently rewritten with replacement characters, changing the archived name and hash. On Windows, names are the UTF-8 encoding of their UTF-16 spelling, and a name holding an unpaired surrogate (no UTF-8 form exists, and upstream defines no byte spelling) fails loudly instead of guessing. Public signatures are unchanged.
 - **`NovaCache.SafeName` predicates take bytes.** `isReservedDeviceName` and `hasTrailingDotOrSpace` operate on `ByteString`, the form NAR entry names have; the categories are ASCII-structural, so byte-level matching stays exact inside names that do not decode. Text callers (the store-key allowlist) encode first.
 - **`caseHackSuffix` is a `ByteString`**, matching the entry names it marks.
-- Dependency floors rise to `directory >= 1.3.8` and `filepath >= 1.4.100` (the `OsPath` API), and `filepath` is capped below 1.5 to stay on the lineage GHC's bundled `directory` is built against.
+- Dependency floors rise to `directory >= 1.3.8` and `filepath >= 1.4.100` (the `OsPath` API); both the 1.4 and 1.5 `filepath` lineages are supported.
 
 ## 0.6.0.0 - 2026-07-20
 
