@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | NAR (Nix ARchive) binary format serialization and deserialization.
 --
 -- NAR is a deterministic archive format used by Nix. All strings are
@@ -11,6 +13,9 @@
 -- directory ::= (entry)*
 -- entry     ::= "entry" "(" "name" STRING "node" node ")"
 -- @
+--
+-- Entry names and symlink targets are raw byte strings: the format
+-- imposes no text encoding on them, and upstream carries them verbatim.
 module NovaCache.NAR
   ( NarEntry (..),
     serialise,
@@ -28,16 +33,14 @@ import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.List (sort, sortBy)
 import Data.Ord (comparing)
-import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
 import Data.Word (Word64)
 import qualified NovaCache.Hash as Hash
 import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
-import System.Directory
+import System.Directory.OsPath
   ( doesDirectoryExist,
     doesFileExist,
     executable,
@@ -46,8 +49,15 @@ import System.Directory
     listDirectory,
     pathIsSymbolicLink,
   )
-import System.FilePath ((</>))
 import qualified System.Info
+import System.OsPath (OsPath, decodeFS, encodeFS, (</>))
+import qualified System.OsPath as OP
+#ifdef mingw32_HOST_OS
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+#else
+import System.IO (latin1)
+#endif
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -57,12 +67,14 @@ import qualified System.Info
 data NarEntry
   = -- | Regular file: executable flag and contents.
     NarRegular !Bool !ByteString
-  | -- | Symbolic link: target path.
-    NarSymlink !Text
-  | -- | Directory: list of (name, entry) pairs.  Names must be unique; the
-    -- serializer sorts them and 'deserialise' rejects duplicate or
+  | -- | Symbolic link: target path, as the raw bytes the archive
+    -- carries.
+    NarSymlink !ByteString
+  | -- | Directory: list of (name, entry) pairs.  Names are the raw
+    -- bytes the archive carries; they must be unique, the serializer
+    -- sorts them bytewise, and 'deserialise' rejects duplicate or
     -- out-of-order names.
-    NarDirectory ![(Text, NarEntry)]
+    NarDirectory ![(ByteString, NarEntry)]
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
@@ -121,7 +133,7 @@ buildNode (NarSymlink target) =
     <> narStr tokType
     <> narStr tokSymlink
     <> narStr tokTarget
-    <> narStr (TE.encodeUtf8 target)
+    <> narStr target
     <> narStr tokRParen
 buildNode (NarDirectory entries) =
   narStr tokLParen
@@ -136,12 +148,12 @@ execFlag True = narStr tokExecutable <> narStr BS.empty
 execFlag False = mempty
 
 -- | Build a single directory entry: @"entry" "(" "name" \<n\> "node" \<node\> ")"@.
-buildDirEntry :: (Text, NarEntry) -> B.Builder
+buildDirEntry :: (ByteString, NarEntry) -> B.Builder
 buildDirEntry (entryName, entry) =
   narStr tokEntry
     <> narStr tokLParen
     <> narStr tokName
-    <> narStr (TE.encodeUtf8 entryName)
+    <> narStr entryName
     <> narStr tokNode
     <> buildNode entry
     <> narStr tokRParen
@@ -225,7 +237,8 @@ parseRegular bs = do
           -- a regular node without it is malformed - reject, matching Nix.
           Left ("expected 'executable' or 'contents' in regular, got: " ++ show tok)
 
--- | Parse a symlink node.
+-- | Parse a symlink node.  The target is carried verbatim: upstream
+-- imposes no text encoding on it.
 parseSymlink :: NarParser NarEntry
 parseSymlink bs = do
   (tgt, afterTgt) <- readStr bs
@@ -233,8 +246,7 @@ parseSymlink bs = do
   (targetPath, afterPath) <- readStr afterTgt
   (rp, final) <- readStr afterPath
   expect tokRParen rp
-  symTarget <- decodeUtf8Safe targetPath
-  pure (NarSymlink symTarget, final)
+  pure (NarSymlink targetPath, final)
 
 -- | Parse a directory node (zero or more child entries).
 parseDirectory :: NarParser NarEntry
@@ -256,33 +268,35 @@ parseDirectory = go Nothing []
           (entry, afterEntry) <- parseNode afterNodeTok
           (rp, afterRp) <- readStr afterEntry
           expect tokRParen rp
-          decodedName <- decodeUtf8Safe entryName
-          _ <- checkName prev decodedName
-          go (Just decodedName) ((decodedName, entry) : acc) afterRp
+          _ <- checkName prev entryName
+          go (Just entryName) ((entryName, entry) : acc) afterRp
     -- NAR directory entries must have safe names in strictly increasing
-    -- (sorted, unique) order.  Enforcing this rejects malformed or hostile
-    -- archives, keeps @serialise . deserialise@ an identity, and forecloses the
-    -- path-traversal surface for any future NAR-extraction consumer.
+    -- (sorted, unique) byte order.  Enforcing this rejects malformed or
+    -- hostile archives, keeps @serialise . deserialise@ an identity, and
+    -- forecloses the path-traversal surface for any future NAR-extraction
+    -- consumer.  Names are arbitrary bytes; every check here is
+    -- ASCII-structural, so it stays exact whether or not the name
+    -- decodes as text (see "NovaCache.SafeName").
     checkName prev name
-      | T.null name = Left "empty NAR directory entry name"
+      | BS.null name = Left "empty NAR directory entry name"
       -- Backslash is a directory separator on Windows - this library's
       -- primary consumer - so a name like "..\out.exe" is as much a
       -- traversal vector as one with '/'.  A colon is a drive prefix
       -- ("C:evil") or an NTFS alternate data stream ("a:b"), either of
       -- which resolves the write somewhere other than a file of this name.
-      | name == "." || name == ".." || T.any (\c -> c == '/' || c == '\\' || c == '\0' || c == ':') name =
-          Left ("unsafe NAR directory entry name: " ++ T.unpack name)
+      | name == "." || name == ".." || BS8.any (\c -> c == '/' || c == '\\' || c == '\0' || c == ':') name =
+          Left ("unsafe NAR directory entry name: " ++ show name)
       -- Windows-unsafe categories, shared with the store-key allowlist
       -- (NovaCache.SafeName): a device name resolves to the device, and
       -- NTFS strips a trailing dot or space so the on-disk name would
       -- silently diverge from the NAR name.
       | isReservedDeviceName name =
-          Left ("Windows reserved device name as NAR directory entry: " ++ T.unpack name)
+          Left ("Windows reserved device name as NAR directory entry: " ++ show name)
       | hasTrailingDotOrSpace name =
-          Left ("NAR directory entry name ends with a dot or space: " ++ T.unpack name)
+          Left ("NAR directory entry name ends with a dot or space: " ++ show name)
       | Just p <- prev,
         name <= p =
-          Left ("NAR directory entries not strictly increasing: " ++ T.unpack name)
+          Left ("NAR directory entries not strictly increasing: " ++ show name)
       | otherwise = Right ()
 
 -- ---------------------------------------------------------------------------
@@ -347,12 +361,6 @@ expect expected got
   | got == expected = Right ()
   | otherwise = Left ("expected " ++ show expected ++ ", got " ++ show got)
 
--- | Decode a UTF-8 bytestring, converting decode failures to parse errors.
-decodeUtf8Safe :: ByteString -> Either String Text
-decodeUtf8Safe bs = case TE.decodeUtf8' bs of
-  Right txt -> Right txt
-  Left err -> Left ("invalid UTF-8 in NAR: " ++ show err)
-
 -- ---------------------------------------------------------------------------
 -- Hashing
 -- ---------------------------------------------------------------------------
@@ -386,8 +394,9 @@ defaultCaseHack = case System.Info.os of
 -- | Upstream's reversible collision suffix (its @caseHackSuffix@): an
 -- extractor appends @~nix~case~hack~<N>@ to a sibling whose name
 -- case-folds onto an earlier one, and serialisation strips from the
--- suffix onward to recover the NAR name.
-caseHackSuffix :: Text
+-- suffix onward to recover the NAR name.  Bytes, matching the entry
+-- names it marks.
+caseHackSuffix :: ByteString
 caseHackSuffix = "~nix~case~hack~"
 
 -- | Walk a filesystem path and build a 'NarEntry' under
@@ -401,10 +410,17 @@ serialiseFromPath = serialiseFromPathWith defaultCaseHack
 -- | 'serialiseFromPath' with the case-hack mode explicit, for callers
 -- and tests that need behavior independent of the host platform.
 serialiseFromPathWith :: CaseHack -> FilePath -> IO NarEntry
-serialiseFromPathWith mode path = do
+serialiseFromPathWith mode path = walkPath mode =<< encodeFS path
+
+-- | Walk one platform-native path.  The walk runs on 'OsPath' so child
+-- names reach the archive byte-true ('osPathBytes'); only the root
+-- enters as 'FilePath', and the root's own name never appears in a
+-- NAR.
+walkPath :: CaseHack -> OsPath -> IO NarEntry
+walkPath mode path = do
   isSym <- pathIsSymbolicLink path
   if isSym
-    then NarSymlink . T.pack <$> getSymbolicLinkTarget path
+    then NarSymlink <$> (osPathBytes =<< getSymbolicLinkTarget path)
     else do
       isDir <- doesDirectoryExist path
       if isDir
@@ -417,40 +433,45 @@ serialiseFromPathWith mode path = do
 -- two on-disk names stripping to the same entry name fail loudly, as
 -- upstream's serialiser does - continuing would emit an archive with
 -- duplicate entries no parser accepts.
-buildDirectory :: CaseHack -> FilePath -> IO NarEntry
+buildDirectory :: CaseHack -> OsPath -> IO NarEntry
 buildDirectory mode path = do
   names <- sort <$> listDirectory path
-  case unhackedDirNames mode names of
-    Left (first, second) ->
+  named <- traverse withNameBytes names
+  case unhackedDirNames mode named of
+    Left (first, second) -> do
+      firstPath <- decodeFS (path </> first)
+      secondPath <- decodeFS (path </> second)
       fail
         ( "serialiseFromPath: file name collision between '"
-            ++ (path </> first)
+            ++ firstPath
             ++ "' and '"
-            ++ (path </> second)
+            ++ secondPath
             ++ "' after case-hack stripping"
         )
-    Right resolved -> do
-      entries <- traverse walkChild resolved
-      pure (NarDirectory entries)
+    Right resolved -> NarDirectory <$> traverse walkChild resolved
   where
+    withNameBytes diskName = do
+      nameBytes <- osPathBytes diskName
+      pure (nameBytes, diskName)
     walkChild (entryName, diskName) = do
-      entry <- serialiseFromPathWith mode (path </> diskName)
+      entry <- walkPath mode (path </> diskName)
       pure (entryName, entry)
 
--- | Resolve on-disk child names to (NAR entry name, on-disk name) pairs,
--- ordered by entry name.  Under 'CaseHackDisabled' names pass through
--- verbatim (already sorted by the caller).  Under 'CaseHackEnabled' the
--- case-hack suffix is stripped; @Left@ carries the first pair of disk
--- names whose stripped entry names coincide.
-unhackedDirNames :: CaseHack -> [FilePath] -> Either (FilePath, FilePath) [(Text, FilePath)]
-unhackedDirNames CaseHackDisabled names = Right [(T.pack name, name) | name <- names]
-unhackedDirNames CaseHackEnabled names =
-  detectCollision (sortBy (comparing fst) (map resolve names))
+-- | Resolve (NAR name, on-disk name) pairs for a directory's children.
+-- Under 'CaseHackDisabled' pairs pass through verbatim (serialisation
+-- sorts at emit).  Under 'CaseHackEnabled' the case-hack suffix is
+-- stripped from each NAR name and pairs are re-sorted by the stripped
+-- bytes; @Left@ carries the first pair of disk names whose stripped
+-- entry names coincide.
+unhackedDirNames :: CaseHack -> [(ByteString, OsPath)] -> Either (OsPath, OsPath) [(ByteString, OsPath)]
+unhackedDirNames CaseHackDisabled named = Right named
+unhackedDirNames CaseHackEnabled named =
+  detectCollision (sortBy (comparing fst) (map resolve named))
   where
-    resolve diskName =
-      let (unhacked, rest) = T.breakOn caseHackSuffix (T.pack diskName)
-       in if T.null rest
-            then (T.pack diskName, diskName)
+    resolve (nameBytes, diskName) =
+      let (unhacked, rest) = BS.breakSubstring caseHackSuffix nameBytes
+       in if BS.null rest
+            then (nameBytes, diskName)
             else (unhacked, diskName)
     detectCollision resolved =
       case [ (diskA, diskB)
@@ -461,23 +482,58 @@ unhackedDirNames CaseHackEnabled names =
         [] -> Right resolved
 
 -- | Build a regular file entry, checking the executable bit.
-buildRegularFile :: FilePath -> IO NarEntry
+buildRegularFile :: OsPath -> IO NarEntry
 buildRegularFile path = do
   isFile <- doesFileExist path
   if isFile
     then do
-      contents <- BS.readFile path
+      contents <- readFileBytes path
       isExec <- checkExecutable path
       pure (NarRegular isExec contents)
-    else
+    else do
       -- Not a symlink, directory, or regular file: a special file (FIFO,
       -- socket, device) or a path that vanished mid-walk.  Fail loudly rather
       -- than fabricating an empty regular (which would silently change the NAR
       -- and its hash) - matching Nix, which aborts on unsupported types.
-      fail ("serialiseFromPath: not a regular file (special or vanished): " ++ path)
+      shownPath <- decodeFS path
+      fail ("serialiseFromPath: not a regular file (special or vanished): " ++ shownPath)
 
 -- | Check whether a file has the executable permission set.
--- Uses 'System.Directory.getPermissions' which is cross-platform:
+-- Uses 'System.Directory.OsPath.getPermissions' which is cross-platform:
 -- checks the user-execute bit on Unix, file extension on Windows.
-checkExecutable :: FilePath -> IO Bool
+checkExecutable :: OsPath -> IO Bool
 checkExecutable path = executable <$> getPermissions path
+
+-- | Read a file's contents by platform-native path.  The byte-string
+-- file API still takes 'FilePath', so the path bridges through
+-- 'decodeFS' - interop with unmigrated APIs is that function's
+-- documented purpose, and its contract is the exact round-trip: the
+-- reopened path names the same file even when the name has no text
+-- decoding.
+readFileBytes :: OsPath -> IO ByteString
+readFileBytes path = BS.readFile =<< decodeFS path
+
+-- | The NAR name for one platform-native path component: on POSIX the
+-- raw bytes the filesystem reports, on Windows the UTF-8 encoding of
+-- the UTF-16 name - each platform's spelling of the upstream rule that
+-- a NAR carries names as byte strings.  Symlink targets take the same
+-- path.  The one refusal is a Windows name holding an unpaired
+-- surrogate: it has no UTF-8 form and upstream defines no byte
+-- spelling for it, so failing loudly beats inventing a name (the same
+-- policy 'buildRegularFile' applies to special files).
+#ifdef mingw32_HOST_OS
+osPathBytes :: OsPath -> IO ByteString
+osPathBytes path = case OP.decodeUtf path of
+  Just decoded -> pure (TE.encodeUtf8 (T.pack decoded))
+  Nothing ->
+    fail ("serialiseFromPath: name has no UTF-8 form (unpaired surrogate): " ++ show path)
+#else
+osPathBytes :: OsPath -> IO ByteString
+osPathBytes path = case OP.decodeWith latin1 latin1 path of
+  Right decoded -> pure (BS8.pack decoded)
+  Left err ->
+    -- Unreachable: latin1 decoding is total - byte N reads as code
+    -- point N, and Char8 re-truncation above inverts it exactly - but
+    -- surfacing the impossible beats hiding it.
+    fail ("serialiseFromPath: undecodable name: " ++ show err)
+#endif
