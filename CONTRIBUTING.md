@@ -1,6 +1,6 @@
 # Contributing to nova-cache
 
-Thanks for your interest — issues and pull requests are welcome.
+Thanks for your interest. Issues and pull requests are welcome.
 
 ## Ground rules
 
