@@ -5,7 +5,7 @@
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
-![GHC](https://img.shields.io/badge/GHC-9.8-purple)
+![GHC](https://img.shields.io/badge/GHC-9.14-purple)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 </div>
@@ -99,7 +99,7 @@ cabal build
 cabal test
 ```
 
-Optional flag: `--flag server` builds the cache server. Requires GHC 9.8+ and cabal-install 3.10+.
+Optional flag: `--flag server` builds the cache server. Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 

@@ -30,7 +30,7 @@ jobs:
           echo "Set version to $TAG_VERSION"
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.8'
+          ghc-version: '9.14.1'
           cabal-version: 'latest'
       - run: cabal sdist
       - name: Upload to Hackage
