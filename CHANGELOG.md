@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Toolchain: GHC 9.14.1 (the first GHC LTS release)** - CI, the deploy and release pipelines, and the README badge move from GHC 9.8.4 to 9.14.1, matching nova-nix. GHC 9.14 opens GHC's new LTS scheme (a minimum of two years of bugfix releases), and under that scheme every earlier series stops receiving fixes, so no version in between had a future. Dependency bounds already admitted the newer compiler and the full set resolves on it. The project targets the LTS alone: base >= 4.22, and foldl' comes from the Prelude, so its one redundant Data.List import is gone.
+
 ## 0.7.0.0 - 2026-07-21
 
 - **NAR entry names and symlink targets are byte strings.** The format imposes no text encoding on either, and upstream carries both verbatim; decoding them as UTF-8 at parse rejected archives real Nix accepts. `NarEntry` now carries `ByteString` for directory entry names and symlink targets (the breaking change behind the major bump), the parser stops decoding, and entry order is defined bytewise. For names both representations accept - valid UTF-8 - code-point order and byte order coincide, so previously-valid archives keep their exact bytes and hashes. The `checkName` rejection categories apply unchanged to the byte form; they are ASCII-structural, so they now also catch hazards inside names that do not decode (a `nul.` device stem followed by undecodable bytes used to fail as bad UTF-8 and still fails - for the real reason).

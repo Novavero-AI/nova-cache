@@ -135,9 +135,9 @@ main = do
     _ -> pure ()
 
   let settings =
-        Warp.setHost (fromString bindHost) $
-          Warp.setPort port $
-            Warp.setOnExceptionResponse onExceptionResponse Warp.defaultSettings
+        Warp.setHost (fromString bindHost)
+          $ Warp.setPort port
+          $ Warp.setOnExceptionResponse onExceptionResponse Warp.defaultSettings
   Warp.runSettings settings (requestLogger (cacheApp cfg))
 
 -- ---------------------------------------------------------------------------

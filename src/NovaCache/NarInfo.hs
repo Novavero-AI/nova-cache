@@ -10,7 +10,6 @@ module NovaCache.NarInfo
   )
 where
 
-import Data.List (foldl')
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T

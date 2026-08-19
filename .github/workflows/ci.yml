@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: haskell-actions/hlint-setup@v2
         with:
-          version: '3.8'
+          version: '3.10'
       - uses: haskell-actions/hlint-run@v2
         with:
           path: '["src/", "test/", "exe/"]'
@@ -55,13 +55,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: haskell-actions/run-ormolu@v19
+      - uses: haskell-actions/run-ormolu@v21
         with:
           # Pinned to the version the repo is formatted with: formatting
           # is not stable across ormolu releases, and a floating version
           # would fail CI on untouched code when upstream ships one.
           # Upgrades bump this and the local binary together.
-          version: "0.7.7.0"
+          version: "0.9.0.0"
           pattern: |
             src/**/*.hs
             test/**/*.hs
@@ -91,7 +91,7 @@ jobs:
       - uses: haskell-actions/setup@v2
         id: setup
         with:
-          ghc-version: '9.8'
+          ghc-version: '9.14.1'
           cabal-version: 'latest'
 
       - name: Cache Cabal store
@@ -121,7 +121,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.8'
+          ghc-version: '9.14.1'
           cabal-version: 'latest'
       - run: cabal check
 
@@ -142,7 +142,7 @@ jobs:
       - uses: haskell-actions/setup@v2
         id: setup
         with:
-          ghc-version: '9.8'
+          ghc-version: '9.14.1'
           cabal-version: 'latest'
 
       - name: Cache Cabal store
@@ -177,7 +177,7 @@ jobs:
       - uses: haskell-actions/setup@v2
         id: setup
         with:
-          ghc-version: '9.8'
+          ghc-version: '9.14.1'
           cabal-version: 'latest'
 
       - name: Cache Cabal store
