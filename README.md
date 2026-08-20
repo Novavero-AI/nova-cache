@@ -54,8 +54,8 @@ import qualified NovaCache.Hash as Hash
 
 -- Stream a tree's NAR and hash it in one pass; the archive never
 -- exists in memory. The parsing side is NovaCache.NAR.Stream, a
--- chunk-fed event machine, and the xz flag adds decompression
--- bounded by a narinfo's declared NarSize.
+-- chunk-fed event machine, and the nova-cache:xz sublibrary adds
+-- decompression bounded by a narinfo's declared NarSize.
 narHash <- withNarSource defaultCaseHack path $ \pull ->
   let go ctx = do
         chunk <- pull
@@ -116,7 +116,7 @@ cabal build
 cabal test
 ```
 
-Optional flags: `--flag server` builds the cache server; `--flag xz` builds the bounded xz decoder (liblzma is bundled - no system library needed). Requires GHC 9.14+ and cabal-install 3.10+.
+Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz` sublibrary carries the bounded xz decoder (liblzma is bundled - no system library needed) - consumers depend on it with `build-depends: nova-cache:xz`. Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 

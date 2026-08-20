@@ -14,13 +14,14 @@
 -- Concatenated streams decode as one output, matching upstream's
 -- @LZMA_CONCATENATED@ decoder in libutil's compression sink.
 --
--- This module builds only under the @xz@ cabal flag.  The
+-- This module lives in the public @nova-cache:xz@ sublibrary.  The
 -- @lzma-static@ dependency bundles liblzma's C sources, so no system
 -- library is needed on any platform - but it is still an extra C
 -- build that consumers without foreign-cache needs should not pay
--- for, and a default-on compression flag broke downstream installs
--- once already (0.5.0.0).  The flag is manual and off by default;
--- consumers that substitute from foreign caches turn it on.
+-- for, and a default-on compression dependency broke downstream
+-- installs once already (0.5.0.0).  Consumers that substitute from
+-- foreign caches depend on @nova-cache:xz@; everyone else never
+-- builds it.
 module NovaCache.Xz
   ( XzLimits (..),
     defaultXzDecoderMemoryBytes,
