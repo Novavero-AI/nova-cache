@@ -57,22 +57,27 @@ import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 -- Wire vocabulary
 -- ---------------------------------------------------------------------------
 
+-- | Archive framing: the magic header, node delimiters, and the type
+-- keyword.
 tokMagic, tokLParen, tokRParen, tokType :: ByteString
 tokMagic = "nix-archive-1"
 tokLParen = "("
 tokRParen = ")"
 tokType = "type"
 
+-- | The three node kinds.
 tokRegular, tokDirectory, tokSymlink :: ByteString
 tokRegular = "regular"
 tokDirectory = "directory"
 tokSymlink = "symlink"
 
+-- | Regular-file and symlink field keywords.
 tokContents, tokTarget, tokExecutable :: ByteString
 tokContents = "contents"
 tokTarget = "target"
 tokExecutable = "executable"
 
+-- | Directory-entry keywords.
 tokEntry, tokName, tokNode :: ByteString
 tokEntry = "entry"
 tokName = "name"

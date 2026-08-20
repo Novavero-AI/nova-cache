@@ -131,7 +131,7 @@ stripDirPrefix :: FilePath -> Text -> Text
 stripDirPrefix dir txt =
   fromMaybe txt (T.stripPrefix (T.pack dir <> "/") txt)
 
--- | Parse a @\<hash\>-\<name\>@ basename into a 'StorePath'.
+-- | Parse a @\<hash\>-\<name\>@ basename into a 't:StorePath'.
 parseBaseName :: Text -> Either String StorePath
 parseBaseName basename
   | T.length basename < minBaseNameLen =

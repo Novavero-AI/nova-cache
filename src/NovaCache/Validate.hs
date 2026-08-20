@@ -57,7 +57,7 @@ data ValidationError
 
 -- | Validate narinfo field semantics: sizes non-negative, store path parses,
 -- hash fields parse, references parse. Collects all errors (not short-circuit).
--- Returns the 'NarInfo' unchanged on success for composition.
+-- Returns the 't:NarInfo' unchanged on success for composition.
 validateNarInfo :: NarInfo -> Either [ValidationError] NarInfo
 validateNarInfo ni =
   case concat [sizeErrors, drvErrors, storePathErrors, fileHashErrors, narHashErrors, refErrors] of
