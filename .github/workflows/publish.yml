@@ -45,14 +45,26 @@ jobs:
 
       # Maintainer-built documentation, permanently - not a stopgap for
       # Hackage's doc builder lagging GHC (today it carries 9.8 against a
-      # base >= 4.22 floor, so it cannot even plan the build).  Even a
-      # caught-up builder compiles default flags only and would silently
-      # omit the flag-gated NovaCache.Xz; building here documents every
-      # module with the same pinned toolchain the release was verified
-      # on, and the docs land with the release instead of on the
-      # builder's schedule.
+      # base >= 4.22 floor, so it cannot even plan the build).  Building
+      # here documents every library, the xz sublibrary included, with
+      # the same pinned toolchain the release was verified on, and the
+      # docs land with the release instead of on the builder's schedule.
       - name: Build documentation
-        run: cabal haddock --haddock-for-hackage -f xz
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          cabal haddock all --haddock-for-hackage
+          # cabal writes each library's tree separately and tars only the
+          # main one; Hackage serves one tree per release with sublibraries
+          # as subdirectories (the layout cabal itself names: <docs>/xz).
+          # Graft the xz component in and re-tar.  The final grep fails the
+          # job if a cabal layout change ever drops the module silently.
+          # Undo the graft when haskell/cabal#9577 lands (one tarball
+          # spanning every library).
+          MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
+          SUB=$(find dist-newstyle -type d -path "*/l/xz/*${VERSION}-docs/xz")
+          cp -R "$SUB" "$MAIN/xz"
+          tar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
+          tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "xz/NovaCache-Xz.html"
       - name: Upload documentation to Hackage
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}

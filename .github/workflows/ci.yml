@@ -123,16 +123,15 @@ jobs:
           key: cabal-${{ runner.os }}-${{ hashFiles('nova-cache.cabal') }}
           restore-keys: cabal-${{ runner.os }}-
 
-      # all + -f server + -f xz + --enable-tests so the server executable,
-      # the xz decoder, and the test suites hit the same -Werror bar as the
+      # all + -f server + --enable-tests so the server executable, the xz
+      # sublibrary, and the test suites hit the same -Werror bar as the
       # library on every OS.  No liblzma setup: lzma-static bundles the C
-      # sources.  The sdist job keeps the flags off, guarding the default
-      # install path.
+      # sources.  The sdist job builds the same set from the tarball.
       - name: Build
-        run: cabal build all -f server -f xz --enable-tests --ghc-options="-Werror"
+        run: cabal build all -f server --enable-tests --ghc-options="-Werror"
 
       - name: Test
-        run: cabal test -f server -f xz --ghc-options="-Werror"
+        run: cabal test -f server --ghc-options="-Werror"
 
   # ---------------------------------------------------------------------------
   # Packaging check (Linux-only)

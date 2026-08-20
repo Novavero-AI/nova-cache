@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **`NovaCache.Xz` moves to the public `nova-cache:xz` sublibrary; the `xz` flag is gone.** A dependency's flag cannot be set from a consumer's `.cabal` file, so reaching the decoder forced a mirrored flag plus a matching `constraints: nova-cache +xz` in every downstream - two knobs that had to agree and that the solver could not see. `build-depends: nova-cache:xz` now expresses the need directly, and consumers without it still never build the bundled liblzma, keeping the 0.5.0.0 lesson. Builds that passed `-f xz` drop the flag and add the dependency; the module and its API are unchanged.
+
 ## 0.8.0.0 - 2026-08-20
 
 - **Bounded xz decompression returns: the new `NovaCache.Xz`, behind a manual, off-by-default `xz` flag.** 0.5.0.0 removed xz support for having no consumer; foreign-cache substitution (cache.nixos.org serves `.nar.xz`) is the consumer, and the decoder comes back shaped for untrusted input. The consumer knows the narinfo's declared NarSize before decompressing, so `decompress` takes that bound and fails past it - a small compressed input cannot expand to arbitrary memory ahead of the hash check - and the decoder's own state is capped too (`xzMaxDecoderMemoryBytes`; the dictionary size is an attacker-chosen number read from the stream header, and upstream passes no limit there). `withXzSource` decompresses a chunk source into a chunk source under the same limits, pairing with streaming NAR consumption. Concatenated streams decode as one output, matching upstream's `LZMA_CONCATENATED` decoder. The `lzma-static` dependency bundles liblzma's C sources, so the flag needs no system library on any platform - and it stays off by default anyway: the 0.5.0.0 lesson was a compression dependency nobody asked for in every install.

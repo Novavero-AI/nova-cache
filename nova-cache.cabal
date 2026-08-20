@@ -1,12 +1,13 @@
 cabal-version:      3.0
 name:               nova-cache
-version:            0.8.0.0
+version:            0.9.0.0
 synopsis:           Pure-first Nix binary cache protocol library
 description:
   A pure-first library implementing the Nix binary cache protocol -
   nix-base32, NAR serialization (whole-tree and streaming), narinfo
-  parsing, Ed25519 signing, store path handling, content validation,
-  and bounded xz decompression - with an optional WAI server.
+  parsing, Ed25519 signing, store path handling, and content
+  validation - with an optional WAI server, and bounded xz
+  decompression as the public @nova-cache:xz@ sublibrary.
 
 license:            Apache-2.0
 license-file:       LICENSE
@@ -26,11 +27,6 @@ extra-doc-files:
 
 flag server
   description: Build the cache server executable (pulls in warp and wai-extra)
-  default:     False
-  manual:      True
-
-flag xz
-  description: Build NovaCache.Xz, bounded xz decompression (lzma-static bundles liblzma; no system library)
   default:     False
   manual:      True
 
@@ -63,11 +59,6 @@ library
     , vector              >= 0.12 && < 0.14
     , wai                 >= 3.2 && < 3.3
 
-
-  if flag(xz)
-    exposed-modules: NovaCache.Xz
-    build-depends:   lzma-static >= 5.2.5 && < 5.3
-
   hs-source-dirs:   src
   default-language:  Haskell2010
   default-extensions:
@@ -78,6 +69,32 @@ library
     -Wcompat
     -Wincomplete-record-updates
     -Wincomplete-uni-patterns
+
+-- The bounded xz decoder as a solver-visible opt-in: a consumer that
+-- substitutes foreign caches writes build-depends: nova-cache:xz and
+-- gets the module; everyone else never builds lzma-static's bundled
+-- liblzma.  This replaces the manual xz flag - a dependency's flag
+-- cannot be set from a consumer's .cabal file, which forced mirror
+-- flags and matching constraints downstream (nova-nix#27) - while
+-- keeping the 0.5.0.0 lesson: xz stays out of the default install.
+library xz
+  visibility:       public
+  exposed-modules:  NovaCache.Xz
+  hs-source-dirs:   src
+  default-language:  Haskell2010
+  default-extensions:
+    BangPatterns
+    OverloadedStrings
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , lzma-static         >= 5.2.5 && < 5.3
 
 executable nova-cache-server
   if !flag(server)
@@ -124,9 +141,6 @@ test-suite nova-cache-test
     , wai-extra           >= 3.1 && < 3.2
 
 test-suite nova-cache-xz-test
-  if !flag(xz)
-    buildable: False
-
   type:             exitcode-stdio-1.0
   main-is:          XzTest.hs
   hs-source-dirs:   test
@@ -138,7 +152,7 @@ test-suite nova-cache-xz-test
   build-depends:
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
-    , nova-cache
+    , nova-cache:xz
 
 source-repository head
   type:     git
