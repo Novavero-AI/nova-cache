@@ -1,0 +1,55 @@
+name: Docs
+
+# Re-upload documentation for an already-published release.  The publish
+# workflow uploads docs for new releases; this exists for versions that
+# shipped before it did (0.8.0.0), or if a doc upload ever needs redoing.
+# Hackage's own doc builder runs an older GHC than the base floor admits,
+# so maintainer-built docs are the only docs these releases get.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload documentation for (e.g. v0.8.0.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: Upload docs to Hackage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Same tag-is-the-version rule as the publish workflow, for tags
+      # whose tree predates the in-repo version bump.
+      - name: Set version from tag
+        run: |
+          TAG_VERSION="${{ inputs.tag }}"
+          TAG_VERSION=${TAG_VERSION#v}
+          sed -i "s/^version:.*/version:            $TAG_VERSION/" nova-cache.cabal
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.14.1'
+          cabal-version: 'latest'
+
+      - name: Build documentation
+        run: cabal haddock --haddock-for-hackage -f xz
+
+      - name: Upload documentation to Hackage
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+        run: |
+          VERSION="${{ inputs.tag }}"
+          VERSION=${VERSION#v}
+          curl -X PUT --fail --silent --show-error \
+            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
+            --header "Content-Type: application/x-tar" \
+            --header "Content-Encoding: gzip" \
+            --data-binary "@dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" \
+            "https://hackage.haskell.org/package/nova-cache-${VERSION}/docs"
