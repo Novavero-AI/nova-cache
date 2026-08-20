@@ -26,6 +26,7 @@ module NovaCache.Xz
   ( XzLimits (..),
     defaultXzDecoderMemoryBytes,
     XzError (..),
+    truncatedInputMessage,
     decompress,
     withXzSource,
   )
@@ -112,11 +113,10 @@ decompress limits input = runST $ do
       Lzma.DecompressInputRequired supply -> case pending of
         Just bytes -> drive Nothing produced acc =<< supply bytes
         Nothing -> drive Nothing produced acc =<< supply BS.empty
-      Lzma.DecompressOutputAvailable out next
-        | grown > bound -> pure (Left (XzOutputOverBound bound))
-        | otherwise -> drive pending grown (out : acc) =<< next
-        where
-          grown = produced + fromIntegral (BS.length out)
+      Lzma.DecompressOutputAvailable out next ->
+        case growWithinBound bound produced out of
+          Nothing -> pure (Left (XzOutputOverBound bound))
+          Just grown -> drive pending grown (out : acc) =<< next
       Lzma.DecompressStreamEnd leftover
         | BS.null leftover -> pure (Right (BS.concat (reverse acc)))
         | otherwise -> pure (Left (XzStreamError trailingDataMessage))
@@ -132,6 +132,12 @@ decompress limits input = runST $ do
 data XzSourceState
   = XzStreaming !(Lzma.DecompressStream IO) !Word64
   | XzDrained
+  | -- | The source failed; the error is held so every later pull
+    -- re-throws it.  Collapsing failure into 'XzDrained' would let a
+    -- consumer that catches the first throw pull once more and read
+    -- the empty chunk - the clean-end signal - presenting truncated
+    -- output as complete.
+    XzFailed !XzError
 
 -- | Decompress a chunk source into a chunk source, under the limits.
 -- The continuation's pull yields decompressed chunks; the empty chunk
@@ -141,7 +147,20 @@ data XzSourceState
 -- decompress, hash, and unpack in one bounded pass.
 --
 -- Limit violations and malformed input are thrown as 'XzError' from
--- the pull.
+-- the pull; once a pull has thrown, every later pull re-throws the
+-- same error.
+--
+-- Despite the bracket-shaped name there is no bracket to run: the
+-- binding ("Codec.Compression.Lzma") exposes no teardown for a live
+-- 'Lzma.DecompressStream' - it runs @lzma_end@ itself on the clean
+-- end path and otherwise leaves it to the stream's ForeignPtr
+-- finalizer.  A pull that throws, or a consumer that exits early,
+-- therefore strands the decoder state (up to 'xzMaxDecoderMemoryBytes')
+-- until a GC runs the finalizer.  Undo condition: a lzma-static
+-- release surfacing live-stream teardown in the high-level API (its
+-- internal @LibLzma.endLzmaStream@ is what the fix needs), at which
+-- point this becomes a real bracket ending the stream on every exit
+-- path.
 withXzSource :: XzLimits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withXzSource limits compressedSource consume = do
   start <- Lzma.decompressIO (decompressParams limits)
@@ -153,19 +172,20 @@ pullDecompressed :: XzLimits -> IO ByteString -> IORef XzSourceState -> IO ByteS
 pullDecompressed limits compressedSource stateRef = advance =<< readIORef stateRef
   where
     bound = xzMaxOutputBytes limits
+    failWith err = do
+      writeIORef stateRef (XzFailed err)
+      throwIO err
     advance XzDrained = pure BS.empty
+    advance (XzFailed err) = throwIO err
     advance (XzStreaming step produced) = case step of
       Lzma.DecompressInputRequired supply -> do
         chunk <- compressedSource
         next <- supply chunk
         advance (XzStreaming next produced)
-      Lzma.DecompressOutputAvailable out nextAction -> do
-        let grown = produced + fromIntegral (BS.length out)
-        if grown > bound
-          then do
-            writeIORef stateRef XzDrained
-            throwIO (XzOutputOverBound bound)
-          else do
+      Lzma.DecompressOutputAvailable out nextAction ->
+        case growWithinBound bound produced out of
+          Nothing -> failWith (XzOutputOverBound bound)
+          Just grown -> do
             next <- nextAction
             writeIORef stateRef (XzStreaming next grown)
             -- liblzma may hand back an empty buffer at stream
@@ -173,17 +193,15 @@ pullDecompressed limits compressedSource stateRef = advance =<< readIORef stateR
             if BS.null out
               then advance (XzStreaming next grown)
               else pure out
-      Lzma.DecompressStreamEnd leftover -> do
-        writeIORef stateRef XzDrained
-        if BS.null leftover
-          then pure BS.empty
-          else throwIO (XzStreamError trailingDataMessage)
-      Lzma.DecompressStreamError ret -> do
-        writeIORef stateRef XzDrained
-        throwIO (mapRet limits ret)
+      Lzma.DecompressStreamEnd leftover
+        | BS.null leftover -> do
+            writeIORef stateRef XzDrained
+            pure BS.empty
+        | otherwise -> failWith (XzStreamError trailingDataMessage)
+      Lzma.DecompressStreamError ret -> failWith (mapRet limits ret)
 
 -- ---------------------------------------------------------------------------
--- Shared decoder configuration
+-- Shared decoder machinery
 -- ---------------------------------------------------------------------------
 
 -- | Decoder parameters under the limits: concatenated-stream decoding
@@ -195,11 +213,63 @@ decompressParams limits =
       Lzma.decompressMemLimit = xzMaxDecoderMemoryBytes limits
     }
 
--- | Map liblzma's status to the error vocabulary.
+-- | Total output after one more chunk, if it stays within the
+-- inclusive bound.  The pure driver and the streaming pull both decide
+-- the boundary here, so output of exactly the bound - a narinfo's
+-- NarSize is exact - passes in both paths by construction.
+growWithinBound :: Word64 -> Word64 -> ByteString -> Maybe Word64
+growWithinBound bound produced chunk
+  | grown > bound = Nothing
+  | otherwise = Just grown
+  where
+    grown = produced + fromIntegral (BS.length chunk)
+
+-- | Map liblzma's status to the error vocabulary.  The binding hands
+-- over the raw 'Lzma.LzmaRet'; shown as-is, a zero-byte input would
+-- fail with the message @LzmaRetOK@ - which reads as success - so the
+-- terminal statuses get real diagnoses instead.
 mapRet :: XzLimits -> Lzma.LzmaRet -> XzError
 mapRet limits ret = case ret of
   Lzma.LzmaRetMemlimitError -> XzMemoryOverBound (xzMaxDecoderMemoryBytes limits)
-  other -> XzStreamError (show other)
+  -- Input exhausted mid-stream: the binding reports LzmaRetOK when
+  -- the decoder was still content at end of input (a zero-byte input
+  -- lands here) and LzmaRetBufError when it could make no further
+  -- progress; both mean the input ran out before the stream did.
+  Lzma.LzmaRetOK -> XzStreamError truncatedInputMessage
+  Lzma.LzmaRetBufError -> XzStreamError truncatedInputMessage
+  Lzma.LzmaRetFormatError -> XzStreamError formatErrorMessage
+  Lzma.LzmaRetDataError -> XzStreamError dataErrorMessage
+  Lzma.LzmaRetOptionsError -> XzStreamError optionsErrorMessage
+  Lzma.LzmaRetUnsupportedCheck -> XzStreamError unsupportedCheckMessage
+  Lzma.LzmaRetMemError -> XzStreamError decoderAllocationMessage
+  -- LzmaRetStreamEnd, LzmaRetGetCheck, LzmaRetProgError never reach
+  -- the error path under this module's parameters; if the binding
+  -- surfaces one anyway, name it honestly rather than invent a cause.
+  other -> XzStreamError (unexpectedStatusPrefix ++ show other)
+
+-- | Diagnosis for input that ends before the xz stream does.  A
+-- zero-byte input and a truncated download both land here; exported so
+-- consumers can match the condition without parsing prose.
+truncatedInputMessage :: String
+truncatedInputMessage = "compressed input is empty or truncated before the end of the xz stream"
 
 trailingDataMessage :: String
 trailingDataMessage = "trailing data after the xz stream"
+
+formatErrorMessage :: String
+formatErrorMessage = "input is not an xz stream (magic bytes not recognized)"
+
+dataErrorMessage :: String
+dataErrorMessage = "corrupt xz stream"
+
+optionsErrorMessage :: String
+optionsErrorMessage = "xz stream declares unsupported filter options"
+
+unsupportedCheckMessage :: String
+unsupportedCheckMessage = "xz stream declares an unsupported integrity check"
+
+decoderAllocationMessage :: String
+decoderAllocationMessage = "decoder memory allocation failed"
+
+unexpectedStatusPrefix :: String
+unexpectedStatusPrefix = "unexpected liblzma status: "
