@@ -10,6 +10,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Lazy as BL
+import Data.Either (isLeft)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List (sort)
 import Data.Maybe (isJust)
@@ -23,6 +24,7 @@ import qualified Network.Wai.Test as WT
 import qualified NovaCache.Base32 as Base32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
+import qualified NovaCache.NAR.Stream as Stream
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Server as Server
 import qualified NovaCache.Signing as Signing
@@ -133,6 +135,7 @@ main = do
       testHash,
       testStorePath,
       testNAR,
+      testStream,
       testNarInfo,
       testSigning,
       testFileStore,
@@ -560,6 +563,212 @@ badPaddingNar =
     [ BS.concat (map (narWireStr 0) ["nix-archive-1", "(", "type", "regular", "contents"]),
       narWireStr 1 "abc",
       narWireStr 0 ")"
+    ]
+
+-- ---------------------------------------------------------------------------
+-- NAR.Stream tests
+-- ---------------------------------------------------------------------------
+
+-- | Drive the streaming parser over the given chunks (all non-empty),
+-- then signal end of input, collecting events.
+runStream :: [ByteString] -> Either String [Stream.NarEvent]
+runStream chunks = go Stream.narStream chunks []
+  where
+    go step pending acc = case step of
+      Stream.NarFail err -> Left err
+      Stream.NarDone -> Right (reverse acc)
+      Stream.NarYield event continue -> go continue pending (event : acc)
+      Stream.NarAwait continue -> case pending of
+        [] -> go (continue BS.empty) [] acc
+        (chunk : rest) -> go (continue chunk) rest acc
+
+-- | Entry shapes the chunking-independence test sweeps: every node
+-- kind, empty and aligned contents, nesting, and a non-UTF-8 name.
+streamCorpus :: [NAR.NarEntry]
+streamCorpus =
+  [ NAR.NarRegular False "hello",
+    NAR.NarRegular True BS.empty,
+    NAR.NarRegular False (BS.replicate 8 0x41),
+    NAR.NarSymlink "/usr/bin/hello",
+    NAR.NarDirectory [],
+    NAR.NarDirectory
+      [ ("bin", NAR.NarDirectory [("hello", NAR.NarRegular True (BS.pack [42]))]),
+        ("lib", NAR.NarSymlink "../lib64"),
+        (BS.pack [0x66, 0xFF], NAR.NarRegular False "raw")
+      ]
+  ]
+
+-- | Merge consecutive contents slices.  Slice granularity deliberately
+-- follows the fed chunks, so parses of different chunkings compare by
+-- structure and content, not by how the input happened to arrive.
+coalesceChunks :: [Stream.NarEvent] -> [Stream.NarEvent]
+coalesceChunks (Stream.EventRegularChunk a : Stream.EventRegularChunk b : rest) =
+  coalesceChunks (Stream.EventRegularChunk (a <> b) : rest)
+coalesceChunks (event : rest) = event : coalesceChunks rest
+coalesceChunks [] = []
+
+-- | Split a byte string into fixed-size pieces.
+chunksOf :: Int -> ByteString -> [ByteString]
+chunksOf n bs
+  | BS.null bs = []
+  | otherwise = case BS.splitAt n bs of
+      (piece, rest) -> piece : chunksOf n rest
+
+-- | Pull a source dry, collecting its chunks (the terminating empty
+-- chunk excluded).
+collectChunks :: IO ByteString -> IO [ByteString]
+collectChunks pull = go []
+  where
+    go acc = do
+      chunk <- pull
+      if BS.null chunk then pure (reverse acc) else go (chunk : acc)
+
+-- | Pull a source dry into one byte string.
+drainSource :: IO ByteString -> IO ByteString
+drainSource pull = BS.concat <$> collectChunks pull
+
+-- | Hash a source chunk by chunk as it is pulled.
+hashPull :: Hash.HashContext -> IO ByteString -> IO Hash.NixHash
+hashPull ctx pull = do
+  chunk <- pull
+  if BS.null chunk
+    then pure (Hash.hashFinalize ctx)
+    else hashPull (Hash.hashUpdate ctx chunk) pull
+
+testStream :: IO Bool
+testStream =
+  runGroup
+    "NAR.Stream"
+    [ test "events for a regular file" $
+        assertEqual
+          "event sequence"
+          ( Right
+              [ Stream.EventRegularBegin True 2,
+                Stream.EventRegularChunk "hi",
+                Stream.EventRegularEnd
+              ]
+          )
+          (runStream [NAR.serialise (NAR.NarRegular True "hi")]),
+      test "events for a directory arrive entry by entry" $
+        let entry = NAR.NarDirectory [("a", NAR.NarSymlink "t"), ("b", NAR.NarRegular False "")]
+            expected =
+              [ Stream.EventDirectoryBegin,
+                Stream.EventEntryBegin "a",
+                Stream.EventSymlink "t",
+                Stream.EventEntryEnd,
+                Stream.EventEntryBegin "b",
+                Stream.EventRegularBegin False 0,
+                Stream.EventRegularEnd,
+                Stream.EventEntryEnd,
+                Stream.EventDirectoryEnd
+              ]
+         in assertEqual "event sequence" (Right expected) (runStream [NAR.serialise entry]),
+      test "byte-at-a-time chunking equals whole-input parsing" $
+        let normalize = fmap coalesceChunks
+            agrees entry =
+              let bytes = NAR.serialise entry
+               in normalize (runStream [bytes]) == normalize (runStream (map BS.singleton (BS.unpack bytes)))
+         in assertTrue "chunking-independent" (all agrees streamCorpus),
+      test "contents slices reassemble across misaligned chunks" $
+        -- 7-byte chunks sit deliberately askew of the 8-byte wire
+        -- alignment, so every length prefix and padding run straddles
+        -- a chunk boundary somewhere.
+        let payload = BS.pack (concat (replicate 40 [0 .. 7]))
+            bytes = NAR.serialise (NAR.NarRegular False payload)
+         in case runStream (chunksOf 7 bytes) of
+              Left err -> do
+                putStrLn ("  streaming parse failed: " ++ err)
+                pure False
+              Right events ->
+                assertEqual
+                  "reassembled contents"
+                  payload
+                  (BS.concat [c | Stream.EventRegularChunk c <- events]),
+      test "streaming agrees with deserialise on the malformed corpus" $
+        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
+            malformed =
+              [ outOfOrderDirNar,
+                badPaddingNar,
+                NAR.serialise (NAR.NarRegular False "x") <> "junk1234",
+                evil "..",
+                evil "a/b",
+                evil "nul"
+              ]
+            bothReject bytes = isLeft (runStream [bytes]) && isLeft (NAR.deserialise bytes)
+         in assertTrue "all rejected by both parsers" (all bothReject malformed),
+      test "the structural bound applies to streaming, not deserialise" $
+        -- deserialise instantiates the machine with its input's length
+        -- as the bound, so a name this size stays accepted there; the
+        -- streaming default caps structural strings at 64 KiB.
+        let longName = BS.replicate 70000 0x61
+            bytes = NAR.serialise (NAR.NarDirectory [(longName, NAR.NarRegular False "x")])
+         in do
+              ok1 <- assertTrue "deserialise accepts" (either (const False) (const True) (NAR.deserialise bytes))
+              ok2 <- assertTrue "streaming rejects" (isLeft (runStream [bytes]))
+              pure (ok1 && ok2),
+      test "a truncated archive fails" $
+        let bytes = NAR.serialise (NAR.NarRegular False "some contents here")
+         in assertLeft "eof" (runStream [BS.take (BS.length bytes - 9) bytes]),
+      test "the declared contents size arrives before the bytes" $
+        case runStream [NAR.serialise (NAR.NarRegular False (BS.replicate 24 0x2A))] of
+          Right (Stream.EventRegularBegin False declared : _) ->
+            assertEqual "declared size" 24 declared
+          other -> do
+            putStrLn ("    expected EventRegularBegin first, got: " ++ show other)
+            pure False,
+      test "withNarSource streams byte-identically to serialise" $ do
+        dir <- caseHackFixture "nova-cache-test-narsource"
+        createDirectory (dir <> "/sub")
+        -- Larger than two pull chunks, so mid-file continuation runs.
+        BS.writeFile (dir <> "/big.bin") (BS.replicate 300000 0x41)
+        BS.writeFile (dir <> "/sub/small") "tiny"
+        BS.writeFile (dir <> "/zero") ""
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+        streamed <- NAR.withNarSource NAR.CaseHackDisabled dir drainSource
+        removeDirectoryRecursive dir
+        assertTrue "bytes equal" (NAR.serialise entry == streamed),
+      test "withNarSource under the case-hack matches the strict walk" $ do
+        dir <- caseHackFixture "nova-cache-test-narsource-hack"
+        BS.writeFile (dir <> "/Foo") "upper"
+        BS.writeFile (dir <> "/foo~nix~case~hack~1") "lower"
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackEnabled dir
+        streamed <- NAR.withNarSource NAR.CaseHackEnabled dir drainSource
+        removeDirectoryRecursive dir
+        assertTrue "bytes equal" (NAR.serialise entry == streamed),
+      test "withNarSource keeps returning empty after the end" $ do
+        dir <- caseHackFixture "nova-cache-test-narsource-end"
+        BS.writeFile (dir <> "/f") "x"
+        ends <- NAR.withNarSource NAR.CaseHackDisabled dir $ \pull -> do
+          _ <- collectChunks pull
+          endA <- pull
+          endB <- pull
+          pure (endA, endB)
+        removeDirectoryRecursive dir
+        assertEqual "stable end" ("", "") ends,
+      test "pulled chunks parse back to the walked tree" $ do
+        dir <- caseHackFixture "nova-cache-test-narsource-loop"
+        BS.writeFile (dir <> "/data.bin") (BS.replicate 200000 0x5A)
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+        chunks <- NAR.withNarSource NAR.CaseHackDisabled dir collectChunks
+        removeDirectoryRecursive dir
+        ok1 <- assertRight "strict parse of the stream" entry (NAR.deserialise (BS.concat chunks))
+        ok2 <- assertTrue "streaming parse of the chunk list" (either (const False) (const True) (runStream chunks))
+        pure (ok1 && ok2),
+      test "incremental hashing equals whole-input hashing" $
+        let payload = BS.pack [0 .. 255]
+            pieces = [BS.take 100 payload, BS.take 55 (BS.drop 100 payload), BS.drop 155 payload]
+            incremental = Hash.hashFinalize (foldl' Hash.hashUpdate Hash.hashInit pieces)
+         in do
+              ok1 <- assertEqual "split arbitrarily" (Hash.hashBytes payload) incremental
+              ok2 <- assertEqual "empty input" (Hash.hashBytes BS.empty) (Hash.hashFinalize Hash.hashInit)
+              pure (ok1 && ok2),
+      test "hashing a pulled source equals narHash of the walk" $ do
+        dir <- caseHackFixture "nova-cache-test-streamhash"
+        BS.writeFile (dir <> "/blob") (BS.replicate 150000 0x07)
+        entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+        digest <- NAR.withNarSource NAR.CaseHackDisabled dir (hashPull Hash.hashInit)
+        removeDirectoryRecursive dir
+        assertEqual "hash matches" (NAR.narHash entry) digest
     ]
 
 -- ---------------------------------------------------------------------------

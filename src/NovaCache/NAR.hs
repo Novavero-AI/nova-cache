@@ -16,6 +16,11 @@
 --
 -- Entry names and symlink targets are raw byte strings: the format
 -- imposes no text encoding on them, and upstream carries them verbatim.
+--
+-- Parsing is the whole-input instantiation of the incremental machine
+-- in "NovaCache.NAR.Stream", and serialisation draws on that module's
+-- wire vocabulary - the grammar exists once.  To serialise a tree
+-- without holding file contents in memory, see 'withNarSource'.
 module NovaCache.NAR
   ( NarEntry (..),
     serialise,
@@ -23,23 +28,43 @@ module NovaCache.NAR
     narHash,
     serialiseFromPath,
     serialiseFromPathWith,
+    withNarSource,
     CaseHack (..),
     defaultCaseHack,
     caseHackSuffix,
   )
 where
 
-import Data.Bits (shiftL, (.&.), (.|.))
+import Control.Exception (finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
-import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (sort, sortBy)
 import Data.Ord (comparing)
 import Data.Word (Word64)
 import qualified NovaCache.Hash as Hash
-import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
+import NovaCache.NAR.Stream
+  ( NarEvent (..),
+    NarStep (..),
+    narPad,
+    narPadOf,
+    narStreamBounded,
+    tokContents,
+    tokDirectory,
+    tokEntry,
+    tokExecutable,
+    tokLParen,
+    tokMagic,
+    tokName,
+    tokNode,
+    tokRParen,
+    tokRegular,
+    tokSymlink,
+    tokTarget,
+    tokType,
+  )
 import System.Directory.OsPath
   ( doesDirectoryExist,
     doesFileExist,
@@ -55,8 +80,10 @@ import qualified System.OsPath as OP
 #ifdef mingw32_HOST_OS
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, openBinaryFile)
 #else
-import System.IO (latin1)
+import qualified Data.ByteString.Char8 as BS8
+import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, latin1, openBinaryFile)
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -76,35 +103,6 @@ data NarEntry
     -- out-of-order names.
     NarDirectory ![(ByteString, NarEntry)]
   deriving (Eq, Show)
-
--- ---------------------------------------------------------------------------
--- Wire tokens (named constants, no magic strings)
--- ---------------------------------------------------------------------------
-
-tokMagic, tokLParen, tokRParen, tokType :: ByteString
-tokMagic = "nix-archive-1"
-tokLParen = "("
-tokRParen = ")"
-tokType = "type"
-
-tokRegular, tokDirectory, tokSymlink :: ByteString
-tokRegular = "regular"
-tokDirectory = "directory"
-tokSymlink = "symlink"
-
-tokContents, tokTarget, tokExecutable :: ByteString
-tokContents = "contents"
-tokTarget = "target"
-tokExecutable = "executable"
-
-tokEntry, tokName, tokNode :: ByteString
-tokEntry = "entry"
-tokName = "name"
-tokNode = "node"
-
--- | Alignment boundary for NAR wire strings.
-narAlignment :: Int
-narAlignment = 8
 
 -- ---------------------------------------------------------------------------
 -- Serialization (pure Builder pipeline)
@@ -168,198 +166,76 @@ narStr bs =
     len = BS.length bs
     padLen = narPad len
 
--- | Compute padding to reach the next 8-byte boundary.
-narPad :: Int -> Int
-narPad len =
-  let remainder = len .&. (narAlignment - 1)
-   in if remainder == 0 then 0 else narAlignment - remainder
-
 -- ---------------------------------------------------------------------------
--- Deserialization (pure, cursor-passing parser)
+-- Deserialization (the streaming machine, driven over the whole input)
 -- ---------------------------------------------------------------------------
-
--- | Parser state: remaining bytes after consuming a token.
-type NarParser a = ByteString -> Either String (a, ByteString)
 
 -- | Deserialise NAR binary format to a 'NarEntry'.
+--
+-- Drives "NovaCache.NAR.Stream" over the whole input, folding its
+-- events back into a tree.  The structural-string bound is the input's
+-- own length - a wire string cannot outgrow its container - so this
+-- accepts exactly what the dedicated whole-input parser accepted,
+-- with no extra ceiling.  Contents events are slices of the input, so
+-- single-chunk files rebuild by sharing, not copying.
 deserialise :: ByteString -> Either String NarEntry
-deserialise bs = do
-  (magic, rest) <- readStr bs
-  expect tokMagic magic
-  (entry, rest2) <- parseNode rest
-  if BS.null rest2
-    then Right entry
-    else Left "trailing bytes after NAR root node"
-
--- | Parse a single NAR node.
-parseNode :: NarParser NarEntry
-parseNode bs = do
-  (lp, rest) <- readStr bs
-  expect tokLParen lp
-  (ty, afterTy) <- readStr rest
-  expect tokType ty
-  (kind, afterKind) <- readStr afterTy
-  dispatch kind afterKind
+deserialise input = drive True (narStreamBounded (fromIntegral (BS.length input))) [] Nothing
   where
-    dispatch kind rest
-      | kind == tokRegular = parseRegular rest
-      | kind == tokSymlink = parseSymlink rest
-      | kind == tokDirectory = parseDirectory rest
-      | otherwise = Left ("unknown NAR entry type: " ++ show kind)
+    drive !firstFeed step stack root = case step of
+      NarFail err -> Left err
+      NarDone -> case (stack, root) of
+        ([], Just entry) -> Right entry
+        _ -> Left malformedEventStream
+      NarYield event continue -> do
+        (stackNext, rootNext) <- applyEvent event stack root
+        drive firstFeed continue stackNext rootNext
+      NarAwait continue
+        | firstFeed -> drive False (continue input) stack root
+        | otherwise -> drive False (continue BS.empty) stack root
 
--- | Parse a regular file node (optional executable flag + contents).
-parseRegular :: NarParser NarEntry
-parseRegular bs = do
-  (tok, afterTok) <- readStr bs
-  regular tok afterTok
+-- | One frame of the event fold in 'deserialise': the construct
+-- enclosing the node currently being built.
+data BuildFrame
+  = -- | A regular file: executable flag and reversed contents slices.
+    FrameRegular !Bool ![ByteString]
+  | -- | A directory: completed children, reversed.
+    FrameDirectory ![(ByteString, NarEntry)]
+  | -- | A directory entry: its name, then its node once complete.
+    FrameEntry !ByteString !(Maybe NarEntry)
+
+-- | Apply one event to the frame stack.  The machine already validated
+-- the grammar, so the mismatch arms are unreachable through
+-- 'narStreamBounded'; they fail closed rather than building partially.
+applyEvent :: NarEvent -> [BuildFrame] -> Maybe NarEntry -> Either String ([BuildFrame], Maybe NarEntry)
+applyEvent event stack root = case (event, stack) of
+  (EventRegularBegin isExec _declaredSize, _) ->
+    Right (FrameRegular isExec [] : stack, root)
+  (EventRegularChunk slice, FrameRegular isExec chunks : rest) ->
+    Right (FrameRegular isExec (slice : chunks) : rest, root)
+  (EventRegularEnd, FrameRegular isExec chunks : rest) ->
+    complete (NarRegular isExec (BS.concat (reverse chunks))) rest
+  (EventSymlink target, _) ->
+    complete (NarSymlink target) stack
+  (EventDirectoryBegin, _) ->
+    Right (FrameDirectory [] : stack, root)
+  (EventEntryBegin entryName, _) ->
+    Right (FrameEntry entryName Nothing : stack, root)
+  (EventEntryEnd, FrameEntry entryName (Just entry) : FrameDirectory entriesRev : rest) ->
+    Right (FrameDirectory ((entryName, entry) : entriesRev) : rest, root)
+  (EventDirectoryEnd, FrameDirectory entriesRev : rest) ->
+    complete (NarDirectory (reverse entriesRev)) rest
+  _ -> Left malformedEventStream
   where
-    regular tok rest
-      | tok == tokExecutable = do
-          (marker, afterEmpty) <- readStr rest
-          -- The format fixes the executable marker's value as the empty
-          -- string; upstream rejects a nonempty value.
-          if BS.null marker
-            then Right ()
-            else Left ("executable marker must be empty, got: " ++ show marker)
-          (cTok, afterCTok) <- readStr afterEmpty
-          expect tokContents cTok
-          (contents, afterContents) <- readStr afterCTok
-          (rp, final) <- readStr afterContents
-          expect tokRParen rp
-          pure (NarRegular True contents, final)
-      | tok == tokContents = do
-          (contents, afterContents) <- readStr rest
-          (rp, final) <- readStr afterContents
-          expect tokRParen rp
-          pure (NarRegular False contents, final)
-      | otherwise =
-          -- 'contents' is mandatory (even an empty file serialises with it), so
-          -- a regular node without it is malformed - reject, matching Nix.
-          Left ("expected 'executable' or 'contents' in regular, got: " ++ show tok)
+    complete entry remaining = case remaining of
+      [] -> case root of
+        Nothing -> Right ([], Just entry)
+        Just _ -> Left malformedEventStream
+      FrameEntry entryName Nothing : rest ->
+        Right (FrameEntry entryName (Just entry) : rest, root)
+      _ -> Left malformedEventStream
 
--- | Parse a symlink node.  The target is carried verbatim: upstream
--- imposes no text encoding on it.
-parseSymlink :: NarParser NarEntry
-parseSymlink bs = do
-  (tgt, afterTgt) <- readStr bs
-  expect tokTarget tgt
-  (targetPath, afterPath) <- readStr afterTgt
-  (rp, final) <- readStr afterPath
-  expect tokRParen rp
-  pure (NarSymlink targetPath, final)
-
--- | Parse a directory node (zero or more child entries).
-parseDirectory :: NarParser NarEntry
-parseDirectory = go Nothing []
-  where
-    go !prev !acc bs = do
-      (tok, afterTok) <- readStr bs
-      if tok == tokRParen
-        then pure (NarDirectory (reverse acc), afterTok)
-        else do
-          expect tokEntry tok
-          (lp, afterLp) <- readStr afterTok
-          expect tokLParen lp
-          (nTok, afterNTok) <- readStr afterLp
-          expect tokName nTok
-          (entryName, afterName) <- readStr afterNTok
-          (nodeTok, afterNodeTok) <- readStr afterName
-          expect tokNode nodeTok
-          (entry, afterEntry) <- parseNode afterNodeTok
-          (rp, afterRp) <- readStr afterEntry
-          expect tokRParen rp
-          _ <- checkName prev entryName
-          go (Just entryName) ((entryName, entry) : acc) afterRp
-    -- NAR directory entries must have safe names in strictly increasing
-    -- (sorted, unique) byte order.  Enforcing this rejects malformed or
-    -- hostile archives, keeps @serialise . deserialise@ an identity, and
-    -- forecloses the path-traversal surface for any future NAR-extraction
-    -- consumer.  Names are arbitrary bytes; every check here is
-    -- ASCII-structural, so it stays exact whether or not the name
-    -- decodes as text (see "NovaCache.SafeName").
-    checkName prev name
-      | BS.null name = Left "empty NAR directory entry name"
-      -- Backslash is a directory separator on Windows - this library's
-      -- primary consumer - so a name like "..\out.exe" is as much a
-      -- traversal vector as one with '/'.  A colon is a drive prefix
-      -- ("C:evil") or an NTFS alternate data stream ("a:b"), either of
-      -- which resolves the write somewhere other than a file of this name.
-      | name == "." || name == ".." || BS8.any (\c -> c == '/' || c == '\\' || c == '\0' || c == ':') name =
-          Left ("unsafe NAR directory entry name: " ++ show name)
-      -- Windows-unsafe categories, shared with the store-key allowlist
-      -- (NovaCache.SafeName): a device name resolves to the device, and
-      -- NTFS strips a trailing dot or space so the on-disk name would
-      -- silently diverge from the NAR name.
-      | isReservedDeviceName name =
-          Left ("Windows reserved device name as NAR directory entry: " ++ show name)
-      | hasTrailingDotOrSpace name =
-          Left ("NAR directory entry name ends with a dot or space: " ++ show name)
-      | Just p <- prev,
-        name <= p =
-          Left ("NAR directory entries not strictly increasing: " ++ show name)
-      | otherwise = Right ()
-
--- ---------------------------------------------------------------------------
--- Wire primitives
--- ---------------------------------------------------------------------------
-
--- | Read a length-prefixed, 8-byte-padded string from the buffer.
-readStr :: NarParser ByteString
-readStr bs
-  | BS.length bs < wordSize =
-      Left "unexpected end of NAR: need 8 bytes for string length"
-  -- Compare the Word64 length to the remaining bytes BEFORE narrowing it to
-  -- Int: a hostile length above maxBound::Int would otherwise wrap negative
-  -- and slip past the totalLen check below.
-  | len > fromIntegral (BS.length payload) =
-      Left
-        ( "unexpected end of NAR: string length "
-            ++ show len
-            ++ " exceeds remaining "
-            ++ show (BS.length payload)
-        )
-  | totalLen > BS.length payload =
-      Left
-        ( "unexpected end of NAR: padded string length "
-            ++ show totalLen
-            ++ " exceeds remaining "
-            ++ show (BS.length payload)
-        )
-  -- Nix's reader rejects nonzero padding; accepting it would let archives
-  -- that upstream tooling refuses round-trip through this library.
-  | BS.any (/= 0) padding =
-      Left "nonzero padding bytes in NAR string"
-  | otherwise =
-      Right (BS.take (fromIntegral len) payload, BS.drop totalLen payload)
-  where
-    len = readWord64LE bs
-    payload = BS.drop wordSize bs
-    totalLen = fromIntegral len + narPad (fromIntegral len)
-    padding = BS.take (totalLen - fromIntegral len) (BS.drop (fromIntegral len) payload)
-
--- | Read a little-endian 'Word64' from the first 8 bytes.
-readWord64LE :: ByteString -> Word64
-readWord64LE bs =
-  byte 0
-    .|. (byte 1 `shiftL` 8)
-    .|. (byte 2 `shiftL` 16)
-    .|. (byte 3 `shiftL` 24)
-    .|. (byte 4 `shiftL` 32)
-    .|. (byte 5 `shiftL` 40)
-    .|. (byte 6 `shiftL` 48)
-    .|. (byte 7 `shiftL` 56)
-  where
-    byte i = fromIntegral (BS.index bs i)
-
--- | Size of a Word64 in bytes.
-wordSize :: Int
-wordSize = 8
-
--- | Assert that a token matches the expected value.
-expect :: ByteString -> ByteString -> Either String ()
-expect expected got
-  | got == expected = Right ()
-  | otherwise = Left ("expected " ++ show expected ++ ", got " ++ show got)
+malformedEventStream :: String
+malformedEventStream = "malformed NAR event stream"
 
 -- ---------------------------------------------------------------------------
 -- Hashing
@@ -428,35 +304,43 @@ walkPath mode path = do
         then buildDirectory mode path
         else buildRegularFile path
 
--- | Build a directory entry by recursively walking children.  Under
--- 'CaseHackEnabled', each on-disk name is stripped of the case-hack
--- suffix and entries are ordered by the STRIPPED name (the NAR name);
--- two on-disk names stripping to the same entry name fail loudly, as
--- upstream's serialiser does - continuing would emit an archive with
--- duplicate entries no parser accepts.
+-- | Build a directory entry by recursively walking children.
 buildDirectory :: CaseHack -> OsPath -> IO NarEntry
 buildDirectory mode path = do
+  resolved <- resolvedDirEntries mode path
+  NarDirectory <$> traverse walkChild resolved
+  where
+    walkChild (entryName, diskName) = do
+      entry <- walkPath mode (path </> diskName)
+      pure (entryName, entry)
+
+-- | A directory's children as (NAR name, on-disk name) pairs under the
+-- case-hack mode.  Under 'CaseHackEnabled', each on-disk name is
+-- stripped of the case-hack suffix and entries are ordered by the
+-- STRIPPED name (the NAR name); two on-disk names stripping to the
+-- same entry name fail loudly, as upstream's serialiser does -
+-- continuing would emit an archive with duplicate entries no parser
+-- accepts.
+resolvedDirEntries :: CaseHack -> OsPath -> IO [(ByteString, OsPath)]
+resolvedDirEntries mode path = do
   names <- sort <$> listDirectory path
   named <- traverse withNameBytes names
   case unhackedDirNames mode named of
-    Left (first, second) -> do
-      firstPath <- decodeFS (path </> first)
-      secondPath <- decodeFS (path </> second)
+    Left (collidedA, collidedB) -> do
+      pathA <- decodeFS (path </> collidedA)
+      pathB <- decodeFS (path </> collidedB)
       fail
         ( "serialiseFromPath: file name collision between '"
-            ++ firstPath
+            ++ pathA
             ++ "' and '"
-            ++ secondPath
+            ++ pathB
             ++ "' after case-hack stripping"
         )
-    Right resolved -> NarDirectory <$> traverse walkChild resolved
+    Right resolved -> pure resolved
   where
     withNameBytes diskName = do
       nameBytes <- osPathBytes diskName
       pure (nameBytes, diskName)
-    walkChild (entryName, diskName) = do
-      entry <- walkPath mode (path </> diskName)
-      pure (entryName, entry)
 
 -- | Resolve (NAR name, on-disk name) pairs for a directory's children.
 -- Under 'CaseHackDisabled' pairs pass through verbatim (serialisation
@@ -491,13 +375,17 @@ buildRegularFile path = do
       contents <- readFileBytes path
       isExec <- checkExecutable path
       pure (NarRegular isExec contents)
-    else do
-      -- Not a symlink, directory, or regular file: a special file (FIFO,
-      -- socket, device) or a path that vanished mid-walk.  Fail loudly rather
-      -- than fabricating an empty regular (which would silently change the NAR
-      -- and its hash) - matching Nix, which aborts on unsupported types.
-      shownPath <- decodeFS path
-      fail ("serialiseFromPath: not a regular file (special or vanished): " ++ shownPath)
+    else specialFileFailure path
+
+-- | The shared refusal for a path that is not a symlink, directory, or
+-- regular file: a special file (FIFO, socket, device) or a path that
+-- vanished mid-walk.  Fail loudly rather than fabricating an empty
+-- regular (which would silently change the NAR and its hash) -
+-- matching Nix, which aborts on unsupported types.
+specialFileFailure :: OsPath -> IO a
+specialFileFailure path = do
+  shownPath <- decodeFS path
+  fail ("serialiseFromPath: not a regular file (special or vanished): " ++ shownPath)
 
 -- | Check whether a file has the executable permission set.
 -- Uses 'System.Directory.OsPath.getPermissions' which is cross-platform:
@@ -538,3 +426,189 @@ osPathBytes path = case OP.decodeWith latin1 latin1 path of
     -- surfacing the impossible beats hiding it.
     fail ("serialiseFromPath: undecodable name: " ++ show err)
 #endif
+
+-- ---------------------------------------------------------------------------
+-- Streaming filesystem serialisation (IO boundary)
+-- ---------------------------------------------------------------------------
+
+-- | Chunk size for streaming file contents: large enough to amortize
+-- per-chunk handling in consumers, small enough that one pull's memory
+-- and latency stay flat.
+narSourceChunkBytes :: Int
+narSourceChunkBytes = 131072
+
+-- | One planned piece of the archive: structural bytes rendered up
+-- front, or a regular file whose length prefix, contents, and padding
+-- stream at pull time.
+data NarSegment
+  = SegmentBytes !ByteString
+  | SegmentFile !OsPath
+
+-- | What the puller is doing between calls.  The 'IORef' holding this
+-- is the module's one piece of mutable state - the same deliberate,
+-- documented boundary as the streaming write in "NovaCache.Store".
+data SourceState
+  = SourceSegments ![NarSegment]
+  | -- | Mid-file: the open handle, its decoded path for error text,
+    -- the bytes still owed, the padding after them, and the remaining
+    -- segments.
+    SourceFile !Handle !FilePath !Word64 !Int ![NarSegment]
+  | SourceDrained
+
+-- | Serialise a filesystem tree as a pull source of NAR chunks,
+-- without ever holding a file's contents in memory: the tree's
+-- structure is planned up front (names, kinds, symlink targets -
+-- never contents), then each pull returns the next chunk, reading
+-- regular files 'narSourceChunkBytes' at a time.  The empty chunk
+-- means end of input and repeats on further pulls - the convention
+-- 'NovaCache.Store.writeNarStreaming' consumes, so the two ends
+-- compose directly.  Pair with "NovaCache.Hash"'s incremental hashing
+-- to compute the NAR hash in the same pass.
+--
+-- The walk applies the same case-hack resolution and loud failures as
+-- 'serialiseFromPathWith', and emits entries in the same bytewise
+-- order, so the pulled bytes equal @'serialise' \<tree\>@ exactly.  A
+-- file's size is read when its streaming starts and exactly that many
+-- bytes are emitted, as upstream's dump does; a file that shrinks
+-- mid-stream fails loudly rather than emitting a torn archive.  Any
+-- file handle still open when the continuation exits is closed.
+withNarSource :: CaseHack -> FilePath -> (IO ByteString -> IO a) -> IO a
+withNarSource mode root consume = do
+  rootPath <- encodeFS root
+  segments <- planSegments mode rootPath
+  stateRef <- newIORef (SourceSegments segments)
+  consume (pullChunk stateRef) `finally` closeCurrent stateRef
+  where
+    closeCurrent stateRef = do
+      state <- readIORef stateRef
+      case state of
+        SourceFile handle _ _ _ _ -> hClose handle
+        _ -> pure ()
+
+-- | Produce the next chunk of the planned archive.
+pullChunk :: IORef SourceState -> IO ByteString
+pullChunk stateRef = advance =<< readIORef stateRef
+  where
+    advance (SourceSegments []) = do
+      writeIORef stateRef SourceDrained
+      pure BS.empty
+    advance (SourceSegments (SegmentBytes bytes : rest)) = do
+      writeIORef stateRef (SourceSegments rest)
+      pure bytes
+    advance (SourceSegments (SegmentFile path : rest)) = do
+      shownPath <- decodeFS path
+      handle <- openBinaryFile shownPath ReadMode
+      size <- hFileSize handle
+      let owed = fromIntegral size :: Word64
+      writeIORef stateRef (SourceFile handle shownPath owed (narPadOf owed) rest)
+      pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
+    advance (SourceFile handle _ 0 padLen rest) = do
+      hClose handle
+      writeIORef stateRef (SourceSegments rest)
+      if padLen == 0
+        then pullChunk stateRef
+        else pure (BS.replicate padLen 0)
+    advance (SourceFile handle shownPath owed padLen rest) = do
+      chunk <- BS.hGet handle (fromIntegral (min owed (fromIntegral narSourceChunkBytes)))
+      if BS.null chunk
+        then do
+          hClose handle
+          writeIORef stateRef SourceDrained
+          ioError (userError ("withNarSource: " ++ shownPath ++ " shrank while streaming"))
+        else do
+          writeIORef
+            stateRef
+            (SourceFile handle shownPath (owed - fromIntegral (BS.length chunk)) padLen rest)
+          pure chunk
+    advance SourceDrained = pure BS.empty
+
+-- | Plan the archive: every structural byte rendered, file contents
+-- deferred as 'SegmentFile's.  Holds structure only - O(entries),
+-- never contents.
+planSegments :: CaseHack -> OsPath -> IO [NarSegment]
+planSegments mode path = do
+  pieces <- planNode mode path
+  pure (coalesce (PieceBytes (narStr tokMagic) : pieces))
+
+-- | Plan pieces before coalescing: structural builders, or a deferred
+-- regular file.
+data PlanPiece
+  = PieceBytes B.Builder
+  | PieceFile !OsPath
+
+-- | Merge adjacent structural runs and render each strict, so a pull
+-- returns a directory's worth of tokens in one chunk instead of one
+-- token at a time.
+coalesce :: [PlanPiece] -> [NarSegment]
+coalesce = go mempty
+  where
+    go pending [] = flushOnto pending []
+    go pending (PieceBytes builder : rest) = go (pending <> builder) rest
+    go pending (PieceFile path : rest) =
+      flushOnto pending (SegmentFile path : go mempty rest)
+    flushOnto pending segments =
+      let bytes = BL.toStrict (B.toLazyByteString pending)
+       in if BS.null bytes then segments else SegmentBytes bytes : segments
+
+-- | Plan one node, mirroring 'walkPath'.
+planNode :: CaseHack -> OsPath -> IO [PlanPiece]
+planNode mode path = do
+  isSym <- pathIsSymbolicLink path
+  if isSym
+    then do
+      target <- osPathBytes =<< getSymbolicLinkTarget path
+      pure [PieceBytes (buildNode (NarSymlink target))]
+    else do
+      isDir <- doesDirectoryExist path
+      if isDir
+        then planDirectory mode path
+        else planRegular path
+
+-- | Plan a directory.  Children are ordered by their NAR-name bytes -
+-- the same order 'buildNode' emits - not by on-disk order, which can
+-- differ on Windows where 'OsPath' sorts by UTF-16 units.
+planDirectory :: CaseHack -> OsPath -> IO [PlanPiece]
+planDirectory mode path = do
+  resolved <- resolvedDirEntries mode path
+  children <- traverse planChild (sortBy (comparing fst) resolved)
+  pure
+    ( PieceBytes (narStr tokLParen <> narStr tokType <> narStr tokDirectory)
+        : concat children
+        ++ [PieceBytes (narStr tokRParen)]
+    )
+  where
+    planChild (entryName, diskName) = do
+      node <- planNode mode (path </> diskName)
+      pure
+        ( PieceBytes
+            ( narStr tokEntry
+                <> narStr tokLParen
+                <> narStr tokName
+                <> narStr entryName
+                <> narStr tokNode
+            )
+            : node
+            ++ [PieceBytes (narStr tokRParen)]
+        )
+
+-- | Plan a regular file: the node's structure now, its contents at
+-- pull time.  The pieces mirror 'buildNode' on 'NarRegular' exactly,
+-- with the contents wire string (length, bytes, padding) deferred.
+planRegular :: OsPath -> IO [PlanPiece]
+planRegular path = do
+  isFile <- doesFileExist path
+  if isFile
+    then do
+      isExec <- checkExecutable path
+      pure
+        [ PieceBytes
+            ( narStr tokLParen
+                <> narStr tokType
+                <> narStr tokRegular
+                <> execFlag isExec
+                <> narStr tokContents
+            ),
+          PieceFile path,
+          PieceBytes (narStr tokRParen)
+        ]
+    else specialFileFailure path
