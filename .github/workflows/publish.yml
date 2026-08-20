@@ -56,14 +56,15 @@ jobs:
           # cabal writes each library's tree separately and tars only the
           # main one; Hackage serves one tree per release with sublibraries
           # as subdirectories (the layout cabal itself names: <docs>/xz).
-          # Graft the xz component in and re-tar.  The final grep fails the
+          # Graft the xz component in and re-tar as ustar - Hackage's tar
+          # reader 400s GNU-format headers, cabal's own tarballs are ustar.  The final grep fails the
           # job if a cabal layout change ever drops the module silently.
           # Undo the graft when haskell/cabal#9577 lands (one tarball
           # spanning every library).
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
           SUB=$(find dist-newstyle -type d -path "*/l/xz/*${VERSION}-docs/xz")
           cp -R "$SUB" "$MAIN/xz"
-          tar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
+          tar --format=ustar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
           tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "xz/NovaCache-Xz.html"
       - name: Upload documentation to Hackage
         run: |

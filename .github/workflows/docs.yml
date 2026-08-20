@@ -45,12 +45,13 @@ jobs:
           cabal haddock all --haddock-for-hackage
           # Same sublibrary graft as the publish workflow: cabal tars only
           # the main library's tree; Hackage serves sublibraries as
-          # subdirectories of the one release tree.  Undo the graft when
+          # subdirectories of the one release tree (re-tarred as ustar -
+          # Hackage's tar reader 400s GNU-format headers).  Undo the graft when
           # haskell/cabal#9577 lands (one tarball spanning every library).
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
           SUB=$(find dist-newstyle -type d -path "*/l/xz/*${VERSION}-docs/xz")
           cp -R "$SUB" "$MAIN/xz"
-          tar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
+          tar --format=ustar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
           tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "xz/NovaCache-Xz.html"
 
       - name: Upload documentation to Hackage
