@@ -161,7 +161,6 @@ optionalKV :: Text -> Maybe Text -> [Text]
 optionalKV _ Nothing = []
 optionalKV key (Just val) = [kv key val]
 
--- | Look up the first occurrence of a key.
 -- | Look up the LAST occurrence of a scalar key: upstream's parser
 -- assigns each field as it reads, so a duplicated key resolves to the
 -- final value.  (@Sig@ is the one intentionally repeatable key -
@@ -189,17 +188,29 @@ require key kvs = case lookupLast key kvs of
 maxSizeFieldDigits :: Int
 maxSizeFieldDigits = 20
 
+-- | The uint64 ceiling (2^64 - 1).  Twenty digits still admit values
+-- past it; upstream's @string2Int\<uint64_t\>@ refuses those, so a
+-- narinfo carrying one would be signed here and then rejected as
+-- corrupt by every real Nix client.
+maxSizeFieldValue :: Integer
+maxSizeFieldValue = 18446744073709551615
+
 -- | Parse a non-negative base-10 integer, matching C++ Nix's narinfo parser.
 -- Uses 'TR.decimal' (not 'reads', which also accepts hex/octal/leading space)
 -- and requires the whole field to be consumed, so a non-canonical value cannot
 -- slip through and then be re-signed under the cache's key.  The length is
--- bounded first ('maxSizeFieldDigits'), so the parse cost is constant.
+-- bounded first ('maxSizeFieldDigits'), so the parse cost is constant, and the
+-- value is bounded after ('maxSizeFieldValue'), completing the uint64 contract.
 parseInteger :: Text -> Text -> Either String Integer
 parseInteger key txt
   | T.length txt > maxSizeFieldDigits =
       Left ("integer field for " ++ T.unpack key ++ " is " ++ show (T.length txt) ++ " characters, above the " ++ show maxSizeFieldDigits ++ " maximum")
   | otherwise = case TR.decimal txt of
-      Right (n, rest) | T.null rest -> Right n
+      Right (n, rest)
+        | T.null rest,
+          n > maxSizeFieldValue ->
+            Left ("integer field for " ++ T.unpack key ++ " is above the uint64 maximum: " ++ T.unpack txt)
+        | T.null rest -> Right n
       _ -> Left ("invalid integer for " ++ T.unpack key ++ ": " ++ T.unpack txt)
 
 -- | Show a value as 'Text'.

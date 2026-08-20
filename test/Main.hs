@@ -396,12 +396,33 @@ testNAR =
       -- this spelling (drive/stream colon, device, NTFS dot/space strip).
       test "Windows-hazard entry names rejected" $
         let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
-            names = ["C:evil", "a:b", "nul", "NUL", "com1", "nul.txt", "foo.", "foo "]
+            -- The last three: COM0/LPT0 are reserved alongside COM1-9,
+            -- the device stem is compared with trailing spaces trimmed
+            -- ("NUL .txt" still opens the device), and the superscript
+            -- digits (here U+00B9 as UTF-8) count as device digits.
+            names =
+              [ "C:evil",
+                "a:b",
+                "nul",
+                "NUL",
+                "com1",
+                "nul.txt",
+                "foo.",
+                "foo ",
+                "com0",
+                "lpt0",
+                "nul .txt",
+                "CON .x",
+                "com" <> BS.pack [0xC2, 0xB9]
+              ]
             rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
          in assertTrue "all hazard names rejected" (all (rejected . evil) names),
       test "near-miss names still parse" $
         let plain name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
-            names = ["nul2", "com10", "conx", "foo.bar", "a.b.c", "lpt0"]
+            -- "com" followed by a non-digit non-superscript byte (here
+            -- U+00B4, acute accent) is an ordinary name; so are stems
+            -- one character too long.
+            names = ["nul2", "com10", "conx", "foo.bar", "a.b.c", "lpt00", "com" <> BS.pack [0xC2, 0xB4]]
             accepted bytes = either (const False) (const True) (NAR.deserialise bytes)
          in assertTrue "all near-miss names accepted" (all (accepted . plain) names),
       -- Upstream carries names and targets as raw bytes: entries that
@@ -693,6 +714,18 @@ testNarInfo =
                 putStrLn ("  parse failed: " ++ err)
                 pure False
               Right ni -> assertEqual "uint64 max" 18446744073709551615 (NarInfo.niNarSize ni),
+      -- Twenty digits still fit values past 2^64 - 1; upstream's
+      -- string2Int<uint64_t> refuses them, so signing one here would
+      -- produce a narinfo every real client rejects as corrupt.
+      test "a 20-digit size above the uint64 maximum rejects" $
+        let overCap =
+              T.unlines
+                [ "StorePath: /nix/store/aaaa-test",
+                  "URL: nar/test.nar.xz",
+                  "NarHash: sha256:def",
+                  "NarSize: 18446744073709551616"
+                ]
+         in assertLeft "size above uint64" (NarInfo.parseNarInfo overCap),
       -- Upstream assigns fields as it reads, so a duplicated scalar key
       -- resolves to the LAST value (Sig stays the repeatable exception).
       test "duplicate scalar keys resolve last-wins" $
@@ -958,6 +991,11 @@ testFileStore =
         assertEqual "valid" (Just "abc123def456") (Store.sanitizePath "abc123def456"),
       test "sanitizePath rejects windows device name" $
         assertEqual "device nul" Nothing (Store.sanitizePath "nul"),
+      test "sanitizePath rejects the zero-numbered devices" $ do
+        ok1 <- assertEqual "com0" Nothing (Store.sanitizePath "com0")
+        ok2 <- assertEqual "lpt0" Nothing (Store.sanitizePath "lpt0")
+        ok3 <- assertEqual "com10 stays valid" (Just "com10") (Store.sanitizePath "com10")
+        pure (ok1 && ok2 && ok3),
       test "sanitizePath rejects dotfile" $
         assertEqual "dotfile" Nothing (Store.sanitizePath ".hidden"),
       test "sanitizePath rejects a trailing dot" $
