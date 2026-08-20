@@ -42,3 +42,25 @@ jobs:
             https://hackage.haskell.org/packages/
         env:
           HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
+
+      # Maintainer-built documentation, permanently - not a stopgap for
+      # Hackage's doc builder lagging GHC (today it carries 9.8 against a
+      # base >= 4.22 floor, so it cannot even plan the build).  Even a
+      # caught-up builder compiles default flags only and would silently
+      # omit the flag-gated NovaCache.Xz; building here documents every
+      # module with the same pinned toolchain the release was verified
+      # on, and the docs land with the release instead of on the
+      # builder's schedule.
+      - name: Build documentation
+        run: cabal haddock --haddock-for-hackage -f xz
+      - name: Upload documentation to Hackage
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          curl -X PUT --fail --silent --show-error \
+            --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
+            --header "Content-Type: application/x-tar" \
+            --header "Content-Encoding: gzip" \
+            --data-binary "@dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" \
+            "https://hackage.haskell.org/package/nova-cache-${VERSION}/docs"
+        env:
+          HACKAGE_TOKEN: ${{ secrets.HACKAGE_TOKEN }}
