@@ -262,6 +262,7 @@ jobs:
             sudo systemctl stop nova-cache.service && \
             sudo install -m 0755 /tmp/nova-cache-server /usr/local/bin/nova-cache-server && \
             sudo cp /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
+            rm -f /tmp/nova-cache-server /tmp/nova-cache.service && \
             sudo systemctl daemon-reload && \
             sudo systemctl start nova-cache.service && \
             sudo systemctl status nova-cache.service --no-pager"
