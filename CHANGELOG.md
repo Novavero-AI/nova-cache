@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0.0 - 2026-08-20
 
 - **`NovaCache.Xz` moves to the public `nova-cache:xz` sublibrary; the `xz` flag is gone.** A dependency's flag cannot be set from a consumer's `.cabal` file, so reaching the decoder forced a mirrored flag plus a matching `constraints: nova-cache +xz` in every downstream - two knobs that had to agree and that the solver could not see. `build-depends: nova-cache:xz` now expresses the need directly, and consumers without it still never build the bundled liblzma, keeping the 0.5.0.0 lesson. Builds that passed `-f xz` drop the flag and add the dependency; the module and its API are unchanged.
 
