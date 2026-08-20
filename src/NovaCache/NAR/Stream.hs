@@ -25,6 +25,7 @@ module NovaCache.NAR.Stream
 
     -- * Entry-name safety
     checkEntryName,
+    isWindowsHazardName,
 
     -- * Wire vocabulary (shared with the serialiser in "NovaCache.NAR")
     tokMagic,
@@ -144,7 +145,12 @@ data NarEvent
 -- can go wrong is a 'NarFail'.
 data NarStep
   = NarAwait !(ByteString -> NarStep)
-  | NarYield !NarEvent NarStep
+  | -- | The continuation is deliberately lazy: yielding is what hands
+    -- control back to the consumer, and a strict field would force
+    -- each step's successor at construction, materializing the whole
+    -- fed chunk's event chain before the consumer acts on the first
+    -- event.  Do not add a bang.
+    NarYield !NarEvent NarStep
   | NarDone
   | NarFail !String
 
@@ -161,6 +167,13 @@ maxWireStringBytes = 65536
 -- 'maxWireStringBytes' over structural strings.
 narStream :: NarStep
 narStream = narStreamBounded maxWireStringBytes
+
+-- | The largest structural-string bound 'narStreamBounded' honors:
+-- 'Int''s ceiling less alignment headroom, so a payload at the bound
+-- still fits 'Int' together with its padding.
+structuralBoundCeiling :: Word64
+structuralBoundCeiling =
+  fromIntegral (maxBound :: Int) - fromIntegral (narAlignment - 1)
 
 -- ---------------------------------------------------------------------------
 -- Parser
@@ -180,9 +193,10 @@ narStreamBounded bound =
   expectWire limited "archive magic" tokMagic (parseNode limited archiveEnd) BS.empty
   where
     -- Declared lengths are compared in Word64 and narrowed only below
-    -- the bound, so the bound itself must fit Int for the narrowing to
-    -- be exact.
-    limited = min bound (fromIntegral (maxBound :: Int))
+    -- the bound; 'wireString' then demands the narrowed length plus
+    -- its padding in Int, so the bound must sit far enough below Int's
+    -- ceiling that the padded sum cannot wrap.
+    limited = min bound structuralBoundCeiling
     archiveEnd leftover
       | BS.null leftover = NarAwait confirm
       | otherwise = NarFail trailingBytes
@@ -286,36 +300,45 @@ parseDirectory bound k leftover =
 -- Entry-name safety
 -- ---------------------------------------------------------------------------
 
--- | Reject a NAR directory entry name that is unsafe or out of order
--- against its predecessor.  Entries must have safe names in strictly
--- increasing (sorted, unique) byte order: enforcing this rejects
--- malformed or hostile archives, keeps @serialise . deserialise@ an
--- identity, and forecloses the path-traversal surface for any
--- NAR-extraction consumer.  Names are arbitrary bytes; every check
--- here is ASCII-structural, so it stays exact whether or not the name
--- decodes as text (see "NovaCache.SafeName").
+-- | Reject a NAR directory entry name the grammar itself refuses, or
+-- one out of order against its predecessor.  The rejections are
+-- exactly upstream's: no empty name, no @.@ or @..@, no @/@ or NUL,
+-- and strictly increasing (sorted, unique) byte order - which rejects
+-- malformed archives, keeps @serialise . deserialise@ an identity,
+-- and forecloses the POSIX path-traversal surface.  Names hazardous
+-- only on Windows (device stems like @aux.c@, colons, backslashes,
+-- trailing dots or spaces) are accepted here, as upstream's restore
+-- accepts them on Unix and real caches serve them; rejecting them is
+-- a materialization-boundary decision a store writer takes with
+-- 'isWindowsHazardName' when the target filesystem needs it.
 checkEntryName :: Maybe ByteString -> ByteString -> Either String ()
 checkEntryName prev name
   | BS.null name = Left "empty NAR directory entry name"
-  -- Backslash is a directory separator on Windows - this library's
-  -- primary consumer - so a name like "..\out.exe" is as much a
-  -- traversal vector as one with '/'.  A colon is a drive prefix
-  -- ("C:evil") or an NTFS alternate data stream ("a:b"), either of
-  -- which resolves the write somewhere other than a file of this name.
-  | name == "." || name == ".." || BS8.any (\c -> c == '/' || c == '\\' || c == '\0' || c == ':') name =
+  | name == "." || name == ".." || BS8.any (\c -> c == '/' || c == '\0') name =
       Left ("unsafe NAR directory entry name: " ++ show name)
-  -- Windows-unsafe categories, shared with the store-key allowlist
-  -- (NovaCache.SafeName): a device name resolves to the device, and
-  -- NTFS strips a trailing dot or space so the on-disk name would
-  -- silently diverge from the NAR name.
-  | isReservedDeviceName name =
-      Left ("Windows reserved device name as NAR directory entry: " ++ show name)
-  | hasTrailingDotOrSpace name =
-      Left ("NAR directory entry name ends with a dot or space: " ++ show name)
   | Just p <- prev,
     name <= p =
       Left ("NAR directory entries not strictly increasing: " ++ show name)
   | otherwise = Right ()
+
+-- | Does the name resolve, on a Windows filesystem, to something other
+-- than an ordinary file of this exact spelling?  Backslash is a
+-- directory separator there, so @..\\out.exe@ traverses like a name
+-- with @/@; a colon is a drive prefix (@C:evil@) or an NTFS alternate
+-- data stream (@a:b@); a reserved device stem (@nul@, @aux.c@) opens
+-- the device; and NTFS strips a trailing dot or space, silently
+-- diverging the on-disk name from the NAR name.  The parser accepts
+-- all of these because upstream does and real cache.nixos.org
+-- archives carry them (perl man pages named @ExtUtils::MakeMaker.3@,
+-- kernel trees carrying @aux.c@); a store writer applies this
+-- predicate at materialization when the target filesystem needs it.
+-- Every check is ASCII-structural, so it stays exact whether or not
+-- the name decodes as text (see "NovaCache.SafeName").
+isWindowsHazardName :: ByteString -> Bool
+isWindowsHazardName name =
+  BS8.any (\c -> c == '\\' || c == ':') name
+    || isReservedDeviceName name
+    || hasTrailingDotOrSpace name
 
 -- ---------------------------------------------------------------------------
 -- Chunk-fed primitives
@@ -341,8 +364,9 @@ wireString bound what k = exactly lengthPrefixBytes ("length of " ++ what) withL
                     ++ "-byte wire-string bound"
                 )
             else
-              -- Safe narrowing: declared <= bound, and narStreamBounded
-              -- clamps every bound to Int's range.
+              -- Safe narrowing and a safe padded demand: declared <=
+              -- bound <= structuralBoundCeiling, which sits enough
+              -- below Int's ceiling that len + narPad len cannot wrap.
               let len = fromIntegral declared
                in exactly (len + narPad len) what $ \whole ->
                     case BS.splitAt len whole of

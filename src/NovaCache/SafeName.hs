@@ -1,8 +1,9 @@
 -- | Windows-unsafe name categories, shared by the store-key allowlist
--- ('NovaCache.Store.sanitizePath') and the NAR entry-name guard in
--- "NovaCache.NAR": names Windows resolves to something other than an
--- ordinary file of that exact spelling.  Both guards reject the same
--- categories from one definition, so they cannot drift apart.
+-- ('NovaCache.Store.sanitizePath') and the NAR materialization
+-- predicate ('NovaCache.NAR.Stream.isWindowsHazardName'): names
+-- Windows resolves to something other than an ordinary file of that
+-- exact spelling.  Both guards reject the same categories from one
+-- definition, so they cannot drift apart.
 --
 -- The predicates take raw bytes, the form NAR entry names have.  The
 -- categories are ASCII-structural - except the superscript device
@@ -26,9 +27,9 @@ import Data.Char (isAsciiUpper, isDigit, toLower)
 -- @com0@-@com9@, @lpt0@-@lpt9@, or a superscript-digit @com@\/@lpt@
 -- form)?  The comparison runs on the stem - the portion before the
 -- first dot, trailing spaces trimmed - since @nul.txt@ and @NUL .txt@
--- also open the device.  Enforced on every platform so a
--- Windows-hosted consumer is safe too, and kept in step with the twin
--- guard nova-nix applies when it materializes NAR entries.
+-- also open the device.  Surfaced to store writers through
+-- 'NovaCache.NAR.Stream.isWindowsHazardName', and kept in step with
+-- the twin guard nova-nix applies when it materializes NAR entries.
 --
 -- Device matching is ASCII case-insensitive, so only @A@-@Z@ fold; any
 -- other byte passes through and can never match the named set.

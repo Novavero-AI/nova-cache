@@ -17,7 +17,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, requestBodyLength, requestHeaders, requestMethod)
 import qualified Network.Wai.Test as WT
@@ -363,10 +363,10 @@ testNAR =
         let entry = NAR.NarRegular True BS.empty
          in assertRight "exec empty" entry (NAR.deserialise (NAR.serialise entry)),
       -- Cache-served archives are untrusted input: every name that could
-      -- traverse out of an extraction root must fail the parse.
+      -- traverse out of a POSIX extraction root must fail the parse.
       test "unsafe directory entry names rejected" $
         let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
-            names = ["..", ".", "", "a/b", "a\\b", "a\0b"]
+            names = ["..", ".", "", "a/b", "a\0b"]
             rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
          in assertTrue "all unsafe names rejected" (all (rejected . evil) names),
       test "duplicate directory entries rejected" $
@@ -395,17 +395,29 @@ testNAR =
                     ["nix-archive-1", "(", "type", "regular", "executable", "X", "contents", "hi", ")"]
                 )
          in assertLeft "nonempty marker" (NAR.deserialise marked),
+      -- Upstream's restore accepts these on Unix, and real
+      -- cache.nixos.org archives carry them (perl man pages named
+      -- ExtUtils::MakeMaker.3, kernel trees carrying aux.c): the
+      -- parser must too, or substitution fails where upstream
+      -- succeeds.  Rejecting them is the store writer's call, via
+      -- NAR.isWindowsHazardName, where the target filesystem needs it.
+      test "Windows-hazard names parse, as upstream accepts" $
+        let entryFor name = NAR.NarDirectory [(name, NAR.NarRegular False "x")]
+            names = ["ExtUtils::MakeMaker.3", "aux.c", "a:b", "a\\b", "nul", "foo.", "foo "]
+            roundTrips name = NAR.deserialise (NAR.serialise (entryFor name)) == Right (entryFor name)
+         in assertTrue "all parse and round-trip" (all roundTrips names),
       -- Windows resolves these names to something other than a file of
-      -- this spelling (drive/stream colon, device, NTFS dot/space strip).
-      test "Windows-hazard entry names rejected" $
-        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
-            -- The last three: COM0/LPT0 are reserved alongside COM1-9,
-            -- the device stem is compared with trailing spaces trimmed
-            -- ("NUL .txt" still opens the device), and the superscript
-            -- digits (here U+00B9 as UTF-8) count as device digits.
-            names =
+      -- this spelling (drive/stream colon, separator backslash, device,
+      -- NTFS dot/space strip).
+      test "isWindowsHazardName flags the hazard categories" $
+        -- Among the devices: COM0/LPT0 are reserved alongside COM1-9,
+        -- the device stem is compared with trailing spaces trimmed
+        -- ("NUL .txt" still opens the device), and the superscript
+        -- digits (here U+00B9 as UTF-8) count as device digits.
+        let names =
               [ "C:evil",
                 "a:b",
+                "a\\b",
                 "nul",
                 "NUL",
                 "com1",
@@ -418,16 +430,16 @@ testNAR =
                 "CON .x",
                 "com" <> BS.pack [0xC2, 0xB9]
               ]
-            rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
-         in assertTrue "all hazard names rejected" (all (rejected . evil) names),
-      test "near-miss names still parse" $
+         in assertTrue "all hazard names flagged" (all NAR.isWindowsHazardName names),
+      test "near-miss names parse and pass the hazard predicate" $
         let plain name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
             -- "com" followed by a non-digit non-superscript byte (here
             -- U+00B4, acute accent) is an ordinary name; so are stems
             -- one character too long.
             names = ["nul2", "com10", "conx", "foo.bar", "a.b.c", "lpt00", "com" <> BS.pack [0xC2, 0xB4]]
             accepted bytes = either (const False) (const True) (NAR.deserialise bytes)
-         in assertTrue "all near-miss names accepted" (all (accepted . plain) names),
+            clean name = accepted (plain name) && not (NAR.isWindowsHazardName name)
+         in assertTrue "all near-miss names accepted" (all clean names),
       -- Upstream carries names and targets as raw bytes: entries that
       -- do not decode as UTF-8 parse and round-trip.
       test "non-UTF-8 entry name round-trips" $
@@ -453,11 +465,9 @@ testNAR =
                 pure False,
       -- The hazard checks are ASCII-structural, so they fire inside
       -- names that do not decode as text.
-      test "hazards inside non-UTF-8 names still rejected" $
-        let evil name = NAR.serialise (NAR.NarDirectory [(name, NAR.NarRegular False "x")])
-            names = ["nul." <> BS.pack [0xFF], BS.pack [0xFF, 0x2E], BS.pack [0xFF] <> ":x"]
-            rejected bytes = either (const True) (const False) (NAR.deserialise bytes)
-         in assertTrue "all hazard bytes rejected" (all (rejected . evil) names),
+      test "hazards inside non-UTF-8 names still flagged" $
+        let names = ["nul." <> BS.pack [0xFF], BS.pack [0xFF, 0x2E], BS.pack [0xFF] <> ":x"]
+         in assertTrue "all hazard bytes flagged" (all NAR.isWindowsHazardName names),
       -- The case-hack strip: a tree materialized with upstream's
       -- collision suffix serialises back under its NAR names.
       test "serialiseFromPathWith strips the case-hack suffix" $ do
@@ -572,7 +582,12 @@ badPaddingNar =
 -- | Drive the streaming parser over the given chunks (all non-empty),
 -- then signal end of input, collecting events.
 runStream :: [ByteString] -> Either String [Stream.NarEvent]
-runStream chunks = go Stream.narStream chunks []
+runStream = runStreamFrom Stream.narStream
+
+-- | 'runStream' from an explicitly constructed machine, for tests that
+-- need a bound other than the default.
+runStreamFrom :: Stream.NarStep -> [ByteString] -> Either String [Stream.NarEvent]
+runStreamFrom start chunks = go start chunks []
   where
     go step pending acc = case step of
       Stream.NarFail err -> Left err
@@ -692,7 +707,7 @@ testStream =
                 NAR.serialise (NAR.NarRegular False "x") <> "junk1234",
                 evil "..",
                 evil "a/b",
-                evil "nul"
+                evil ""
               ]
             bothReject bytes = isLeft (runStream [bytes]) && isLeft (NAR.deserialise bytes)
          in assertTrue "all rejected by both parsers" (all bothReject malformed),
@@ -709,6 +724,21 @@ testStream =
       test "a truncated archive fails" $
         let bytes = NAR.serialise (NAR.NarRegular False "some contents here")
          in assertLeft "eof" (runStream [BS.take (BS.length bytes - 9) bytes]),
+      -- Regression: under a huge caller bound, a declared length near
+      -- maxBound Int once wrapped the padded Int demand negative, so
+      -- the machine "read" the string instantly as empty at an unmoved
+      -- position and this archive parsed as a complete empty symlink.
+      -- The parse must fail, as upstream would at end of input.
+      test "a near-maxBound declared length fails under a huge bound" $
+        let declared = fromIntegral (maxBound :: Int) :: Word64
+            lenPrefix = BS.pack [fromIntegral ((declared `shiftR` (8 * i)) .&. 0xff) | i <- [0 .. 7]]
+            bytes =
+              BS.concat (map (narWireStr 0) ["nix-archive-1", "(", "type", "symlink", "target"])
+                <> lenPrefix
+                <> narWireStr 0 ")"
+         in assertLeft
+              "overflowing padded demand"
+              (runStreamFrom (Stream.narStreamBounded (maxBound :: Word64)) [bytes]),
       test "the declared contents size arrives before the bytes" $
         case runStream [NAR.serialise (NAR.NarRegular False (BS.replicate 24 0x2A))] of
           Right (Stream.EventRegularBegin False declared : _) ->
