@@ -7,12 +7,17 @@ module NovaCache.Hash
   ( NixHash (..),
     hashBytes,
     hashFile,
+    HashContext,
+    hashInit,
+    hashUpdate,
+    hashFinalize,
     formatNixHash,
     parseNixHash,
   )
 where
 
 import Crypto.Hash (Digest, SHA256, hash)
+import qualified Crypto.Hash as CH
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -39,6 +44,26 @@ hashBytes = NixHash . convert . sha256
 -- | Compute the SHA-256 hash of a file's contents.
 hashFile :: FilePath -> IO NixHash
 hashFile path = hashBytes <$> BS.readFile path
+
+-- | An in-progress SHA-256 computation.  Pure - crypton contexts are
+-- persistent values - so a consumer can fold 'hashUpdate' over chunks
+-- as they stream (a download, 'NovaCache.NAR.withNarSource') and never
+-- hold the whole input.
+newtype HashContext = HashContext (CH.Context SHA256)
+
+-- | The empty hash computation.
+hashInit :: HashContext
+hashInit = HashContext CH.hashInit
+
+-- | Absorb one chunk.
+hashUpdate :: HashContext -> ByteString -> HashContext
+hashUpdate (HashContext ctx) chunk = HashContext (CH.hashUpdate ctx chunk)
+
+-- | Close the computation.  @'hashFinalize' . foldl' 'hashUpdate'
+-- 'hashInit'@ over any chunking of the input equals 'hashBytes' of the
+-- whole.
+hashFinalize :: HashContext -> NixHash
+hashFinalize (HashContext ctx) = NixHash (convert (CH.hashFinalize ctx))
 
 -- | Format a 'NixHash' as @sha256:\<nix-base32\>@.
 formatNixHash :: NixHash -> Text

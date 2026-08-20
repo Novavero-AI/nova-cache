@@ -34,6 +34,7 @@ library
     NovaCache.Base64
     NovaCache.Hash
     NovaCache.NAR
+    NovaCache.NAR.Stream
     NovaCache.NarInfo
     NovaCache.SafeName
     NovaCache.Server
