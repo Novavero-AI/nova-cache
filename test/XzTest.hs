@@ -1,5 +1,5 @@
--- | Tests for the bounded xz decoder.  A separate suite because it
--- exists only under the @xz@ flag; the fixtures are real @xz -6@
+-- | Tests for the bounded xz decoder.  A separate suite because the
+-- decoder lives in the nova-cache:xz sublibrary; the fixtures are real @xz -6@
 -- output embedded as hex, so no external tool runs at test time.
 module Main (main) where
 

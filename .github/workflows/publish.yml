@@ -55,15 +55,18 @@ jobs:
           cabal haddock all --haddock-for-hackage
           # cabal writes each library's tree separately and tars only the
           # main one; Hackage serves one tree per release with sublibraries
-          # as subdirectories (the layout cabal itself names: <docs>/xz).
-          # Graft the xz component in and re-tar as ustar - Hackage's tar
-          # reader 400s GNU-format headers, cabal's own tarballs are ustar.  The final grep fails the
-          # job if a cabal layout change ever drops the module silently.
-          # Undo the graft when haskell/cabal#9577 lands (one tarball
-          # spanning every library).
+          # as subdirectories (the layout cabal itself names: <docs>/<name>).
+          # Graft every sublibrary component in and re-tar as ustar -
+          # Hackage's tar reader 400s GNU-format headers; cabal's own
+          # tarballs are ustar.  The final greps fail the job if a cabal
+          # layout change ever drops a module silently.  Undo the graft
+          # when haskell/cabal#9577 lands (one tarball spanning every
+          # library).
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
-          SUB=$(find dist-newstyle -type d -path "*/l/xz/*${VERSION}-docs/xz")
-          cp -R "$SUB" "$MAIN/xz"
+          for LDIR in dist-newstyle/build/*/*/nova-cache-${VERSION}/l/*/; do
+            NAME=$(basename "$LDIR")
+            cp -R "$LDIR/doc/html/nova-cache-${VERSION}-docs/$NAME" "$MAIN/$NAME"
+          done
           # cabal names the sublibrary hoogle file nova-cache:xz.txt, and
           # Hackage validates tarball paths as Windows-portable - a colon
           # is an invalid character there and 400s the whole upload.  The
@@ -71,6 +74,7 @@ jobs:
           find "$MAIN" -name '*:*' -print -delete
           tar --format=ustar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
           tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "xz/NovaCache-Xz.html"
+          tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "zstandard/NovaCache-Zstd.html"
       - name: Upload documentation to Hackage
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}

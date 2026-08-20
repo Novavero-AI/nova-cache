@@ -1,13 +1,14 @@
 cabal-version:      3.0
 name:               nova-cache
-version:            0.9.0.0
+version:            0.10.0.0
 synopsis:           Pure-first Nix binary cache protocol library
 description:
   A pure-first library implementing the Nix binary cache protocol -
   nix-base32, NAR serialization (whole-tree and streaming), narinfo
   parsing, Ed25519 signing, store path handling, and content
-  validation - with an optional WAI server, and bounded xz
-  decompression as the public @nova-cache:xz@ sublibrary.
+  validation - with an optional WAI server, and bounded xz and zstd
+  codecs as the public @nova-cache:xz@ and @nova-cache:zstandard@
+  sublibraries.
 
 license:            Apache-2.0
 license-file:       LICENSE
@@ -96,6 +97,32 @@ library xz
     , bytestring          >= 0.11 && < 0.13
     , lzma-static         >= 5.2.5 && < 5.3
 
+-- The bounded zstd codec, the same solver-visible opt-in as xz.
+-- Named zstandard, not zstd: an in-package component name shadows the
+-- like-named external package in every build-depends of this package,
+-- so a sublibrary called zstd could never depend on the zstd binding.
+-- Consumers substituting from zstd caches (or pushing compressed)
+-- depend on nova-cache:zstandard; the zstd package bundles libzstd's
+-- C sources, so nobody else builds them.
+library zstandard
+  visibility:       public
+  exposed-modules:  NovaCache.Zstd
+  hs-source-dirs:   src
+  default-language:  Haskell2010
+  default-extensions:
+    BangPatterns
+    OverloadedStrings
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , zstd                >= 0.1 && < 0.2
+
 executable nova-cache-server
   if !flag(server)
     buildable: False
@@ -153,6 +180,20 @@ test-suite nova-cache-xz-test
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , nova-cache:xz
+
+test-suite nova-cache-zstd-test
+  type:             exitcode-stdio-1.0
+  main-is:          ZstdTest.hs
+  hs-source-dirs:   test
+  default-language: Haskell2010
+  default-extensions:
+    OverloadedStrings
+  ghc-options:      -Wall -Wcompat
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , nova-cache:zstandard
 
 source-repository head
   type:     git
