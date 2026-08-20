@@ -156,8 +156,22 @@ main = do
             (Xz.decompress (boundedTo (zerosLength - 1)) zerosXz),
         test "garbage input is a stream error" $
           assertTrue "garbage" (isStreamError (Xz.decompress openLimits "not an xz stream")),
-        test "a truncated stream is a stream error" $
-          assertTrue "truncated" (isStreamError (Xz.decompress openLimits (BS.take 40 textXz))),
+        test "a truncated stream is diagnosed as truncated" $
+          -- The binding reports truncation as LzmaRetBufError (or
+          -- LzmaRetOK); the message must be the diagnosis, not the
+          -- raw constructor.
+          assertEqual
+            "truncated"
+            (Left (Xz.XzStreamError Xz.truncatedInputMessage))
+            (Xz.decompress openLimits (BS.take 40 textXz)),
+        test "empty input is diagnosed as truncated" $
+          -- Zero bytes drive the decoder straight to end of input
+          -- while the binding still reports LzmaRetOK, which shown
+          -- raw would read as success.
+          assertEqual
+            "empty input"
+            (Left (Xz.XzStreamError Xz.truncatedInputMessage))
+            (Xz.decompress openLimits BS.empty),
         test "concatenated streams decode as one output" $
           -- Upstream decodes with LZMA_CONCATENATED; two streams
           -- back-to-back are one valid input.
@@ -179,6 +193,16 @@ main = do
           source <- listSource (chunksOf 7 textXz)
           out <- Xz.withXzSource openLimits source drainSource
           assertEqual "streamed output" textPlain out,
+        test "withXzSource succeeds at the exact output bound" $ do
+          -- NarSize is exact, so the streaming path must accept
+          -- output == bound just as the pure path does.
+          source <- listSource (chunksOf 7 textXz)
+          out <-
+            Xz.withXzSource
+              (boundedTo (fromIntegral (BS.length textPlain)))
+              source
+              drainSource
+          assertEqual "exact-bound streamed output" textPlain out,
         test "withXzSource throws past the output bound" $ do
           source <- listSource (chunksOf 16 zerosXz)
           outcome <-
@@ -192,7 +216,19 @@ main = do
             endA <- pull
             endB <- pull
             pure (endA, endB)
-          assertEqual "stable end" ("", "") ends
+          assertEqual "stable end" ("", "") ends,
+        test "withXzSource re-throws the same error on pulls after a failure" $ do
+          -- A caught error must not turn the next pull into the empty
+          -- chunk, the clean-end signal; a failed source stays failed.
+          source <- listSource (chunksOf 16 zerosXz)
+          Xz.withXzSource (boundedTo 1000) source $ \pull -> do
+            firstPull <- try (drainSource pull) :: IO (Either Xz.XzError ByteString)
+            secondPull <- try pull :: IO (Either Xz.XzError ByteString)
+            okFirst <-
+              assertEqual "first pull" (Left (Xz.XzOutputOverBound 1000)) firstPull
+            okSecond <-
+              assertEqual "later pull" (Left (Xz.XzOutputOverBound 1000)) secondPull
+            pure (okFirst && okSecond)
       ]
   if and results
     then do
