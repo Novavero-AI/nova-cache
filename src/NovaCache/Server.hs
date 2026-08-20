@@ -265,7 +265,7 @@ putNar cfg req respond fileName = case requestBodyLength req of
 -- | Decode a raw narinfo body and validate it in a single pure pipeline.
 --
 -- Composes UTF-8 decoding, narinfo parsing, and field validation. Returns
--- the validated 'NarInfo' on success, or a user-facing error message.
+-- the validated 't:NarInfo' on success, or a user-facing error message.
 decodeAndValidate :: ByteString -> Either Text NarInfo
 decodeAndValidate body = do
   decoded <- first (const "request body is not valid UTF-8") (TE.decodeUtf8' body)
@@ -342,7 +342,7 @@ requireAuth cfg req respond action = case scApiKey cfg of
 -- Signing
 -- ---------------------------------------------------------------------------
 
--- | Sign a validated 'NarInfo' if a signing key is configured.
+-- | Sign a validated 't:NarInfo' if a signing key is configured.
 --
 -- With no key, returns the unsigned rendering (intentional - the operator
 -- configured none).  With a key, FAILS CLOSED: a signing error returns 'Left'
@@ -358,7 +358,7 @@ signNarInfo (Just sk) ni = case sign sk ni of
     let signed = ni {niSigs = niSigs ni ++ [sig]}
      in pure (Right (renderNarInfoBytes signed))
 
--- | Render a 'NarInfo' to its UTF-8 encoded wire format.
+-- | Render a 't:NarInfo' to its UTF-8 encoded wire format.
 renderNarInfoBytes :: NarInfo -> ByteString
 renderNarInfoBytes = TE.encodeUtf8 . renderNarInfo
 

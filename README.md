@@ -1,7 +1,7 @@
 <div align="center">
 <h1>nova-cache</h1>
 <p><strong>The Nix binary cache protocol, in Haskell.</strong></p>
-<p>nix-base32, NAR archives, narinfo, store paths, and Ed25519 signing - with an optional WAI cache server. A pure core; IO is confined to the storage and server boundaries.</p>
+<p>nix-base32, NAR archives (strict and streaming), narinfo, store paths, Ed25519 signing, and bounded xz decompression - with an optional WAI cache server. A pure core; IO is confined to the storage and server boundaries.</p>
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
@@ -46,6 +46,23 @@ import NovaCache.Validate (validateFull)
 case validateFull publicKey ni narBytes fileBytes of
   Right ()  -> accept
   Left errs -> reject errs
+```
+
+```haskell
+import NovaCache.NAR (defaultCaseHack, withNarSource)
+import qualified NovaCache.Hash as Hash
+
+-- Stream a tree's NAR and hash it in one pass; the archive never
+-- exists in memory. The parsing side is NovaCache.NAR.Stream, a
+-- chunk-fed event machine, and the xz flag adds decompression
+-- bounded by a narinfo's declared NarSize.
+narHash <- withNarSource defaultCaseHack path $ \pull ->
+  let go ctx = do
+        chunk <- pull
+        if BS.null chunk
+          then pure (Hash.hashFinalize ctx)
+          else go (Hash.hashUpdate ctx chunk)
+   in go Hash.hashInit
 ```
 
 ## Server
@@ -99,7 +116,7 @@ cabal build
 cabal test
 ```
 
-Optional flag: `--flag server` builds the cache server. Requires GHC 9.14+ and cabal-install 3.10+.
+Optional flags: `--flag server` builds the cache server; `--flag xz` builds the bounded xz decoder (liblzma is bundled - no system library needed). Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 

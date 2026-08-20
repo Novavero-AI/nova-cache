@@ -65,11 +65,11 @@ hashUpdate (HashContext ctx) chunk = HashContext (CH.hashUpdate ctx chunk)
 hashFinalize :: HashContext -> NixHash
 hashFinalize (HashContext ctx) = NixHash (convert (CH.hashFinalize ctx))
 
--- | Format a 'NixHash' as @sha256:\<nix-base32\>@.
+-- | Format a 't:NixHash' as @sha256:\<nix-base32\>@.
 formatNixHash :: NixHash -> Text
 formatNixHash (NixHash raw) = sha256Prefix <> Base32.encode raw
 
--- | Parse a @sha256:\<nix-base32\>@ string back to a 'NixHash'.
+-- | Parse a @sha256:\<nix-base32\>@ string back to a 't:NixHash'.
 --
 -- Validates both the prefix and the decoded length.
 parseNixHash :: Text -> Either String NixHash

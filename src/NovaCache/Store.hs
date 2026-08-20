@@ -83,7 +83,7 @@ tempFilePrefix = ".nova.tmp"
 -- Initialization
 -- ---------------------------------------------------------------------------
 
--- | Create a 'FileStore' rooted at the given directory.
+-- | Create a 't:FileStore' rooted at the given directory.
 --
 -- Ensures the @narinfo@ and @nar@ subdirectories exist.
 newFileStore :: FilePath -> IO FileStore

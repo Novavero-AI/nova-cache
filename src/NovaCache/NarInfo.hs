@@ -78,7 +78,7 @@ fieldColon = ":"
 defaultCompression :: Text
 defaultCompression = "bzip2"
 
--- | Parse a narinfo text body into a 'NarInfo'.  Only StorePath, URL,
+-- | Parse a narinfo text body into a 't:NarInfo'.  Only StorePath, URL,
 -- NarHash, and NarSize are required, matching upstream Nix; a valid
 -- narinfo from a foreign cache must not be rejected over an absent
 -- optional field.
@@ -116,7 +116,7 @@ parseRefs (Just r)
 -- Rendering
 -- ---------------------------------------------------------------------------
 
--- | Render a 'NarInfo' to its text representation.
+-- | Render a 't:NarInfo' to its text representation.
 renderNarInfo :: NarInfo -> Text
 renderNarInfo ni =
   T.unlines $

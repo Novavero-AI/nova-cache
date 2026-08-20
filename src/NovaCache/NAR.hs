@@ -279,8 +279,8 @@ caseHackSuffix = "~nix~case~hack~"
 -- 'defaultCaseHack'.
 --
 -- This is the module's IO boundary: the platform-native walk
--- ('walkPath') classifies each path as symlink, directory, or regular
--- file and delegates to pure constructors.
+-- classifies each path as symlink, directory, or regular file and
+-- delegates to pure constructors.
 serialiseFromPath :: FilePath -> IO NarEntry
 serialiseFromPath = serialiseFromPathWith defaultCaseHack
 
@@ -459,7 +459,7 @@ data SourceState
 -- without ever holding a file's contents in memory: the tree's
 -- structure is planned up front (names, kinds, symlink targets -
 -- never contents), then each pull returns the next chunk, reading
--- regular files 'narSourceChunkBytes' at a time.  The empty chunk
+-- regular files 128 KiB at a time.  The empty chunk
 -- means end of input and repeats on further pulls - the convention
 -- 'NovaCache.Store.writeNarStreaming' consumes, so the two ends
 -- compose directly.  Pair with "NovaCache.Hash"'s incremental hashing
