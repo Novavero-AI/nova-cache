@@ -6,9 +6,9 @@ description:
   A pure-first library implementing the Nix binary cache protocol -
   nix-base32, NAR serialization (whole-tree and streaming), narinfo
   parsing, Ed25519 signing, store path handling, and content
-  validation - with an optional WAI server, and bounded xz and zstd
-  codecs as the public @nova-cache:xz@ and @nova-cache:zstandard@
-  sublibraries.
+  validation - with an optional WAI server, and bounded xz, bzip2,
+  and zstd codecs as the public @nova-cache:xz@, @nova-cache:bzip2@,
+  and @nova-cache:zstandard@ sublibraries.
 
 license:            Apache-2.0
 license-file:       LICENSE
@@ -25,6 +25,8 @@ extra-doc-files:
     CHANGELOG.md
     NOTICE
     README.md
+extra-source-files:
+    cbits/nova_bzip2.h
 
 flag server
   description: Build the cache server executable (pulls in warp and wai-extra)
@@ -96,6 +98,34 @@ library xz
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , lzma-static         >= 5.2.5 && < 5.3
+
+-- The bounded bzip2 decoder, the same solver-visible opt-in as xz.
+-- Historical cache.nixos.org narinfos declare Compression: bzip2, and
+-- upstream reads an absent Compression field as bzip2, so substituting
+-- old paths needs the codec.  No existing binding bundles libbz2's C
+-- sources on every platform (bzlib links the system library outside
+-- Windows), so the module drives libbz2 directly over bzip2-clib -
+-- nothing but the bundled sources - through the cbits shim.
+library bzip2
+  visibility:       public
+  exposed-modules:  NovaCache.Bzip2
+  hs-source-dirs:   src
+  c-sources:        cbits/nova_bzip2.c
+  include-dirs:     cbits
+  default-language:  Haskell2010
+  default-extensions:
+    BangPatterns
+    OverloadedStrings
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , bzip2-clib          >= 1.0.8 && < 1.1
 
 -- The bounded zstd codec, the same solver-visible opt-in as xz.
 -- Named zstandard, not zstd: an in-package component name shadows the
@@ -180,6 +210,20 @@ test-suite nova-cache-xz-test
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , nova-cache:xz
+
+test-suite nova-cache-bzip2-test
+  type:             exitcode-stdio-1.0
+  main-is:          Bzip2Test.hs
+  hs-source-dirs:   test
+  default-language: Haskell2010
+  default-extensions:
+    OverloadedStrings
+  ghc-options:      -Wall -Wcompat
+
+  build-depends:
+      base                >= 4.22 && < 5
+    , bytestring          >= 0.11 && < 0.13
+    , nova-cache:bzip2
 
 test-suite nova-cache-zstd-test
   type:             exitcode-stdio-1.0
