@@ -23,6 +23,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      # v0.9.0.0 reached Hackage with its changelog section still headed
+      # "## Unreleased" (the dating commit landed 73 minutes after the
+      # tag), and a Hackage tarball is immutable - that heading is frozen
+      # into the release forever.  Refuse to upload anything until the
+      # changelog's top section is exactly this version, dated.
+      - name: Verify changelog is dated for this release
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          TOP=$(grep -m 1 '^## ' CHANGELOG.md)
+          case "$TOP" in
+            "## ${VERSION} - "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+              echo "changelog head: ${TOP}"
+              ;;
+            *)
+              echo "CHANGELOG.md top section is '${TOP}'; expected '## ${VERSION} - YYYY-MM-DD'"
+              exit 1
+              ;;
+          esac
+
       - name: Set version from tag
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
@@ -35,6 +55,19 @@ jobs:
       - run: cabal sdist
       - name: Upload to Hackage
         run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          # A docs failure downstream used to strand the release: the
+          # sdist was already live, so the re-run died here on Hackage's
+          # duplicate-version 400 without ever reaching the docs steps
+          # (0.9.0.0 shipped docless exactly this way).  When the version
+          # is already published, skip the sdist and let the docs steps
+          # run; the probe hits this version's own cabal file, which 404s
+          # for any version Hackage does not have.
+          if curl --fail --silent --output /dev/null \
+              "https://hackage.haskell.org/package/nova-cache-${VERSION}/nova-cache.cabal"; then
+            echo "nova-cache-${VERSION} is already on Hackage; skipping sdist upload"
+            exit 0
+          fi
           SDIST=$(ls dist-newstyle/sdist/nova-cache-*.tar.gz)
           curl --fail --silent --show-error \
             --header "Authorization: X-ApiKey ${HACKAGE_TOKEN}" \
