@@ -116,7 +116,7 @@ cabal build
 cabal test
 ```
 
-Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz` sublibrary carries the bounded xz decoder (liblzma is bundled - no system library needed) - consumers depend on it with `build-depends: nova-cache:xz`. Requires GHC 9.14+ and cabal-install 3.10+.
+Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz` and `nova-cache:zstandard` sublibraries carry the bounded codecs (liblzma and libzstd are bundled - no system libraries needed) - consumers depend on them with `build-depends: nova-cache:xz` and the like. Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.0.0 - 2026-08-20
+
+- **Bounded zstd: the new `NovaCache.Zstd`, a public `nova-cache:zstandard` sublibrary.** The modern caches (Cachix, attic, FlakeHub) serve NARs zstd-compressed, and a cache of our own wants the same: near-xz ratio on binaries with decompression an order of magnitude faster, cheap enough to compress at push time (`compress`, frame content size recorded; `defaultCompressionLevel` is libzstd's own 3). `decompress` takes the narinfo's declared NarSize as its output bound and fails past it, and `withZstdSource` decompresses a chunk source into a chunk source under the same limits, pairing with streaming NAR consumption - the xz discipline, ported. Two deliberate divergences from `NovaCache.Xz`, documented in place: decoder-state memory is capped by libzstd's default window limit (128 MiB; the binding exposes no tunable), and a truncated input yields truncated output at this layer - the signed NarSize and NarHash checks above are the arbiter of completeness. Concatenated frames decode as one output, as upstream's sink accepts. The `zstd` dependency bundles libzstd's C sources; no system library on any platform. (`zstandard`, not `zstd`: an in-package component name shadows the like-named dependency, so a sublibrary called `zstd` could never depend on the `zstd` binding.)
+
 ## 0.9.0.0 - 2026-08-20
 
 - **`NovaCache.Xz` moves to the public `nova-cache:xz` sublibrary; the `xz` flag is gone.** A dependency's flag cannot be set from a consumer's `.cabal` file, so reaching the decoder forced a mirrored flag plus a matching `constraints: nova-cache +xz` in every downstream - two knobs that had to agree and that the solver could not see. `build-depends: nova-cache:xz` now expresses the need directly, and consumers without it still never build the bundled liblzma, keeping the 0.5.0.0 lesson. Builds that passed `-f xz` drop the flag and add the dependency; the module and its API are unchanged.
