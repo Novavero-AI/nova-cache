@@ -149,7 +149,9 @@ data Bzip2SourceState
 -- bounded pass.
 --
 -- Limit violations and malformed input are thrown as 'Bzip2Error'
--- from the pull.
+-- from the pull.  A pull that fails latches: every later pull
+-- rethrows the same exception, so a catch-and-retry consumer can
+-- never mistake an aborted transfer for a clean end of output.
 withBzip2Source :: Bzip2Limits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withBzip2Source limits compressedSource consume = do
   opened <- newDecoder

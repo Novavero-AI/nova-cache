@@ -56,6 +56,7 @@ module NovaCache.Zstd
     compress,
     ZstdCompressionLevel,
     zstdCompressionLevel,
+    lowestCompressionLevel,
     maxCompressionLevel,
     defaultCompressionLevel,
     withZstdSource,
