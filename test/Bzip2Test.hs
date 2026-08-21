@@ -163,9 +163,28 @@ main = do
           -- remains; two streams back-to-back are one valid input.
           outcome <- Bzip2.decompress openLimits (textBz2 <> textBz2)
           assertEqual "two text streams" (Right (textPlain <> textPlain)) outcome,
-        test "trailing garbage after the stream is refused" $ do
-          outcome <- Bzip2.decompress openLimits (textBz2 <> "garbage!")
-          assertTrue "trailing garbage" (isStreamError outcome),
+        -- Upstream Nix decompresses bzip2 through libarchive, which
+        -- ignores whatever follows the last stream unless it begins
+        -- another one.  Measured against libarchive 3.8.2 driven exactly
+        -- as Nix drives it (filter_all + format_raw + format_empty): all
+        -- four of these decode to the payload there, and all four were
+        -- refused here before.
+        test "trailing bytes that are not a stream end the output" $ do
+          let trailers = ["garbage!", "\0\0\0\0", "\n", "BZh"]
+          results <-
+            mapM
+              ( \trailer -> do
+                  outcome <- Bzip2.decompress openLimits (textBz2 <> trailer)
+                  assertEqual ("trailer " <> show trailer) (Right textPlain) outcome
+              )
+              trailers
+          pure (and results),
+        test "a truncated concatenated stream is still refused" $ do
+          -- The safe half of the rule: bytes that DO begin a stream are
+          -- decoded as one, and a truncated one fails rather than
+          -- silently truncating the output.
+          outcome <- Bzip2.decompress openLimits (textBz2 <> BS.take 40 textBz2)
+          assertTrue "truncated second stream" (isStreamError outcome),
         test "withBzip2Source decompresses a chunked source" $ do
           source <- listSource (chunksOf 7 textBz2)
           out <- Bzip2.withBzip2Source openLimits source drainSource
