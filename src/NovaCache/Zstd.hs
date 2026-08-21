@@ -16,7 +16,7 @@
 -- properties the driver cannot give:
 --
 -- * The decompression context is created and freed in a bracket
---   ('withDecoder'), so its window buffer - sized by the incoming
+--   (@withDecoder@), so its window buffer - sized by the incoming
 --   frame header, i.e. by the peer, up to libzstd's 128 MiB default
 --   ceiling - is released deterministically on every exit: success,
 --   bound violation, corrupt frame, or an exception in the
@@ -146,7 +146,7 @@ incompleteStreamError = renderError endOfInputSite "truncated frame or trailing 
 newtype ZstdCompressionLevel = ZstdCompressionLevel Int
   deriving (Eq, Ord, Show)
 
--- | Validate a level into 'ZstdCompressionLevel'; 'Nothing' outside
+-- | Validate a level into 't:ZstdCompressionLevel'; 'Nothing' outside
 -- the accepted range.
 zstdCompressionLevel :: Int -> Maybe ZstdCompressionLevel
 zstdCompressionLevel level
@@ -177,7 +177,7 @@ defaultCompressionLevel = ZstdCompressionLevel 3
 
 -- | Compress one payload at the given level.  The produced frame
 -- records its content size, so consumers with a one-shot decoder can
--- allocate exactly.  Total by construction: 'ZstdCompressionLevel'
+-- allocate exactly.  Total by construction: 't:ZstdCompressionLevel'
 -- cannot hold a level the binding's pure one-shot API would reject.
 compress :: ZstdCompressionLevel -> ByteString -> ByteString
 compress (ZstdCompressionLevel level) = OneShot.compress level
