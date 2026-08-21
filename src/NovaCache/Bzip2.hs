@@ -21,10 +21,12 @@
 -- about 4 MiB at the format's largest block size (900k) - so decoder
 -- memory is a constant of the format, not a parameter.
 --
--- Concatenated streams decode as one output: upstream's bzip2
--- decompression sink re-initializes the decoder at stream end while
--- input remains, and this module does the same.  Trailing bytes that
--- do not start a valid stream are refused, as is truncated input.
+-- Concatenated streams decode as one output, and trailing bytes that
+-- do not begin another stream end the output rather than failing it:
+-- upstream C++ Nix decompresses bzip2 through libarchive, which does
+-- both.  Truncated input is still refused, including a truncated
+-- concatenated stream, since silently truncating output is the
+-- failure mode a bounded decoder exists to avoid.
 --
 -- Everything here is IO: the decoder is libbz2, driven over the FFI.
 -- The binding goes directly over @bzip2-clib@ (nothing but the
@@ -44,15 +46,15 @@ module NovaCache.Bzip2
   )
 where
 
-import Control.Exception (Exception, SomeException, throwIO, toException, try)
+import Control.Exception (Exception, SomeException, finally, throwIO, toException, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Foreign.C.Types (CChar, CInt (..), CUInt (..))
-import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, newForeignPtr, withForeignPtr)
+import Foreign.ForeignPtr (FinalizerPtr, ForeignPtr, finalizeForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
@@ -107,7 +109,14 @@ decompress limits input = do
   opened <- newDecoder
   case opened of
     Left err -> pure (Left err)
-    Right decoder -> do
+    Right decoder ->
+      -- The decoder owns malloc'd libbz2 state (a block table up to
+      -- 3.6 MB) that the RTS cannot see, so it creates no GC pressure
+      -- and would otherwise be released at a finalizer's leisure.
+      -- Release it here on every exit, as the zstd codec does.
+      collectFrom decoder `finally` finalizeForeignPtr (decoderStream decoder)
+  where
+    collectFrom decoder = do
       -- The IORef makes the whole input a one-shot chunk source
       -- (input, then the empty end marker), so the strict path
       -- drives the same engine as the streaming one.
@@ -117,7 +126,7 @@ decompress limits input = do
             writeIORef remainingRef BS.empty
             pure held
       collect source decoder []
-  where
+
     collect source decoder acc = do
       outcome <- nextDecodedChunk limits source decoder
       case outcome of
@@ -155,8 +164,19 @@ data Bzip2SourceState
 withBzip2Source :: Bzip2Limits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withBzip2Source limits compressedSource consume = do
   opened <- newDecoder
-  stateRef <- newIORef (either (Bzip2Failed . toException) Bzip2Streaming opened)
-  consume (pullDecompressed limits compressedSource stateRef)
+  case opened of
+    Left err -> do
+      stateRef <- newIORef (Bzip2Failed (toException err))
+      consume (pullDecompressed limits compressedSource stateRef)
+    Right decoder -> do
+      stateRef <- newIORef (Bzip2Streaming decoder)
+      -- Deterministic teardown on every exit - clean end, bound
+      -- violation, decode failure, or an exception in the consumer.
+      -- libbz2's block table is malloc'd and invisible to the RTS, so
+      -- leaving it to the ForeignPtr finalizer lets sequential decodes
+      -- accumulate decoder state in proportion to how rarely the GC runs.
+      consume (pullDecompressed limits compressedSource stateRef)
+        `finally` finalizeForeignPtr (decoderStream decoder)
 
 -- | Produce the next decompressed chunk.
 pullDecompressed :: Bzip2Limits -> IO ByteString -> IORef Bzip2SourceState -> IO ByteString
@@ -245,13 +265,7 @@ nextDecodedChunk ::
 nextDecodedChunk limits compressedSource = advance
   where
     advance decoder = case decoderPhase decoder of
-      AtStreamBoundary
-        | BS.null (decoderLeftover decoder) -> do
-            chunk <- compressedSource
-            if BS.null chunk
-              then pure (Right Nothing)
-              else reopen decoder {decoderLeftover = chunk}
-        | otherwise -> reopen decoder
+      AtStreamBoundary -> continueAfterStream decoder
       MidStream
         | BS.null (decoderLeftover decoder) -> do
             chunk <- compressedSource
@@ -260,9 +274,37 @@ nextDecodedChunk limits compressedSource = advance
               else advance decoder {decoderLeftover = chunk}
         | otherwise -> decodeStep decoder
 
-    -- Input after a clean stream end: re-initialize and decode it as
-    -- the next concatenated stream.  Garbage fails the re-initialized
-    -- decoder's magic check, which is the trailing-garbage refusal.
+    -- Input after a clean stream end.  Upstream C++ Nix decompresses
+    -- bzip2 through libarchive (its own BzipDecompressionSink is gone),
+    -- and libarchive decodes the payload and ignores trailing bytes that
+    -- do not begin another stream: a single stray NUL or newline after
+    -- the last stream substitutes fine under `nix copy` and used to fail
+    -- here.  Bytes that DO begin a stream header are decoded as a
+    -- concatenated stream, and a truncated one still fails, since
+    -- libarchive refuses those too and silently truncating a real stream
+    -- is the failure mode worth keeping.  One measured divergence
+    -- remains: a trailer that is a well-formed header carrying no block
+    -- data (`BZh9` alone) is refused here and accepted by libarchive,
+    -- which buffers past it - refusing is the safer side of a case that
+    -- does not arise in practice.
+    continueAfterStream decoder = do
+      trailing <- fillToHeader (decoderLeftover decoder)
+      if startsStream trailing
+        then reopen decoder {decoderLeftover = trailing}
+        else pure (Right Nothing)
+
+    -- Top the held bytes up to a full stream header, so the decision
+    -- above is never taken on a short read that more input completes.
+    fillToHeader held
+      | BS.length held >= streamHeaderLength = pure held
+      | otherwise = do
+          chunk <- compressedSource
+          if BS.null chunk
+            then pure held
+            else fillToHeader (held <> chunk)
+
+    -- Re-initialize and decode the trailing bytes as the next
+    -- concatenated stream.
     reopen decoder = do
       status <- withForeignPtr (decoderStream decoder) cDecompressReinit
       if status == statusOk
@@ -290,6 +332,30 @@ nextDecodedChunk limits compressedSource = advance
                 if BS.null outChunk
                   then advance continued
                   else pure (Right (Just (outChunk, continued)))
+
+-- | Does this begin a bzip2 stream: the @BZh@ magic followed by a
+-- block-size digit?  The trailing-bytes decision rests on this, so it
+-- reads only the header and never consumes.
+startsStream :: ByteString -> Bool
+startsStream bytes =
+  streamMagic `BS.isPrefixOf` bytes
+    && case BS.indexMaybe bytes (BS.length streamMagic) of
+      Just level -> level >= minBlockSizeDigit && level <= maxBlockSizeDigit
+      Nothing -> False
+
+-- | The bytes every bzip2 stream opens with, before the block-size digit.
+streamMagic :: ByteString
+streamMagic = "BZh"
+
+-- | A full stream header: the magic and the block-size digit after it.
+streamHeaderLength :: Int
+streamHeaderLength = BS.length streamMagic + 1
+
+-- | @\'1\'@ and @\'9\'@: the block-size digits bzip2 defines, in
+-- hundreds of kilobytes.
+minBlockSizeDigit, maxBlockSizeDigit :: Word8
+minBlockSizeDigit = 0x31
+maxBlockSizeDigit = 0x39
 
 -- | The one place the output bound is enforced: the produced count
 -- grown by a chunk, refused past the bound.  Inclusive - reaching
