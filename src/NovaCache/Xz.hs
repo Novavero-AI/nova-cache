@@ -33,7 +33,7 @@ module NovaCache.Xz
 where
 
 import qualified Codec.Compression.Lzma as Lzma
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, SomeException, throwIO, try)
 -- decompressST runs in lazy ST (the upstream package's own lazy
 -- API drives it the same way); the driver's accumulator bangs and
 -- guard-before-recurse keep the bound checks strict regardless.
@@ -132,12 +132,14 @@ decompress limits input = runST $ do
 data XzSourceState
   = XzStreaming !(Lzma.DecompressStream IO) !Word64
   | XzDrained
-  | -- | The source failed; the error is held so every later pull
+  | -- | A pull failed; the exception is held so every later pull
     -- re-throws it.  Collapsing failure into 'XzDrained' would let a
     -- consumer that catches the first throw pull once more and read
     -- the empty chunk - the clean-end signal - presenting truncated
-    -- output as complete.
-    XzFailed !XzError
+    -- output as complete.  Held at 'SomeException', not 'XzError':
+    -- the compressed source throwing mid-pull leaves the transfer
+    -- just as unfinishable as a decoder error does.
+    XzFailed !SomeException
 
 -- | Decompress a chunk source into a chunk source, under the limits.
 -- The continuation's pull yields decompressed chunks; the empty chunk
@@ -147,8 +149,9 @@ data XzSourceState
 -- decompress, hash, and unpack in one bounded pass.
 --
 -- Limit violations and malformed input are thrown as 'XzError' from
--- the pull; once a pull has thrown, every later pull re-throws the
--- same error.
+-- the pull; once a pull has let any exception escape - decoder error
+-- or the compressed source failing - every later pull re-throws the
+-- same exception.
 --
 -- Despite the bracket-shaped name there is no bracket to run: the
 -- binding ("Codec.Compression.Lzma") exposes no teardown for a live
@@ -169,36 +172,48 @@ withXzSource limits compressedSource consume = do
 
 -- | Produce the next decompressed chunk.
 pullDecompressed :: XzLimits -> IO ByteString -> IORef XzSourceState -> IO ByteString
-pullDecompressed limits compressedSource stateRef = advance =<< readIORef stateRef
+pullDecompressed limits compressedSource stateRef = dispatch =<< readIORef stateRef
   where
     bound = xzMaxOutputBytes limits
-    failWith err = do
-      writeIORef stateRef (XzFailed err)
-      throwIO err
-    advance XzDrained = pure BS.empty
-    advance (XzFailed err) = throwIO err
-    advance (XzStreaming step produced) = case step of
+    dispatch XzDrained = pure BS.empty
+    dispatch (XzFailed failure) = throwIO failure
+    dispatch (XzStreaming step produced) = do
+      outcome <- tryPull (advance step produced)
+      case outcome of
+        Left failure -> do
+          writeIORef stateRef (XzFailed failure)
+          throwIO failure
+        Right chunk -> pure chunk
+    advance step produced = case step of
       Lzma.DecompressInputRequired supply -> do
         chunk <- compressedSource
         next <- supply chunk
-        advance (XzStreaming next produced)
+        advance next produced
       Lzma.DecompressOutputAvailable out nextAction ->
         case growWithinBound bound produced out of
-          Nothing -> failWith (XzOutputOverBound bound)
+          Nothing -> throwIO (XzOutputOverBound bound)
           Just grown -> do
             next <- nextAction
             writeIORef stateRef (XzStreaming next grown)
             -- liblzma may hand back an empty buffer at stream
             -- boundaries; returning it would read as end of output.
             if BS.null out
-              then advance (XzStreaming next grown)
+              then advance next grown
               else pure out
       Lzma.DecompressStreamEnd leftover
         | BS.null leftover -> do
             writeIORef stateRef XzDrained
             pure BS.empty
-        | otherwise -> failWith (XzStreamError trailingDataMessage)
-      Lzma.DecompressStreamError ret -> failWith (mapRet limits ret)
+        | otherwise -> throwIO (XzStreamError trailingDataMessage)
+      Lzma.DecompressStreamError ret -> throwIO (mapRet limits ret)
+
+-- | 'try' at 'SomeException', monomorphic so the catch-all needs no
+-- annotation at the call site.  Any exception escaping a pull - the
+-- compressed source failing included - leaves the transfer
+-- unfinishable, and the only sound later answer is the same failure
+-- again, so the caller latches whatever this catches.
+tryPull :: IO ByteString -> IO (Either SomeException ByteString)
+tryPull = try
 
 -- ---------------------------------------------------------------------------
 -- Shared decoder machinery
