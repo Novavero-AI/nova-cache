@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Source must be ASCII-only
         run: |
-          if git grep -nP '[^\x00-\x7F]' -- '*.hs' '*.cabal' '*.md' '*.nix' '*.sh'; then
+          if git grep -nP '[^\x00-\x7F]' -- '*.hs' '*.c' '*.h' '*.cabal' '*.md' '*.nix' '*.sh'; then
             echo "Non-ASCII characters found above; keep the source ASCII-only (no smart quotes, em-dashes, or Unicode arrows)."
             exit 1
           fi
@@ -90,6 +90,48 @@ jobs:
         run: git ls-files '*.hs' | xargs ormolu --mode check
 
   # ---------------------------------------------------------------------------
+  # cbits/nova_bzip2.c is the only hand-written C in the tree, and the build
+  # compiles it with whatever warnings GHC's bootstrap toolchain defaults to
+  # - quiet enough that GNU extensions and implicit conversions never
+  # surface.  This job holds it to strict C99 instead.  Syntax-only, so
+  # nothing links or runs; declarations come from bzip2-clib's own bundled
+  # bzlib.h, fetched from Hackage rather than apt's libbz2-dev, so the lint
+  # reads the same header the build compiles against instead of a lookalike.
+  #
+  # -Wconversion -Wsign-conversion earn their place beyond the usual set:
+  # the shim's entire job is marshalling, and bz_stream's avail_in/avail_out
+  # are 32-bit unsigned while the Haskell side hands down Int.  Implicit
+  # narrowing there is the one defect class this file can plausibly carry,
+  # and -Wall -Wextra -pedantic does not diagnose it.
+  # ---------------------------------------------------------------------------
+
+  c99-lint:
+    name: C99 Strict
+    needs: [ascii]
+    runs-on: ubuntu-latest
+    env:
+      # Matches the floor of the bzip2-clib bound in nova-cache.cabal.
+      BZIP2_CLIB_VERSION: 1.0.8
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch the bundled bzlib.h the build compiles against
+        run: |
+          mkdir -p "$RUNNER_TEMP/clib-include"
+          curl -fsSL \
+            "https://hackage.haskell.org/package/bzip2-clib-$BZIP2_CLIB_VERSION/bzip2-clib-$BZIP2_CLIB_VERSION.tar.gz" \
+            | tar -xz --strip-components=2 -C "$RUNNER_TEMP/clib-include" \
+                "bzip2-clib-$BZIP2_CLIB_VERSION/cbits/bzlib.h"
+
+      - name: Compile C99 with strict warnings
+        run: |
+          for f in cbits/*.c; do
+            echo "Checking $f ..."
+            gcc -std=c99 -Wall -Wextra -pedantic -Wconversion -Wsign-conversion \
+                -Werror -fsyntax-only -Icbits -I"$RUNNER_TEMP/clib-include" "$f"
+          done
+
+  # ---------------------------------------------------------------------------
   # Build + Test (cross-platform matrix)
   # ---------------------------------------------------------------------------
 
@@ -139,7 +181,7 @@ jobs:
 
   cabal-check:
     name: Cabal Check
-    needs: [lint, format]
+    needs: [lint, format, c99-lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -182,6 +224,83 @@ jobs:
           tar -xzf "$RUNNER_TEMP"/sdist/nova-cache-*.tar.gz -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP"/nova-cache-*/
           cabal build all -f server --enable-tests
+
+  # ---------------------------------------------------------------------------
+  # Exercise the cbits shim under ASan/UBSan (Linux-only).  The C99 job only
+  # compiles it; this one RUNS it, so a stray pointer or an overflow in the
+  # hand-written C fails CI instead of corrupting a decompressed NAR in
+  # production.  The bzip2 suite is the whole target: lib:bzip2 is the only
+  # component with c-sources, and the C behind xz and zstd belongs to
+  # dependencies this job deliberately leaves uninstrumented.  Linux is the
+  # host because GHC's mingw toolchain ships no sanitizer runtime and the
+  # shim is platform-independent, so one instrumented host is real coverage.
+  # ---------------------------------------------------------------------------
+
+  sanitizers:
+    name: ASan/UBSan
+    needs: [cabal-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: '9.14.1'
+          cabal-version: 'latest'
+
+      # Its own key, like sdist and deploy: this job builds neither the
+      # server flag nor the xz and zstd sublibraries, so its store holds a
+      # different set than the matrix build's.  Dependencies land in it
+      # unsanitized - the flags below are scoped to this package alone.
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-sanitize-${{ hashFiles('nova-cache.cabal') }}
+          restore-keys: cabal-sanitize-
+
+      # Scoped through cabal.project.local so only this package's cbits
+      # compile instrumented and only its test executable links the
+      # sanitizer runtimes; a command-line --ghc-options would rebuild every
+      # dependency instrumented too.  -fno-sanitize-recover makes each UBSan
+      # report fatal rather than a log line CI would scroll past.  No
+      # -Werror here: the warnings gate is the build matrix, and this job's
+      # signal is runtime findings.
+      - name: Scope sanitizer flags to this package
+        run: |
+          {
+            echo "package nova-cache"
+            echo "  ghc-options: -optc-fsanitize=address,undefined -optc-fno-sanitize-recover=all -optl-fsanitize=address,undefined"
+          } > cabal.project.local
+
+      - name: Build with instrumented cbits
+        run: cabal build nova-cache-bzip2-test
+
+      # cabal reuses an existing C object across a ghc-options change, so a
+      # warm build tree can link an uninstrumented shim and leave this job
+      # green having tested nothing.  Fail loudly instead of silently.
+      - name: Confirm the shim is instrumented
+        run: |
+          obj=$(find dist-newstyle -name 'nova_bzip2.o' -print -quit)
+          if [ -z "$obj" ]; then
+            echo "nova_bzip2.o not found; the bzip2 sublibrary did not build"
+            exit 1
+          fi
+          if ! nm "$obj" | grep -q '__asan'; then
+            echo "$obj carries no ASan instrumentation; the flags did not reach the C compile"
+            exit 1
+          fi
+
+      # detect_leaks=0: LeakSanitizer would report the GHC RTS's
+      # process-lifetime allocations, plus any bz_stream whose ForeignPtr
+      # finalizer the RTS never ran before exit - neither is a shim defect.
+      # The stream's own teardown path is exercised by the suite itself.
+      - name: Test under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: cabal test nova-cache-bzip2-test
 
   # ---------------------------------------------------------------------------
   # Deploy (main branch only): build on the hosted arm64 image, ship the
