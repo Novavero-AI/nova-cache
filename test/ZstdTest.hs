@@ -6,7 +6,7 @@
 -- the reference encoder - no external tool runs at test time.
 module Main (main) where
 
-import Control.Exception (try)
+import Control.Exception (throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -15,6 +15,7 @@ import Data.Word (Word8)
 import qualified NovaCache.Zstd as Zstd
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
+import System.IO.Error (isUserError)
 
 -- ---------------------------------------------------------------------------
 -- Harness (mirrors test/XzTest.hs)
@@ -173,13 +174,19 @@ wideWindowFrame =
 
 -- | A pull source yielding the given chunks, then empty forever.
 chunkSource :: [ByteString] -> IO (IO ByteString)
-chunkSource chunks = do
-  ref <- newIORef chunks
+chunkSource chunks = scriptedSource (map pure chunks)
+
+-- | A pull source that performs the given actions in order and
+-- returns the empty chunk after they run out; an action may throw,
+-- which is how the errored-source tests stage a failure.
+scriptedSource :: [IO ByteString] -> IO (IO ByteString)
+scriptedSource steps = do
+  ref <- newIORef steps
   pure $ do
     remaining <- readIORef ref
     case remaining of
       [] -> pure BS.empty
-      (c : cs) -> writeIORef ref cs >> pure c
+      (act : rest) -> writeIORef ref rest >> act
 
 -- | Split a payload into bounded chunks so the streaming path sees
 -- many small feeds, as a network body would deliver.
@@ -289,6 +296,31 @@ main = do
             second <- try pull :: IO (Either Zstd.ZstdError ByteString)
             initial <- assertTrue "first pull throws" (isStreamError first)
             repeated <- assertEqual "second pull rethrows the same error" first second
-            pure (initial && repeated)
+            pure (initial && repeated),
+        test "source: a source failure never becomes a clean end" $ do
+          -- The source delivers a full frame, errors on the pull that
+          -- would confirm the end, then reads as exhausted.  An
+          -- unlatched decoder would answer the retry with the empty
+          -- chunk - a failed transfer posing as complete output.
+          source <-
+            scriptedSource [pure compressedPayload, throwIO (userError sourceFailureText)]
+          Zstd.withZstdSource (limitsOf payloadSize) source $ \pull -> do
+            chunk <- pull
+            firstPull <- try pull :: IO (Either IOError ByteString)
+            laterPull <- try pull :: IO (Either IOError ByteString)
+            okChunk <- assertEqual "decoded chunk" payload chunk
+            okFirst <- assertTrue "first pull throws" (either isUserError (const False) firstPull)
+            okLater <- assertTrue "later pull throws" (either isUserError (const False) laterPull)
+            pure (okChunk && okFirst && okLater)
       ]
-  if and results then exitSuccess else exitFailure
+  if and results
+    then do
+      putStrLn ""
+      putStrLn ("All " ++ show (length results) ++ " tests passed.")
+      exitSuccess
+    else do
+      putStrLn ""
+      putStrLn "Some tests FAILED."
+      exitFailure
+  where
+    sourceFailureText = "staged transfer failure"

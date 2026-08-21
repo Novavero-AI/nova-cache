@@ -65,7 +65,7 @@ where
 import qualified Codec.Compression.Zstd as OneShot
 import Codec.Compression.Zstd.FFI (Buffer (..), In, Out)
 import qualified Codec.Compression.Zstd.FFI as FFI
-import Control.Exception (Exception, bracket, throwIO, try)
+import Control.Exception (Exception, SomeException, bracket, throwIO, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -231,8 +231,10 @@ drainSource pull = collect []
 -- bounded pass.
 --
 -- Limit violations and unacceptable input are thrown as 'ZstdError'
--- from the pull, and every pull after a failure rethrows it.  The
--- decompression context lives exactly as long as the continuation.
+-- from the pull; once a pull has let any exception escape - decoder
+-- error or the compressed source failing - every later pull rethrows
+-- the same exception.  The decompression context lives exactly as
+-- long as the continuation.
 withZstdSource :: ZstdLimits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withZstdSource limits compressedSource consume =
   withDecoder $ \decoder -> do
@@ -242,11 +244,14 @@ withZstdSource limits compressedSource consume =
 -- | What the pull source is doing between calls.  The 'IORef'
 -- holding this is the module's one piece of mutable state - the
 -- same deliberate, documented boundary as the xz source.  A failure
--- is remembered: a consumer that catches the error and pulls again
--- gets it rethrown, never a phantom clean end of stream.
+-- is remembered: a consumer that catches the exception and pulls
+-- again gets it rethrown, never a phantom clean end of stream.
+-- Held at 'SomeException', not 'ZstdError': the compressed source
+-- throwing mid-pull leaves the transfer just as unfinishable as a
+-- decoder error does.
 data ZstdSourceState
   = ZstdStreaming !DecodeProgress
-  | ZstdFailed !ZstdError
+  | ZstdFailed !SomeException
   | ZstdDrained
 
 -- | Where a decode stands between pulls.
@@ -275,12 +280,14 @@ pullDecompressed limits compressedSource decoder stateRef =
     bound = zstdMaxOutputBytes limits
 
     dispatch ZstdDrained = pure BS.empty
-    dispatch (ZstdFailed err) = throwIO err
-    dispatch (ZstdStreaming progress) = advance progress
-
-    refuse err = do
-      writeIORef stateRef (ZstdFailed err)
-      throwIO err
+    dispatch (ZstdFailed failure) = throwIO failure
+    dispatch (ZstdStreaming progress) = do
+      outcome <- tryPull (advance progress)
+      case outcome of
+        Left failure -> do
+          writeIORef stateRef (ZstdFailed failure)
+          throwIO failure
+        Right chunk -> pure chunk
 
     advance progress
       | not (BS.null (pendingCompressed progress)) = decodeStep progress
@@ -308,12 +315,12 @@ pullDecompressed limits compressedSource decoder stateRef =
           case outcome of
             Right step
               | BS.null (stepOutput step) && not (stepAtBoundary step) ->
-                  refuse incompleteStreamError
+                  throwIO incompleteStreamError
             _ -> deliver progress outcome
 
-    deliver _ (Left err) = refuse err
+    deliver _ (Left err) = throwIO err
     deliver progress (Right step)
-      | grown > bound = refuse (ZstdOutputOverBound bound)
+      | grown > bound = throwIO (ZstdOutputOverBound bound)
       | BS.null (stepOutput step) = advance nextProgress
       | otherwise = do
           writeIORef stateRef (ZstdStreaming nextProgress)
@@ -326,6 +333,14 @@ pullDecompressed limits compressedSource decoder stateRef =
               producedBytes = grown,
               atFrameBoundary = stepAtBoundary step
             }
+
+-- | 'try' at 'SomeException', monomorphic so the catch-all needs no
+-- annotation at the call site.  Any exception escaping a pull - the
+-- compressed source failing included - leaves the transfer
+-- unfinishable, and the only sound later answer is the same failure
+-- again, so the caller latches whatever this catches.
+tryPull :: IO ByteString -> IO (Either SomeException ByteString)
+tryPull = try
 
 -- ---------------------------------------------------------------------------
 -- Decoder plumbing (FFI boundary)

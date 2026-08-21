@@ -3,7 +3,7 @@
 -- output embedded as hex, so no external tool runs at test time.
 module Main (main) where
 
-import Control.Exception (try)
+import Control.Exception (throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
@@ -11,6 +11,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified NovaCache.Xz as Xz
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
+import System.IO.Error (isUserError)
 
 -- ---------------------------------------------------------------------------
 -- Harness (mirrors test/Main.hs)
@@ -109,15 +110,21 @@ chunksOf n bs
 -- | A chunk source over a fixed list (empty chunk on exhaustion), for
 -- feeding 'Xz.withXzSource'.
 listSource :: [ByteString] -> IO (IO ByteString)
-listSource chunks = do
-  remaining <- newIORef chunks
+listSource chunks = scriptedSource (map pure chunks)
+
+-- | A chunk source that performs the given actions in order and
+-- returns the empty chunk after they run out; an action may throw,
+-- which is how the errored-source tests stage a failure.
+scriptedSource :: [IO ByteString] -> IO (IO ByteString)
+scriptedSource steps = do
+  remaining <- newIORef steps
   pure $ do
     held <- readIORef remaining
     case held of
       [] -> pure BS.empty
-      (c : cs) -> do
-        writeIORef remaining cs
-        pure c
+      (act : rest) -> do
+        writeIORef remaining rest
+        act
 
 -- ---------------------------------------------------------------------------
 -- Tests
@@ -228,7 +235,22 @@ main = do
               assertEqual "first pull" (Left (Xz.XzOutputOverBound 1000)) firstPull
             okSecond <-
               assertEqual "later pull" (Left (Xz.XzOutputOverBound 1000)) secondPull
-            pure (okFirst && okSecond)
+            pure (okFirst && okSecond),
+        test "a source failure never becomes a clean end" $ do
+          -- The source delivers a full stream, errors on the pull
+          -- that would confirm the end, then reads as exhausted.  An
+          -- unlatched decoder would answer the retry with the empty
+          -- chunk - a failed transfer posing as complete output.
+          source <-
+            scriptedSource [pure textXz, throwIO (userError sourceFailureText)]
+          Xz.withXzSource openLimits source $ \pull -> do
+            chunk <- pull
+            firstPull <- try pull :: IO (Either IOError ByteString)
+            laterPull <- try pull :: IO (Either IOError ByteString)
+            okChunk <- assertEqual "decoded chunk" textPlain chunk
+            okFirst <- assertTrue "first pull throws" (either isUserError (const False) firstPull)
+            okLater <- assertTrue "later pull throws" (either isUserError (const False) laterPull)
+            pure (okChunk && okFirst && okLater)
       ]
   if and results
     then do
@@ -241,6 +263,7 @@ main = do
       exitFailure
   where
     smallMemory = 1024 * 1024
+    sourceFailureText = "staged transfer failure"
     isStreamError outcome = case outcome of
       Left (Xz.XzStreamError _) -> True
       _ -> False
