@@ -25,6 +25,7 @@ module NovaCache.NAR
   ( NarEntry (..),
     serialise,
     deserialise,
+    isWindowsHazardName,
     narHash,
     serialiseFromPath,
     serialiseFromPathWith,
@@ -35,7 +36,7 @@ module NovaCache.NAR
   )
 where
 
-import Control.Exception (finally)
+import Control.Exception (bracketOnError, finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
@@ -48,6 +49,7 @@ import qualified NovaCache.Hash as Hash
 import NovaCache.NAR.Stream
   ( NarEvent (..),
     NarStep (..),
+    isWindowsHazardName,
     narPad,
     narPadOf,
     narStreamBounded,
@@ -181,7 +183,7 @@ narStr bs =
 deserialise :: ByteString -> Either String NarEntry
 deserialise input = drive True (narStreamBounded (fromIntegral (BS.length input))) [] Nothing
   where
-    drive !firstFeed step stack root = case step of
+    drive !firstFeed step !stack !root = case step of
       NarFail err -> Left err
       NarDone -> case (stack, root) of
         ([], Just entry) -> Right entry
@@ -497,11 +499,16 @@ pullChunk stateRef = advance =<< readIORef stateRef
       pure bytes
     advance (SourceSegments (SegmentFile path : rest)) = do
       shownPath <- decodeFS path
-      handle <- openBinaryFile shownPath ReadMode
-      size <- hFileSize handle
-      let owed = fromIntegral size :: Word64
-      writeIORef stateRef (SourceFile handle shownPath owed (narPadOf owed) rest)
-      pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
+      -- hFileSize can throw after a successful open (the path swapped
+      -- for a FIFO between plan and pull); until the state ref records
+      -- the handle, closeCurrent cannot see it, so ownership transfers
+      -- under bracketOnError - the same discipline as the shrink path
+      -- below.
+      bracketOnError (openBinaryFile shownPath ReadMode) hClose $ \handle -> do
+        size <- hFileSize handle
+        let owed = fromIntegral size :: Word64
+        writeIORef stateRef (SourceFile handle shownPath owed (narPadOf owed) rest)
+        pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
     advance (SourceFile handle _ 0 padLen rest) = do
       hClose handle
       writeIORef stateRef (SourceSegments rest)
@@ -533,7 +540,7 @@ planSegments mode path = do
 -- | Plan pieces before coalescing: structural builders, or a deferred
 -- regular file.
 data PlanPiece
-  = PieceBytes B.Builder
+  = PieceBytes !B.Builder
   | PieceFile !OsPath
 
 -- | Merge adjacent structural runs and render each strict, so a pull
@@ -542,9 +549,9 @@ data PlanPiece
 coalesce :: [PlanPiece] -> [NarSegment]
 coalesce = go mempty
   where
-    go pending [] = flushOnto pending []
-    go pending (PieceBytes builder : rest) = go (pending <> builder) rest
-    go pending (PieceFile path : rest) =
+    go !pending [] = flushOnto pending []
+    go !pending (PieceBytes builder : rest) = go (pending <> builder) rest
+    go !pending (PieceFile path : rest) =
       flushOnto pending (SegmentFile path : go mempty rest)
     flushOnto pending segments =
       let bytes = BL.toStrict (B.toLazyByteString pending)
