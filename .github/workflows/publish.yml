@@ -108,6 +108,7 @@ jobs:
           tar --format=ustar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
           tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "xz/NovaCache-Xz.html"
           tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "zstandard/NovaCache-Zstd.html"
+          tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" | grep -q "bzip2/NovaCache-Bzip2.html"
       - name: Upload documentation to Hackage
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}

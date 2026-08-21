@@ -1,7 +1,7 @@
 <div align="center">
 <h1>nova-cache</h1>
 <p><strong>The Nix binary cache protocol, in Haskell.</strong></p>
-<p>nix-base32, NAR archives (strict and streaming), narinfo, store paths, Ed25519 signing, and bounded xz and zstd codecs as the public nova-cache:xz and nova-cache:zstandard sublibraries (decompression bounded, zstd compression for the push direction) - with an optional WAI cache server. A pure core; IO is confined to the storage and server boundaries.</p>
+<p>nix-base32, NAR archives (strict and streaming), narinfo, store paths, Ed25519 signing, and bounded xz, zstd, and bzip2 codecs as the public nova-cache:xz, nova-cache:zstandard, and nova-cache:bzip2 sublibraries (decompression bounded, zstd compression for the push direction) - with an optional WAI cache server. A pure core; IO is confined to the storage and server boundaries.</p>
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
@@ -54,9 +54,10 @@ import qualified NovaCache.Hash as Hash
 
 -- Stream a tree's NAR and hash it in one pass; the archive never
 -- exists in memory. The parsing side is NovaCache.NAR.Stream, a
--- chunk-fed event machine; the nova-cache:xz and nova-cache:zstandard
--- sublibraries add decompression bounded by a narinfo's declared
--- NarSize, and the zstd side also compresses for the push direction.
+-- chunk-fed event machine; the nova-cache:xz, nova-cache:zstandard,
+-- and nova-cache:bzip2 sublibraries add decompression bounded by a
+-- narinfo's declared NarSize, and the zstd side also compresses for
+-- the push direction.
 narHash <- withNarSource defaultCaseHack path $ \pull ->
   let go ctx = do
         chunk <- pull
