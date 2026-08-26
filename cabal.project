@@ -4,3 +4,11 @@ packages: .
 -- identical versions regardless of when they last ran cabal update.  Bump
 -- deliberately - a fresh timestamp - when adopting new releases.
 index-state: 2026-08-20T01:41:58Z
+
+-- The xz binding defaults to a pkg-config-found system liblzma and
+-- falls back to the bundled sources, so which library a build links
+-- would depend on the host.  Pin the bundled path: every build links
+-- xz-clib's sources, the behavior lzma-static always had.  This file
+-- does not travel to consumers; one carrying the same guarantee adds
+-- the same line (a dependency's flag cannot be set from a .cabal).
+constraints: xz -system-xz
