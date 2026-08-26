@@ -154,16 +154,13 @@ data XzSourceState
 -- same exception.
 --
 -- Despite the bracket-shaped name there is no bracket to run: the
--- binding ("Codec.Compression.Lzma") exposes no teardown for a live
--- 'Lzma.DecompressStream' - it runs @lzma_end@ itself on the clean
--- end path and otherwise leaves it to the stream's ForeignPtr
--- finalizer.  A pull that throws, or a consumer that exits early,
--- therefore strands the decoder state (up to 'xzMaxDecoderMemoryBytes')
--- until a GC runs the finalizer.  Undo condition: a lzma-static
--- release surfacing live-stream teardown in the high-level API (its
--- internal @LibLzma.endLzmaStream@ is what the fix needs), at which
--- point this becomes a real bracket ending the stream on every exit
--- path.
+-- binding ("Codec.Compression.Lzma") runs @lzma_end@ itself on the
+-- clean end path and otherwise frees the decoder through the
+-- stream's ForeignPtr finalizer - the lifecycle the ecosystem's
+-- zlib and bzlib bindings use for the same job.  A pull that
+-- throws, or a consumer that exits early, holds the decoder state
+-- (bounded by 'xzMaxDecoderMemoryBytes') until a GC runs the
+-- finalizer.
 withXzSource :: XzLimits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withXzSource limits compressedSource consume = do
   start <- Lzma.decompressIO (decompressParams limits)
