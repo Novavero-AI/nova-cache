@@ -167,8 +167,10 @@ jobs:
 
       # all + -f server + --enable-tests so the server executable, the xz
       # sublibrary, and the test suites hit the same -Werror bar as the
-      # library on every OS.  No liblzma setup: lzma-static bundles the C
-      # sources.  The sdist job builds the same set from the tarball.
+      # library on every OS.  No liblzma setup: cabal.project pins the xz
+      # package to its bundled xz-clib (constraints: xz -system-xz), so
+      # no runner needs the system library.  The sdist job builds the
+      # same set from the tarball.
       - name: Build
         run: cabal build all -f server --enable-tests --ghc-options="-Werror"
 
