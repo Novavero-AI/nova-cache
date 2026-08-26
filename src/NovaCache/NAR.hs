@@ -76,8 +76,6 @@ import NovaCache.NAR.Stream
 import System.Directory.OsPath
   ( doesDirectoryExist,
     doesFileExist,
-    executable,
-    getPermissions,
     getSymbolicLinkTarget,
     listDirectory,
     pathIsSymbolicLink,
@@ -88,10 +86,12 @@ import qualified System.OsPath as OP
 #ifdef mingw32_HOST_OS
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import System.Directory.OsPath (executable, getPermissions)
 import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, openBinaryFile)
 #else
 import qualified Data.ByteString.Char8 as BS8
 import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, latin1, openBinaryFile)
+import qualified System.Posix.Files as Posix
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -297,11 +297,28 @@ caseHackSuffix = "~nix~case~hack~"
 -- bytes, since a non-UTF-8 name arrives with surrogate escapes.
 type ExecBitResolver = FilePath -> IO Bool
 
--- | The stock resolver: 'getPermissions', which answers from
--- @access(2)@ for the calling process on Unix and from the file
--- extension on Windows.
+#ifdef mingw32_HOST_OS
+
+-- | The stock resolver on Windows: 'getPermissions', which answers
+-- from the file extension - the platform has no mode bit to read.
 defaultExecBitResolver :: ExecBitResolver
 defaultExecBitResolver path = executable <$> (getPermissions =<< encodeFS path)
+
+#else
+
+-- | The stock resolver on POSIX: the owner-execute bit of the file's
+-- own mode, as upstream's dump reads it (@st_mode & S_IXUSR@).  Not
+-- 'System.Directory.OsPath.getPermissions', which answers from
+-- @access(2)@ - what the CALLING PROCESS may do - and so diverges for
+-- root (any execute bit reads as executable), ACLs, and files the
+-- caller does not own; the flag lands in NAR bytes, so that
+-- divergence moves a hash (#65).
+defaultExecBitResolver :: ExecBitResolver
+defaultExecBitResolver path = do
+  status <- Posix.getSymbolicLinkStatus path
+  pure (Posix.intersectFileModes (Posix.fileMode status) Posix.ownerExecuteMode /= Posix.nullFileMode)
+
+#endif
 
 -- | How a tree is read for serialisation: the case-hack mode and the
 -- executable-bit source.
