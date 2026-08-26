@@ -1,4 +1,8 @@
-cabal-version:      3.0
+cabal-version:      3.4
+-- 3.4 so a bare name in build-depends always means the external
+-- package: the xz sublibrary must depend on the xz package, and under
+-- 3.0 an in-package component name shadowed its external namesake
+-- (the hazard the zstandard library's name dodges, documented there).
 name:               nova-cache
 version:            0.11.0.1
 synopsis:           Pure-first Nix binary cache protocol library
@@ -75,8 +79,8 @@ library
 
 -- The bounded xz decoder as a solver-visible opt-in: a consumer that
 -- substitutes foreign caches writes build-depends: nova-cache:xz and
--- gets the module; everyone else never builds lzma-static's bundled
--- liblzma.  This replaces the manual xz flag - a dependency's flag
+-- gets the module; everyone else never builds the xz package's
+-- bundled liblzma.  This replaces the manual xz flag - a dependency's flag
 -- cannot be set from a consumer's .cabal file, which forced mirror
 -- flags and matching constraints downstream (nova-nix#27) - while
 -- keeping the 0.5.0.0 lesson: xz stays out of the default install.
@@ -97,7 +101,9 @@ library xz
   build-depends:
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
-    , lzma-static         >= 5.2.5 && < 5.3
+    -- The external xz package, not this very sublibrary: bare names
+    -- are external from cabal-version 3.4 on.
+    , xz                  >= 5.6.3 && < 5.7
 
 -- The bounded bzip2 decoder, the same solver-visible opt-in as xz.
 -- Historical cache.nixos.org narinfos declare Compression: bzip2, and

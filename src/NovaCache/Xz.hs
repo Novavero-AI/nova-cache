@@ -15,8 +15,8 @@
 -- @LZMA_CONCATENATED@ decoder in libutil's compression sink.
 --
 -- This module lives in the public @nova-cache:xz@ sublibrary.  The
--- @lzma-static@ dependency bundles liblzma's C sources, so no system
--- library is needed on any platform - but it is still an extra C
+-- @xz@ dependency bundles liblzma's C sources (via @xz-clib@), so no
+-- system library is needed on any platform - but it is still an extra C
 -- build that consumers without foreign-cache needs should not pay
 -- for, and a default-on compression dependency broke downstream
 -- installs once already (0.5.0.0).  Consumers that substitute from
