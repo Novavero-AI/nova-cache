@@ -11,8 +11,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Lazy as BL
 import Data.Either (isLeft)
-import Data.IORef (atomicModifyIORef', newIORef)
-import Data.List (sort)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.List (isSuffixOf, sort)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -501,6 +501,56 @@ testNAR =
         pure $ case (outcome :: Either SomeException NAR.NarEntry) of
           Left _ -> True
           Right _ -> False,
+      -- The resolver is the executable-bit source: its answer lands
+      -- verbatim, independent of permissions or extension.
+      test "serialiseFromPathOpts takes the exec bit from the resolver" $ do
+        dir <- caseHackFixture "nova-cache-test-execresolver"
+        BS.writeFile (dir <> "/plain") "p"
+        let opts =
+              NAR.defaultSerialiseOptions
+                { NAR.soCaseHack = NAR.CaseHackDisabled,
+                  NAR.soExecBit = \_ -> pure True
+                }
+        entry <- NAR.serialiseFromPathOpts opts dir
+        removeDirectoryRecursive dir
+        assertEqual
+          "resolver answer"
+          (NAR.NarDirectory [("plain", NAR.NarRegular True "p")])
+          entry,
+      -- The resolver contract, pinned as an exact call set for both
+      -- producers: once per regular file, never for the directory,
+      -- and always the on-disk spelling - under the case hack, the
+      -- suffixed name the walk reads, not the stripped entry name.
+      test "the resolver sees the on-disk case-hacked spelling" $ do
+        dir <- caseHackFixture "nova-cache-test-execdisk"
+        BS.writeFile (dir <> "/Foo") "upper"
+        BS.writeFile (dir <> "/foo~nix~case~hack~1") "lower"
+        seenWalk <- newIORef []
+        seenPlan <- newIORef []
+        let recordingOpts ref =
+              NAR.defaultSerialiseOptions
+                { NAR.soCaseHack = NAR.CaseHackEnabled,
+                  NAR.soExecBit = \path ->
+                    atomicModifyIORef' ref (\paths -> (path : paths, ())) >> pure False
+                }
+            baseName = reverse . takeWhile (\c -> c /= '/' && c /= '\\') . reverse
+        _ <- NAR.serialiseFromPathOpts (recordingOpts seenWalk) dir
+        _ <- NAR.withNarSourceOpts (recordingOpts seenPlan) dir drainSource
+        removeDirectoryRecursive dir
+        walked <- readIORef seenWalk
+        planned <- readIORef seenPlan
+        let expected = ["Foo", "foo~nix~case~hack~1"]
+        walkOk <-
+          assertEqual
+            "eager walk call set"
+            expected
+            (sort (map baseName walked))
+        planOk <-
+          assertEqual
+            "streaming plan call set"
+            expected
+            (sort (map baseName planned))
+        pure (walkOk && planOk),
       -- The walk's boundary encoding: a Unicode disk name enters the
       -- archive as its UTF-8 bytes on every platform.
       test "serialiseFromPath encodes a Unicode disk name as UTF-8" $ do
@@ -765,6 +815,31 @@ testStream =
         streamed <- NAR.withNarSource NAR.CaseHackEnabled dir drainSource
         removeDirectoryRecursive dir
         assertTrue "bytes equal" (NAR.serialise entry == streamed),
+      -- The streaming planner asks the same resolver the eager walk
+      -- does, so a custom executable-bit source streams byte-equal.
+      test "withNarSourceOpts streams the resolver's flags byte-identically" $ do
+        dir <- caseHackFixture "nova-cache-test-narsource-exec"
+        BS.writeFile (dir <> "/doc") "txt"
+        BS.writeFile (dir <> "/tool") "bin"
+        let opts =
+              NAR.defaultSerialiseOptions
+                { NAR.soCaseHack = NAR.CaseHackDisabled,
+                  NAR.soExecBit = \path -> pure ("tool" `isSuffixOf` path)
+                }
+        entry <- NAR.serialiseFromPathOpts opts dir
+        streamed <- NAR.withNarSourceOpts opts dir drainSource
+        removeDirectoryRecursive dir
+        flagsOk <-
+          assertEqual
+            "eager flags"
+            ( NAR.NarDirectory
+                [ ("doc", NAR.NarRegular False "txt"),
+                  ("tool", NAR.NarRegular True "bin")
+                ]
+            )
+            entry
+        bytesOk <- assertTrue "stream equals serialise" (NAR.serialise entry == streamed)
+        pure (flagsOk && bytesOk),
       test "withNarSource keeps returning empty after the end" $ do
         dir <- caseHackFixture "nova-cache-test-narsource-end"
         BS.writeFile (dir <> "/f") "x"

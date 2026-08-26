@@ -29,7 +29,13 @@ module NovaCache.NAR
     narHash,
     serialiseFromPath,
     serialiseFromPathWith,
+    serialiseFromPathOpts,
     withNarSource,
+    withNarSourceOpts,
+    SerialiseOptions (..),
+    defaultSerialiseOptions,
+    ExecBitResolver,
+    defaultExecBitResolver,
     CaseHack (..),
     defaultCaseHack,
     caseHackSuffix,
@@ -277,6 +283,44 @@ defaultCaseHack = case System.Info.os of
 caseHackSuffix :: ByteString
 caseHackSuffix = "~nix~case~hack~"
 
+-- | Answers "is this file executable" for one regular file during a
+-- walk.  Called with the platform-native ON-DISK path - under
+-- 'CaseHackEnabled' that is the suffixed spelling the walk is
+-- reading, not the stripped NAR entry name - and the answer lands
+-- verbatim in the entry's (or stream's) executable flag.  Lets a
+-- store that models the bit outside POSIX permissions (an NTFS
+-- alternate data stream, a sidecar, a database) serialise correct
+-- NAR bytes in the same walk, streaming included.
+--
+-- The path is the walk's own 'decodeFS' rendering: pass it to any
+-- 'FilePath'-taking API as-is; 'encodeFS' it first to compare raw
+-- bytes, since a non-UTF-8 name arrives with surrogate escapes.
+type ExecBitResolver = FilePath -> IO Bool
+
+-- | The stock resolver: 'getPermissions', which answers from
+-- @access(2)@ for the calling process on Unix and from the file
+-- extension on Windows.
+defaultExecBitResolver :: ExecBitResolver
+defaultExecBitResolver path = executable <$> (getPermissions =<< encodeFS path)
+
+-- | How a tree is read for serialisation: the case-hack mode and the
+-- executable-bit source.
+data SerialiseOptions = SerialiseOptions
+  { -- | Directory-name case-hack resolution (see 'CaseHack').
+    soCaseHack :: !CaseHack,
+    -- | Where a regular file's executable flag comes from.
+    soExecBit :: !ExecBitResolver
+  }
+
+-- | 'defaultCaseHack' and 'defaultExecBitResolver': with these,
+-- 'serialiseFromPathOpts' is exactly 'serialiseFromPath'.
+defaultSerialiseOptions :: SerialiseOptions
+defaultSerialiseOptions =
+  SerialiseOptions
+    { soCaseHack = defaultCaseHack,
+      soExecBit = defaultExecBitResolver
+    }
+
 -- | Walk a filesystem path and build a 'NarEntry' under
 -- 'defaultCaseHack'.
 --
@@ -284,36 +328,40 @@ caseHackSuffix = "~nix~case~hack~"
 -- classifies each path as symlink, directory, or regular file and
 -- delegates to pure constructors.
 serialiseFromPath :: FilePath -> IO NarEntry
-serialiseFromPath = serialiseFromPathWith defaultCaseHack
+serialiseFromPath = serialiseFromPathOpts defaultSerialiseOptions
 
 -- | 'serialiseFromPath' with the case-hack mode explicit, for callers
 -- and tests that need behavior independent of the host platform.
 serialiseFromPathWith :: CaseHack -> FilePath -> IO NarEntry
-serialiseFromPathWith mode path = walkPath mode =<< encodeFS path
+serialiseFromPathWith mode = serialiseFromPathOpts defaultSerialiseOptions {soCaseHack = mode}
+
+-- | 'serialiseFromPath' with every knob explicit.
+serialiseFromPathOpts :: SerialiseOptions -> FilePath -> IO NarEntry
+serialiseFromPathOpts opts path = walkPath opts =<< encodeFS path
 
 -- | Walk one platform-native path.  The walk runs on 'OsPath' so child
 -- names reach the archive byte-true ('osPathBytes'); only the root
 -- enters as 'FilePath', and the root's own name never appears in a
 -- NAR.
-walkPath :: CaseHack -> OsPath -> IO NarEntry
-walkPath mode path = do
+walkPath :: SerialiseOptions -> OsPath -> IO NarEntry
+walkPath opts path = do
   isSym <- pathIsSymbolicLink path
   if isSym
     then NarSymlink <$> (osPathBytes =<< getSymbolicLinkTarget path)
     else do
       isDir <- doesDirectoryExist path
       if isDir
-        then buildDirectory mode path
-        else buildRegularFile path
+        then buildDirectory opts path
+        else buildRegularFile (soExecBit opts) path
 
 -- | Build a directory entry by recursively walking children.
-buildDirectory :: CaseHack -> OsPath -> IO NarEntry
-buildDirectory mode path = do
-  resolved <- resolvedDirEntries mode path
+buildDirectory :: SerialiseOptions -> OsPath -> IO NarEntry
+buildDirectory opts path = do
+  resolved <- resolvedDirEntries (soCaseHack opts) path
   NarDirectory <$> traverse walkChild resolved
   where
     walkChild (entryName, diskName) = do
-      entry <- walkPath mode (path </> diskName)
+      entry <- walkPath opts (path </> diskName)
       pure (entryName, entry)
 
 -- | A directory's children as (NAR name, on-disk name) pairs under the
@@ -369,13 +417,13 @@ unhackedDirNames CaseHackEnabled named =
         [] -> Right resolved
 
 -- | Build a regular file entry, checking the executable bit.
-buildRegularFile :: OsPath -> IO NarEntry
-buildRegularFile path = do
+buildRegularFile :: ExecBitResolver -> OsPath -> IO NarEntry
+buildRegularFile resolver path = do
   isFile <- doesFileExist path
   if isFile
     then do
       contents <- readFileBytes path
-      isExec <- checkExecutable path
+      isExec <- resolveExecBit resolver path
       pure (NarRegular isExec contents)
     else specialFileFailure path
 
@@ -389,11 +437,11 @@ specialFileFailure path = do
   shownPath <- decodeFS path
   fail ("serialiseFromPath: not a regular file (special or vanished): " ++ shownPath)
 
--- | Check whether a file has the executable permission set.
--- Uses 'System.Directory.OsPath.getPermissions' which is cross-platform:
--- checks the user-execute bit on Unix, file extension on Windows.
-checkExecutable :: OsPath -> IO Bool
-checkExecutable path = executable <$> getPermissions path
+-- | Run the resolver on a platform-native path.  The resolver contract
+-- is 'FilePath', so the path bridges through 'decodeFS' - the same
+-- interop seam as 'readFileBytes'.
+resolveExecBit :: ExecBitResolver -> OsPath -> IO Bool
+resolveExecBit resolver path = resolver =<< decodeFS path
 
 -- | Read a file's contents by platform-native path.  The byte-string
 -- file API still takes 'FilePath', so the path bridges through
@@ -459,8 +507,9 @@ data SourceState
 
 -- | Serialise a filesystem tree as a pull source of NAR chunks,
 -- without ever holding a file's contents in memory: the tree's
--- structure is planned up front (names, kinds, symlink targets -
--- never contents), then each pull returns the next chunk, reading
+-- structure is planned up front (names, kinds, symlink targets,
+-- executable flags - never contents), so the resolver's IO runs
+-- before the first pull; then each pull returns the next chunk, reading
 -- regular files 128 KiB at a time.  The empty chunk
 -- means end of input and repeats on further pulls - the convention
 -- 'NovaCache.Store.writeNarStreaming' consumes, so the two ends
@@ -475,9 +524,13 @@ data SourceState
 -- mid-stream fails loudly rather than emitting a torn archive.  Any
 -- file handle still open when the continuation exits is closed.
 withNarSource :: CaseHack -> FilePath -> (IO ByteString -> IO a) -> IO a
-withNarSource mode root consume = do
+withNarSource mode = withNarSourceOpts defaultSerialiseOptions {soCaseHack = mode}
+
+-- | 'withNarSource' with every knob explicit.
+withNarSourceOpts :: SerialiseOptions -> FilePath -> (IO ByteString -> IO a) -> IO a
+withNarSourceOpts opts root consume = do
   rootPath <- encodeFS root
-  segments <- planSegments mode rootPath
+  segments <- planSegments opts rootPath
   stateRef <- newIORef (SourceSegments segments)
   consume (pullChunk stateRef) `finally` closeCurrent stateRef
   where
@@ -532,9 +585,9 @@ pullChunk stateRef = advance =<< readIORef stateRef
 -- | Plan the archive: every structural byte rendered, file contents
 -- deferred as 'SegmentFile's.  Holds structure only - O(entries),
 -- never contents.
-planSegments :: CaseHack -> OsPath -> IO [NarSegment]
-planSegments mode path = do
-  pieces <- planNode mode path
+planSegments :: SerialiseOptions -> OsPath -> IO [NarSegment]
+planSegments opts path = do
+  pieces <- planNode opts path
   pure (coalesce (PieceBytes (narStr tokMagic) : pieces))
 
 -- | Plan pieces before coalescing: structural builders, or a deferred
@@ -558,8 +611,8 @@ coalesce = go mempty
        in if BS.null bytes then segments else SegmentBytes bytes : segments
 
 -- | Plan one node, mirroring 'walkPath'.
-planNode :: CaseHack -> OsPath -> IO [PlanPiece]
-planNode mode path = do
+planNode :: SerialiseOptions -> OsPath -> IO [PlanPiece]
+planNode opts path = do
   isSym <- pathIsSymbolicLink path
   if isSym
     then do
@@ -568,15 +621,15 @@ planNode mode path = do
     else do
       isDir <- doesDirectoryExist path
       if isDir
-        then planDirectory mode path
-        else planRegular path
+        then planDirectory opts path
+        else planRegular (soExecBit opts) path
 
 -- | Plan a directory.  Children are ordered by their NAR-name bytes -
 -- the same order 'buildNode' emits - not by on-disk order, which can
 -- differ on Windows where 'OsPath' sorts by UTF-16 units.
-planDirectory :: CaseHack -> OsPath -> IO [PlanPiece]
-planDirectory mode path = do
-  resolved <- resolvedDirEntries mode path
+planDirectory :: SerialiseOptions -> OsPath -> IO [PlanPiece]
+planDirectory opts path = do
+  resolved <- resolvedDirEntries (soCaseHack opts) path
   children <- traverse planChild (sortBy (comparing fst) resolved)
   pure
     ( PieceBytes (narStr tokLParen <> narStr tokType <> narStr tokDirectory)
@@ -585,7 +638,7 @@ planDirectory mode path = do
     )
   where
     planChild (entryName, diskName) = do
-      node <- planNode mode (path </> diskName)
+      node <- planNode opts (path </> diskName)
       pure
         ( PieceBytes
             ( narStr tokEntry
@@ -601,12 +654,12 @@ planDirectory mode path = do
 -- | Plan a regular file: the node's structure now, its contents at
 -- pull time.  The pieces mirror 'buildNode' on 'NarRegular' exactly,
 -- with the contents wire string (length, bytes, padding) deferred.
-planRegular :: OsPath -> IO [PlanPiece]
-planRegular path = do
+planRegular :: ExecBitResolver -> OsPath -> IO [PlanPiece]
+planRegular resolver path = do
   isFile <- doesFileExist path
   if isFile
     then do
-      isExec <- checkExecutable path
+      isExec <- resolveExecBit resolver path
       pure
         [ PieceBytes
             ( narStr tokLParen
