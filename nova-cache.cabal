@@ -4,7 +4,7 @@ cabal-version:      3.4
 -- 3.0 an in-package component name shadowed its external namesake
 -- (the hazard the zstandard library's name dodges, documented there).
 name:               nova-cache
-version:            0.11.0.1
+version:            0.11.1.0
 synopsis:           Pure-first Nix binary cache protocol library
 description:
   A pure-first library implementing the Nix binary cache protocol -
