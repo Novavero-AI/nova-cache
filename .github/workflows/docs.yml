@@ -51,21 +51,41 @@ jobs:
             HADDOCK_FLAGS="--flags=xz"
           fi
           cabal haddock all $HADDOCK_FLAGS --haddock-for-hackage
-          # Same sublibrary grafts as the publish workflow: cabal tars only
-          # the main library's tree; Hackage serves sublibraries as
-          # subdirectories of the one release tree (re-tarred as ustar -
-          # Hackage's tar reader 400s GNU-format headers).  Driven by what
-          # the tag's tree actually built: pre-0.9.0.0 trees have no l/
-          # directory, so an unmatched glob must skip (under -e the bare
-          # loop body would kill the job).  Undo the graft when
-          # haskell/cabal#9577 lands (one tarball spanning every library).
+          # Same flat graft as the publish workflow: Hackage links a
+          # module from the package page only when its HTML sits at the
+          # docs ROOT (docs/<Module>.html), so each sublibrary's module
+          # and source pages move to the root of the one release tree
+          # (re-tarred as ustar - Hackage's tar reader 400s GNU-format
+          # headers).  Collisions fail loudly rather than overwrite.
+          # Driven by what the tag's tree actually built: pre-0.9.0.0
+          # trees have no l/ directory, so an unmatched glob must skip
+          # (under -e the bare loop body would kill the job).  Undo the
+          # graft when haskell/cabal#9577 lands (one tarball spanning
+          # every library).
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
-          GRAFTED=""
+          mkdir -p "$MAIN/src"
+          GRAFTED_PAGES=""
           for LDIR in dist-newstyle/build/*/*/nova-cache-${VERSION}/l/*/; do
             [ -d "$LDIR" ] || continue
             NAME=$(basename "$LDIR")
-            cp -R "$LDIR/doc/html/nova-cache-${VERSION}-docs/$NAME" "$MAIN/$NAME"
-            GRAFTED="$GRAFTED $NAME"
+            SUB="$LDIR/doc/html/nova-cache-${VERSION}-docs/$NAME"
+            COPIED=0
+            for PAGE in "$SUB"/*.html; do
+              [ -e "$PAGE" ] || continue
+              BASE=$(basename "$PAGE")
+              case "$BASE" in index.html|doc-index*.html) continue ;; esac
+              [ -e "$MAIN/$BASE" ] && { echo "collision grafting ${NAME}: ${BASE} exists at the root"; exit 1; }
+              cp "$PAGE" "$MAIN/$BASE"
+              COPIED=$((COPIED + 1))
+              GRAFTED_PAGES="$GRAFTED_PAGES $BASE"
+            done
+            [ "$COPIED" -gt 0 ] || { echo "no module HTML found for sublibrary ${NAME}"; exit 1; }
+            for PAGE in "$SUB"/src/*.html; do
+              [ -e "$PAGE" ] || continue
+              BASE=$(basename "$PAGE")
+              [ -e "$MAIN/src/$BASE" ] && { echo "collision grafting ${NAME} sources: src/${BASE} exists"; exit 1; }
+              cp "$PAGE" "$MAIN/src/$BASE"
+            done
           done
           # cabal names the sublibrary hoogle file nova-cache:xz.txt, and
           # Hackage validates tarball paths as Windows-portable - a colon
@@ -73,16 +93,16 @@ jobs:
           # hoogle database is not rendered documentation; drop it.
           find "$MAIN" -name '*:*' -print -delete
           tar --format=ustar -czf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz" -C "$(dirname "$MAIN")" "nova-cache-${VERSION}-docs"
-          # Every sublibrary grafted above must show a module page in the
-          # final listing - the graft can copy an empty tree if cabal's
-          # layout shifts, and the tarball is all Hackage ever serves.
-          # A hardcoded module list would break on tags that predate a
-          # sublibrary, which is this workflow's whole audience.
+          # Every grafted module page must survive into the tarball at
+          # the root - the graft can copy from a shifted cabal layout,
+          # and the tarball is all Hackage ever serves.  A hardcoded
+          # module list would break on tags that predate a sublibrary,
+          # which is this workflow's whole audience; pre-sublibrary tags
+          # graft nothing and verify nothing.
           LISTING=$(tar -tzf "dist-newstyle/nova-cache-${VERSION}-docs.tar.gz")
-          for NAME in $GRAFTED; do
-            echo "$LISTING" | grep "nova-cache-${VERSION}-docs/${NAME}/" \
-              | grep -v -e '/index\.html$' -e '/doc-index' | grep -q '\.html$' \
-              || { echo "no module HTML for sublibrary ${NAME} in docs tarball"; exit 1; }
+          for BASE in $GRAFTED_PAGES; do
+            echo "$LISTING" | grep -q "^nova-cache-${VERSION}-docs/${BASE}$" \
+              || { echo "grafted ${BASE} missing from the docs root"; exit 1; }
           done
 
       - name: Upload documentation to Hackage
