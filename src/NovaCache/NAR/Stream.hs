@@ -169,8 +169,8 @@ narStream :: NarStep
 narStream = narStreamBounded maxWireStringBytes
 
 -- | The largest structural-string bound 'narStreamBounded' honors:
--- 'Int''s ceiling less alignment headroom, so a payload at the bound
--- still fits 'Int' together with its padding.
+-- the ceiling of 'Int' less alignment headroom, so a payload at the
+-- bound still fits 'Int' together with its padding.
 structuralBoundCeiling :: Word64
 structuralBoundCeiling =
   fromIntegral (maxBound :: Int) - fromIntegral (narAlignment - 1)
