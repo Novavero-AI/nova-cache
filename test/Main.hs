@@ -31,7 +31,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectory, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, setOwnerExecutable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
@@ -517,6 +517,28 @@ testNAR =
           "resolver answer"
           (NAR.NarDirectory [("plain", NAR.NarRegular True "p")])
           entry,
+      -- A real on-disk exec bit round-trips through the default
+      -- resolver; no earlier fixture ever set one.  POSIX-gated:
+      -- Windows has no mode bit for the default to read.
+      test "a real owner-exec bit round-trips from disk" $
+        if System.Info.os == "mingw32"
+          then pure True
+          else do
+            dir <- caseHackFixture "nova-cache-test-realexec"
+            BS.writeFile (dir <> "/doc") "txt"
+            BS.writeFile (dir <> "/tool") "bin"
+            perms <- getPermissions (dir <> "/tool")
+            setPermissions (dir <> "/tool") (setOwnerExecutable True perms)
+            entry <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+            removeDirectoryRecursive dir
+            assertEqual
+              "owner bit from the file mode"
+              ( NAR.NarDirectory
+                  [ ("doc", NAR.NarRegular False "txt"),
+                    ("tool", NAR.NarRegular True "bin")
+                  ]
+              )
+              entry,
       -- The resolver contract, pinned as an exact call set for both
       -- producers: once per regular file, never for the directory,
       -- and always the on-disk spelling - under the case hack, the
