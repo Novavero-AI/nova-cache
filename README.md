@@ -118,7 +118,7 @@ cabal build
 cabal test
 ```
 
-Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz`, `nova-cache:bzip2`, and `nova-cache:zstandard` sublibraries carry the bounded codecs (liblzma, libbz2, and libzstd are bundled - no system libraries needed) - consumers depend on them with `build-depends: nova-cache:xz` and the like. Requires GHC 9.14+ and cabal-install 3.10+.
+Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz`, `nova-cache:bzip2`, and `nova-cache:zstandard` sublibraries carry the bounded codecs - consumers depend on them with `build-depends: nova-cache:xz` and the like. libbz2 and libzstd are bundled; liblzma comes from the `xz` package, which prefers a pkg-config system liblzma and falls back to its bundled `xz-clib` (pin `constraints: xz -system-xz` to force the bundled copy, as this repo's cabal.project does). Requires GHC 9.14+ and cabal-install 3.10+.
 
 ---
 
