@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.1.1 - 2026-08-26
 
 - **A symlink target with a separator serialises to its POSIX spelling on every platform.** Windows stores a symlink's reparse point with backslashes, so a target written `bin/tool` reads back `bin\tool`, and `getSymbolicLinkTarget` returned that verbatim into the NAR. NAR targets are host-independent byte strings in the POSIX spelling, so the archive of the same logical tree diverged between Windows and POSIX, and an unpack-then-recheck round-trip failed its on-disk hash comparison on Windows for any symlink whose target had more than one component. Both producers now normalise the separator to `/` when reading a target on Windows, where a backslash is only ever a separator and encodes as the single byte `0x5C` that no multi-byte UTF-8 sequence contains, so the byte-level replacement is exact. POSIX is untouched, where a backslash is a legitimate filename byte.
 
