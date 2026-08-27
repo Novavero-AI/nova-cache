@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **A symlink target with a separator serialises to its POSIX spelling on every platform.** Windows stores a symlink's reparse point with backslashes, so a target written `bin/tool` reads back `bin\tool`, and `getSymbolicLinkTarget` returned that verbatim into the NAR. NAR targets are host-independent byte strings in the POSIX spelling, so the archive of the same logical tree diverged between Windows and POSIX, and an unpack-then-recheck round-trip failed its on-disk hash comparison on Windows for any symlink whose target had more than one component. Both producers now normalise the separator to `/` when reading a target on Windows, where a backslash is only ever a separator and encodes as the single byte `0x5C` that no multi-byte UTF-8 sequence contains, so the byte-level replacement is exact. POSIX is untouched, where a backslash is a legitimate filename byte.
+
 ## 0.11.1.0 - 2026-08-26
 
 - **The default executable answer on POSIX is the file's own owner-execute bit, matching upstream's dump.** `defaultExecBitResolver` (and so both producers before any custom resolver) read `getPermissions`, which answers from `access(2)`: what the calling process may do. Root read any execute bit as executable, ACLs counted, and a file the caller does not own answered by the caller's groups; upstream reads `st_mode & S_IXUSR`, a property of the file alone, and the flag lands in NAR bytes, so the divergence moved a hash exactly where the caller was unusual. The POSIX default now reads the mode bit directly; Windows keeps the extension answer, which is all the platform has.

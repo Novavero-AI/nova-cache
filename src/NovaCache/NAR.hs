@@ -364,7 +364,7 @@ walkPath :: SerialiseOptions -> OsPath -> IO NarEntry
 walkPath opts path = do
   isSym <- pathIsSymbolicLink path
   if isSym
-    then NarSymlink <$> (osPathBytes =<< getSymbolicLinkTarget path)
+    then NarSymlink <$> (symlinkTargetBytes =<< getSymbolicLinkTarget path)
     else do
       isDir <- doesDirectoryExist path
       if isDir
@@ -492,6 +492,26 @@ osPathBytes path = case OP.decodeWith latin1 latin1 path of
     -- point N, and Char8 re-truncation above inverts it exactly - but
     -- surfacing the impossible beats hiding it.
     fail ("serialiseFromPath: undecodable name: " ++ show err)
+#endif
+
+-- | A symlink target's NAR bytes.  Identical to 'osPathBytes' for a name,
+-- except that on Windows the separator is normalised to @\/@: Windows
+-- stores a reparse point with backslashes, so a target written @bin\/tool@
+-- reads back @bin\\tool@, and a NAR target is the POSIX spelling on every
+-- platform so the archive stays host-independent.  A backslash is only
+-- ever a separator on Windows, never a filename byte, and it encodes as
+-- the single byte @0x5C@ that no multi-byte UTF-8 sequence contains, so
+-- the byte-level replacement is exact.  On POSIX a backslash is a
+-- legitimate filename byte and is left untouched.
+symlinkTargetBytes :: OsPath -> IO ByteString
+#ifdef mingw32_HOST_OS
+symlinkTargetBytes path = BS.map normalizeSeparator <$> osPathBytes path
+  where
+    normalizeSeparator b = if b == backslashByte then forwardSlashByte else b
+    backslashByte = 0x5C
+    forwardSlashByte = 0x2F
+#else
+symlinkTargetBytes = osPathBytes
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -633,7 +653,7 @@ planNode opts path = do
   isSym <- pathIsSymbolicLink path
   if isSym
     then do
-      target <- osPathBytes =<< getSymbolicLinkTarget path
+      target <- symlinkTargetBytes =<< getSymbolicLinkTarget path
       pure [PieceBytes (buildNode (NarSymlink target))]
     else do
       isDir <- doesDirectoryExist path
