@@ -31,7 +31,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, setOwnerExecutable, setPermissions)
+import System.Directory (createDirectory, createFileLink, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, setOwnerExecutable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
@@ -573,6 +573,27 @@ testNAR =
             expected
             (sort (map baseName planned))
         pure (walkOk && planOk),
+      -- A symlink target with a separator serialises to the POSIX
+      -- spelling on every platform (nova-nix #112): Windows stores a
+      -- reparse point with backslashes, so a target written bin/tool
+      -- reads back bin\tool, and an unpack-then-recheck round-trip
+      -- diverges from the archive unless the NAR boundary normalises
+      -- it.  Both producers must agree with the forward-slash form.
+      -- Guarded on symlink privilege, which a Windows runner without
+      -- developer mode lacks.
+      test "a separator-bearing symlink target serialises with forward slashes" $ do
+        dir <- caseHackFixture "nova-cache-test-symlinksep"
+        created <- try (createFileLink "bin/tool" (dir <> "/link")) :: IO (Either SomeException ())
+        case created of
+          Left _ -> removeDirectoryRecursive dir >> pure True
+          Right () -> do
+            let expectedEntry = NAR.NarDirectory [("link", NAR.NarSymlink "bin/tool")]
+            eager <- NAR.serialiseFromPathWith NAR.CaseHackDisabled dir
+            streamed <- NAR.withNarSource NAR.CaseHackDisabled dir drainSource
+            removeDirectoryRecursive dir
+            eagerOk <- assertEqual "eager target spelling" expectedEntry eager
+            streamOk <- assertEqual "streamed target spelling" (NAR.serialise expectedEntry) streamed
+            pure (eagerOk && streamOk),
       -- The walk's boundary encoding: a Unicode disk name enters the
       -- archive as its UTF-8 bytes on every platform.
       test "serialiseFromPath encodes a Unicode disk name as UTF-8" $ do
