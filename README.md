@@ -1,22 +1,37 @@
-<div align="center">
-<h1>nova-cache</h1>
-<p><strong>The Nix binary cache protocol, in Haskell.</strong></p>
-<p>nix-base32, NAR archives (strict and streaming), narinfo, store paths, Ed25519 signing, and bounded xz, zstd, and bzip2 codecs as the public nova-cache:xz, nova-cache:zstandard, and nova-cache:bzip2 sublibraries (decompression bounded, zstd compression for the push direction) - with an optional WAI cache server. A pure core; IO is confined to the storage and server boundaries.</p>
+# nova-cache
 
 [![CI](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/Novavero-AI/nova-cache/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/nova-cache.svg)](https://hackage.haskell.org/package/nova-cache)
-![GHC](https://img.shields.io/badge/GHC-9.14-purple)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-</div>
+nova-cache implements the Nix binary cache protocol in Haskell: nix-base32,
+NAR serialization (whole-tree and streaming), narinfo parsing, store paths,
+Ed25519 signing and upload validation, and an optional WAI cache server.
+Bounded xz, zstd and bzip2 codecs are the public `nova-cache:xz`,
+`nova-cache:zstandard` and `nova-cache:bzip2` sublibraries, and the zstd codec
+also compresses for uploads.
 
----
+Parsing, formatting, hashing, signing and validation are pure. Reading and
+writing trees, hashing files, the codecs, the store and the server run in
+`IO`. nova-cache is the protocol layer under
+[nova-nix](https://github.com/Novavero-AI/nova-nix).
 
 ## Installation
 
 ```cabal
-build-depends: nova-cache
+build-depends: nova-cache >= 0.11 && < 0.12
 ```
+
+The codecs are separate sublibraries, named alongside the main library:
+
+```cabal
+build-depends: nova-cache:{nova-cache, xz, zstandard} >= 0.11 && < 0.12
+```
+
+libbz2 and libzstd are bundled. liblzma comes from the `xz` package, which
+prefers a system liblzma found through pkg-config and falls back to its bundled
+sources. `constraints: xz -system-xz` in `cabal.project` forces the bundled
+copy, as this repository does.
 
 ## Usage
 
@@ -41,23 +56,21 @@ case (parseNarInfo raw, parseSecretKey "mykey:base64...") of
 ```haskell
 import NovaCache.Validate (validateFull)
 
--- Validate an upload: fields + NAR hash + file hash + signatures.
--- Pure, and every error is collected rather than failing on the first.
+-- Validate an upload: fields, NAR hash, file hash and signatures. Every
+-- error is collected rather than stopping at the first.
 case validateFull publicKey ni narBytes fileBytes of
   Right ()  -> accept
   Left errs -> reject errs
 ```
 
 ```haskell
+import qualified Data.ByteString as BS
 import NovaCache.NAR (defaultCaseHack, withNarSource)
 import qualified NovaCache.Hash as Hash
 
--- Stream a tree's NAR and hash it in one pass; the archive never
--- exists in memory. The parsing side is NovaCache.NAR.Stream, a
--- chunk-fed event machine; the nova-cache:xz, nova-cache:zstandard,
--- and nova-cache:bzip2 sublibraries add decompression bounded by a
--- narinfo's declared NarSize, and the zstd side also compresses for
--- the push direction.
+-- Stream a tree's NAR and hash it in one pass, without holding the archive
+-- in memory. NovaCache.NAR.Stream parses NARs incrementally, and the codec
+-- sublibraries bound decompression by a narinfo's declared NarSize.
 narHash <- withNarSource defaultCaseHack path $ \pull ->
   let go ctx = do
         chunk <- pull
@@ -73,9 +86,9 @@ narHash <- withNarSource defaultCaseHack path $ \pull ->
 cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
 ```
 
-The protocol itself lives in the `NovaCache.Server` library module as a WAI
-`Application`, so any operator can embed the cache in their own server with
-their own root page; the bundled executable is one such embedding.
+The protocol lives in the `NovaCache.Server` library module as a WAI
+`Application`, so the cache can be embedded in another server with its own
+root page. The bundled executable is one such embedding.
 
 ### Configuration
 
@@ -83,7 +96,7 @@ their own root page; the bundled executable is one such embedding.
 | --- | --- |
 | `PORT` | Listen port (default: 5000; also `--port`) |
 | `HOST` | Bind host (default: all interfaces; also `--host`) |
-| `NIX_CACHE_DIR` | Store directory (default: `./nix-cache`) |
+| `NIX_CACHE_DIR` | Store directory (default: `./nix-cache`; also `--store`) |
 | `CACHE_API_KEY` | Bearer token required for `PUT`. The server refuses to start without it unless `--allow-open-writes` is passed. |
 | `SIGNING_KEY_FILE` | Ed25519 secret key file for server-side narinfo signing |
 | `LOG_REQUESTS` | Set to `0` to disable request logging |
@@ -104,22 +117,27 @@ their own root page; the bundled executable is one such embedding.
 
 ### Public cache
 
-A public instance runs at `cache.novavero.ai`:
+A public instance runs at `cache.novavero.ai`. It serves store paths that
+nova-nix builds, which today means its Windows MinGW-w64 toolchain seed
+([nova-nix#207](https://github.com/Novavero-AI/nova-nix/issues/207)). To use
+it from Nix, add it to `/etc/nix/nix.conf`. On a multi-user install, Nix
+ignores substituters set by users it does not trust.
 
 ```
 extra-substituters = https://cache.novavero.ai
 extra-trusted-public-keys = cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
 ```
 
-## Build & test
+## Building from source
+
+Tested with GHC 9.14.1. CI uses the latest cabal-install release.
 
 ```bash
-cabal build
-cabal test
+cabal update
+cabal build all -f server --enable-tests --ghc-options="-Werror"
+cabal test -f server --ghc-options="-Werror"
 ```
 
-Optional extras: `--flag server` builds the cache server, and the public `nova-cache:xz`, `nova-cache:bzip2`, and `nova-cache:zstandard` sublibraries carry the bounded codecs - consumers depend on them with `build-depends: nova-cache:xz` and the like. libbz2 and libzstd are bundled; liblzma comes from the `xz` package, which prefers a pkg-config system liblzma and falls back to its bundled `xz-clib` (pin `constraints: xz -system-xz` to force the bundled copy, as this repo's cabal.project does). Requires GHC 9.14+ and cabal-install 3.10+.
+## License
 
----
-
-<p align="center"><sub>Apache-2.0 - <a href="https://github.com/Novavero-AI">Novavero AI Inc.</a></sub></p>
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

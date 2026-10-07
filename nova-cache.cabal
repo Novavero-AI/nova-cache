@@ -5,14 +5,13 @@ cabal-version:      3.4
 -- (the hazard the zstandard library's name dodges, documented there).
 name:               nova-cache
 version:            0.11.1.1
-synopsis:           Pure-first Nix binary cache protocol library
+synopsis:           Nix binary cache protocol: NAR, narinfo, signing and a WAI server
 description:
-  A pure-first library implementing the Nix binary cache protocol -
-  nix-base32, NAR serialization (whole-tree and streaming), narinfo
-  parsing, Ed25519 signing, store path handling, and content
-  validation - with an optional WAI server, and bounded xz, bzip2,
-  and zstd codecs as the public @nova-cache:xz@, @nova-cache:bzip2@,
-  and @nova-cache:zstandard@ sublibraries.
+  The Nix binary cache protocol in Haskell: nix-base32, NAR serialization
+  (whole-tree and streaming), narinfo parsing, store paths, Ed25519
+  signing and upload validation, with an optional WAI cache server.
+  Bounded xz, bzip2 and zstd codecs are the public @nova-cache:xz@,
+  @nova-cache:bzip2@ and @nova-cache:zstandard@ sublibraries.
 
 license:            Apache-2.0
 license-file:       LICENSE
