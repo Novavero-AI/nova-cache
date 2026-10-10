@@ -14,7 +14,7 @@
 -- GET  \/\<hash\>.narinfo      narinfo by store-path hash
 -- GET  \/nar\/\<file\>          NAR payload (streamed from disk)
 -- GET  \/narinfo-hashes      stored-hash listing (authenticated; push-tool plumbing)
--- PUT  \/\<hash\>.narinfo      validated, signed, stored (authenticated)
+-- PUT  \/\<hash\>.narinfo      validated, checked against its stored NAR, signed, stored (authenticated)
 -- PUT  \/nar\/\<file\>          streamed to disk under a size cap (authenticated)
 -- @
 --
@@ -42,9 +42,19 @@ module NovaCache.Server
     narInfoHashMatches,
     signNarInfo,
     renderCacheInfo,
+
+    -- * Stored NAR check
+    NarClaim (..),
+    StoredNar (..),
+    NarRefusal (..),
+    narUrlFileName,
+    narClaim,
+    judgeStoredNar,
+    renderNarRefusal,
   )
 where
 
+import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import Data.ByteArray (constEq)
 import Data.ByteString (ByteString)
@@ -71,6 +81,7 @@ import Network.Wai
     responseFile,
     responseLBS,
   )
+import NovaCache.Hash (NixHash, formatNixHash, hashFinalize, hashInit, hashUpdate, parseNixHash)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (SecretKey, sign)
 import NovaCache.Store
@@ -81,12 +92,13 @@ import NovaCache.Store
     listNarInfoHashes,
     narFilePath,
     readNarInfo,
+    sanitizePath,
     writeNarInfo,
     writeNarStreaming,
   )
 import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
-import System.IO (hPutStrLn, stderr)
+import System.IO (IOMode (ReadMode), hPutStrLn, stderr, withBinaryFile)
 
 -- ---------------------------------------------------------------------------
 -- Constants
@@ -105,6 +117,14 @@ maxNarBodySize = 4 * 1024 * 1024 * 1024 -- 4 GB
 -- | Suffix of narinfo request paths (@\/\<hash\>.narinfo@).
 narInfoSuffix :: Text
 narInfoSuffix = ".narinfo"
+
+-- | First path segment of NAR request paths (@\/nar\/\<file\>@).
+narRouteSegment :: Text
+narRouteSegment = "nar"
+
+-- | Bytes read per step while hashing a stored NAR.
+storedNarReadBytes :: Int
+storedNarReadBytes = 128 * 1024
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -189,42 +209,23 @@ cacheApp cfg req respond = case (routeMethod, pathInfo req) of
             respond notFound
   -- GET /nar/<file> - handed to the transport layer as a file so the
   -- OS streams it; a multi-GB NAR never transits the Haskell heap.
-  ("GET", ["nar", fileName]) -> do
-    found <- narFilePath (scStore cfg) fileName
-    case found of
-      Just path ->
-        respond (responseFile HTTP.status200 octetHeaders path Nothing)
-      Nothing ->
-        respond notFound
+  ("GET", segments)
+    | Just fileName <- narRoute segments -> do
+        found <- narFilePath (scStore cfg) fileName
+        case found of
+          Just path ->
+            respond (responseFile HTTP.status200 octetHeaders path Nothing)
+          Nothing ->
+            respond notFound
   -- PUT /<hash>.narinfo (auth required, validated)
   ("PUT", [hashNarinfo])
     | Just hashKey <- T.stripSuffix narInfoSuffix hashNarinfo ->
         requireAuth cfg req respond $
-          withLimitedBody maxNarInfoBodySize req respond $ \body ->
-            case decodeAndValidate body of
-              Left err -> do
-                logWarn req ("INVALID: " <> T.unpack err)
-                respond (badRequest err)
-              Right ni
-                | not (narInfoHashMatches hashKey ni) -> do
-                    logWarn req "HASHMISMATCH"
-                    respond (badRequest "narinfo StorePath hash does not match request")
-                | otherwise -> do
-                    signedResult <- signNarInfo (scSigningKey cfg) ni
-                    case signedResult of
-                      Left err -> do
-                        logWarn req ("SIGNFAIL: " <> err)
-                        respond (responseLBS HTTP.status500 textHeaders "signing failed")
-                      Right signed -> do
-                        ok <- writeNarInfo (scStore cfg) hashKey signed
-                        if ok
-                          then respond (responseLBS HTTP.status200 textHeaders "ok")
-                          else do
-                            logWarn req "BADPATH"
-                            respond (badRequest "invalid path")
+          withLimitedBody maxNarInfoBodySize req respond (putNarInfo cfg req respond hashKey)
   -- PUT /nar/<file> (auth required, streamed)
-  ("PUT", ["nar", fileName]) ->
-    requireAuth cfg req respond (putNar cfg req respond fileName)
+  ("PUT", segments)
+    | Just fileName <- narRoute segments ->
+        requireAuth cfg req respond (putNar cfg req respond fileName)
   -- Fallback
   _ ->
     respond notFound
@@ -236,6 +237,36 @@ cacheApp cfg req respond = case (routeMethod, pathInfo req) of
       if requestMethod req == HTTP.methodHead
         then HTTP.methodGet
         else requestMethod req
+
+-- | The file a @\/nar\/\<file\>@ request path names.
+narRoute :: [Text] -> Maybe Text
+narRoute [segment, fileName] | segment == narRouteSegment = Just fileName
+narRoute _ = Nothing
+
+-- | Validate a narinfo upload, check it against the NAR it names, then
+-- sign and store it.
+putNarInfo :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> ByteString -> IO ResponseReceived
+putNarInfo cfg req respond hashKey body = case decodeAndValidate body of
+  Left err -> do
+    logWarn req ("INVALID: " <> T.unpack err)
+    respond (badRequest err)
+  Right ni
+    | not (narInfoHashMatches hashKey ni) -> do
+        logWarn req "HASHMISMATCH"
+        respond (badRequest "narinfo StorePath hash does not match request")
+    | otherwise -> requireStoredNar (scStore cfg) req respond ni $ do
+        signedResult <- signNarInfo (scSigningKey cfg) ni
+        case signedResult of
+          Left err -> do
+            logWarn req ("SIGNFAIL: " <> err)
+            respond (responseLBS HTTP.status500 textHeaders "signing failed")
+          Right signed -> do
+            ok <- writeNarInfo (scStore cfg) hashKey signed
+            if ok
+              then respond (responseLBS HTTP.status200 textHeaders "ok")
+              else do
+                logWarn req "BADPATH"
+                respond (badRequest "invalid path")
 
 -- | Stream a NAR upload into the store.  A declared @Content-Length@ over
 -- the cap is refused before reading anything; chunked or lying transfers
@@ -280,6 +311,146 @@ narInfoHashMatches hashKey ni =
   case parseStorePath defaultStoreDir (niStorePath ni) of
     Right sp -> storePathHashString sp == hashKey
     Left _ -> False
+
+-- ---------------------------------------------------------------------------
+-- Stored NAR check
+-- ---------------------------------------------------------------------------
+
+-- | What a narinfo declares about the NAR its URL names: the file's name
+-- under @nar\/@, and the size and SHA-256 it must have.
+data NarClaim = NarClaim
+  { ncFileName :: !Text,
+    ncFileSize :: !Integer,
+    ncFileHash :: !NixHash
+  }
+  deriving (Eq, Show)
+
+-- | A stored NAR as read: its size in bytes and its SHA-256.
+data StoredNar = StoredNar
+  { snSize :: !Integer,
+    snHash :: !NixHash
+  }
+  deriving (Eq, Show)
+
+-- | Why a narinfo is refused over the NAR its URL names.
+data NarRefusal
+  = -- | The URL names no file this cache serves under @nar\/@.
+    NarUrlNotServed !Text
+  | -- | No FileSize, so a short NAR could not be told from a whole one.
+    NarFileSizeUndeclared
+  | -- | No FileHash, so a NAR of the right size and the wrong content
+    -- could not be told from the right one.
+    NarFileHashUndeclared
+  | -- | The FileHash does not parse. (raw value, parse error)
+    NarFileHashInvalid !Text !String
+  | -- | No file is stored under the name.
+    NarNotStored !Text
+  | -- | The stored file has another size. (name, declared, stored)
+    NarSizeMismatch !Text !Integer !Integer
+  | -- | The stored file has other content. (name, declared, stored)
+    NarHashMismatch !Text !NixHash !NixHash
+  deriving (Eq, Show)
+
+-- | The file under @nar\/@ a GET for a narinfo's URL is routed to.
+-- Upstream requests a relative URL at the cache URI joined by a slash
+-- (@HttpBinaryCacheStore::makeRequest@), and Warp cuts the request
+-- target at its first @?@ and splits and percent-decodes the path with
+-- 'HTTP.decodePathSegments' into 'pathInfo', which is what
+-- 'HTTP.decodePath' does to the same bytes.  An absolute URL is fetched
+-- from its own host, and resolves here to segments no route matches.
+narUrlFileName :: Text -> Maybe Text
+narUrlFileName url = narRoute (fst (HTTP.decodePath ("/" <> TE.encodeUtf8 url)))
+
+-- | Read what a narinfo declares about its NAR.  A writer that omits
+-- FileSize or FileHash is refused rather than half-checked: upstream's
+-- @BinaryCacheStore::addToStoreCommon@ and nova-nix's push both always
+-- send them, and the signature this cache adds does not cover them, so
+-- they are the only record of which file the narinfo describes.
+narClaim :: NarInfo -> Either NarRefusal NarClaim
+narClaim ni = do
+  fileName <- maybe (Left (NarUrlNotServed (niUrl ni))) Right (narUrlFileName (niUrl ni) >>= storable)
+  fileSize <- maybe (Left NarFileSizeUndeclared) Right (niFileSize ni)
+  declaredHash <- maybe (Left NarFileHashUndeclared) Right (niFileHash ni)
+  fileHash <- first (NarFileHashInvalid declaredHash) (parseNixHash declaredHash)
+  pure NarClaim {ncFileName = fileName, ncFileSize = fileSize, ncFileHash = fileHash}
+  where
+    -- The router percent-decodes leniently, but every name the store
+    -- admits is ASCII, so bytes that are not UTF-8 never name a file.
+    storable name = name <$ sanitizePath name
+
+-- | Accept the stored NAR only when it is the file the narinfo declares:
+-- present, FileSize bytes long, and hashing to FileHash.
+judgeStoredNar :: NarClaim -> Maybe StoredNar -> Either NarRefusal ()
+judgeStoredNar claim stored = case stored of
+  Nothing -> Left (NarNotStored name)
+  Just (StoredNar size digest)
+    | size /= ncFileSize claim -> Left (NarSizeMismatch name (ncFileSize claim) size)
+    | digest /= ncFileHash claim -> Left (NarHashMismatch name (ncFileHash claim) digest)
+    | otherwise -> Right ()
+  where
+    name = ncFileName claim
+
+-- | The message a refused narinfo upload answers with.
+renderNarRefusal :: NarRefusal -> Text
+renderNarRefusal refusal = case refusal of
+  NarUrlNotServed url ->
+    "narinfo URL " <> url <> " does not name a file under " <> narRouteSegment <> "/"
+  NarFileSizeUndeclared ->
+    "narinfo declares no FileSize to check its NAR against"
+  NarFileHashUndeclared ->
+    "narinfo declares no FileHash to check its NAR against"
+  NarFileHashInvalid raw err ->
+    "narinfo FileHash " <> raw <> " does not parse: " <> T.pack err
+  NarNotStored name ->
+    "NAR " <> narPath name <> " is not stored; upload it before its narinfo"
+  NarSizeMismatch name declared stored ->
+    "NAR " <> narPath name <> " is " <> showText stored <> " bytes, narinfo FileSize is " <> showText declared
+  NarHashMismatch name declared stored ->
+    "NAR " <> narPath name <> " hashes to " <> formatNixHash stored <> ", narinfo FileHash is " <> formatNixHash declared
+  where
+    showText = T.pack . show
+
+-- | The request path, relative to the cache root, that serves a NAR.
+narPath :: Text -> Text
+narPath name = narRouteSegment <> "/" <> name
+
+-- | Gate a narinfo write on the NAR it names (see 'narClaim' and
+-- 'judgeStoredNar').  A refusal is a 400 naming the problem.  A stored
+-- NAR that cannot be read is the server's own failure, a 500 like a
+-- signing failure, with the exception logged and kept out of the
+-- response.
+requireStoredNar :: FileStore -> Request -> (Response -> IO ResponseReceived) -> NarInfo -> IO ResponseReceived -> IO ResponseReceived
+requireStoredNar store req respond ni action = case narClaim ni of
+  Left refusal -> refuse refusal
+  Right claim -> do
+    stored <- readStoredNar store (ncFileName claim)
+    case stored of
+      Left err -> do
+        logWarn req ("NARREAD: " <> show err)
+        respond (responseLBS HTTP.status500 textHeaders (textBody ("NAR " <> narPath (ncFileName claim) <> " could not be read")))
+      Right found -> either refuse (const action) (judgeStoredNar claim found)
+  where
+    refuse refusal = do
+      let msg = renderNarRefusal refusal
+      logWarn req ("BADNAR: " <> T.unpack msg)
+      respond (badRequest msg)
+
+-- | Read a stored NAR through once in constant memory, for its size and
+-- SHA-256; 'Nothing' when no file is stored under the name.  The name
+-- resolves through 'narFilePath', as @GET \/nar\/\<file\>@ does.
+--
+-- An upload of the same name while this reads is renamed into place,
+-- and on POSIX the open handle keeps reading the file it opened, so
+-- the result describes one whole upload or the other, never a mix.
+readStoredNar :: FileStore -> Text -> IO (Either IOException (Maybe StoredNar))
+readStoredNar store fileName = try (traverse measure =<< narFilePath store fileName)
+  where
+    measure path = withBinaryFile path ReadMode (consume 0 hashInit)
+    consume !size !ctx handle = do
+      chunk <- BS.hGetSome handle storedNarReadBytes
+      if BS.null chunk
+        then pure StoredNar {snSize = size, snHash = hashFinalize ctx}
+        else consume (size + fromIntegral (BS.length chunk)) (hashUpdate ctx chunk) handle
 
 -- ---------------------------------------------------------------------------
 -- Request body limiting
@@ -402,7 +573,11 @@ notFound = responseLBS HTTP.status404 textHeaders "not found"
 
 -- | 400 Bad Request with a text error message.
 badRequest :: Text -> Response
-badRequest msg = responseLBS HTTP.status400 textHeaders (BL.fromStrict (TE.encodeUtf8 msg))
+badRequest msg = responseLBS HTTP.status400 textHeaders (textBody msg)
+
+-- | A text response body.
+textBody :: Text -> BL.ByteString
+textBody = BL.fromStrict . TE.encodeUtf8
 
 -- | Map any uncaught handler exception to a generic 500, so internal error
 -- detail (filesystem paths, exception text) is never leaked to clients.

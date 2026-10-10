@@ -110,7 +110,7 @@ root page. The bundled executable is one such embedding.
 | `GET` | `/narinfo-hashes` | All cached narinfo hashes, newline-delimited (authenticated) |
 | `GET` | `/<hash>.narinfo` | Fetch a narinfo |
 | `GET` | `/nar/<file>` | Fetch a NAR (streamed from disk) |
-| `PUT` | `/<hash>.narinfo` | Upload a narinfo (authenticated, validated) |
+| `PUT` | `/<hash>.narinfo` | Upload a narinfo (authenticated, validated; refused unless the NAR its `URL` names is stored with its `FileSize` and `FileHash`) |
 | `PUT` | `/nar/<file>` | Upload a NAR (authenticated, streamed to disk) |
 
 `HEAD` is answered wherever `GET` is.
