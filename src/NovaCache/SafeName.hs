@@ -28,8 +28,7 @@ import Data.Char (isAsciiUpper, isDigit, toLower)
 -- form)?  The comparison runs on the stem - the portion before the
 -- first dot, trailing spaces trimmed - since @nul.txt@ and @NUL .txt@
 -- also open the device.  Surfaced to store writers through
--- 'NovaCache.NAR.Stream.isWindowsHazardName', and kept in step with
--- the twin guard nova-nix applies when it materializes NAR entries.
+-- 'NovaCache.NAR.Stream.isWindowsHazardName'.
 --
 -- Device matching is ASCII case-insensitive, so only @A@-@Z@ fold; any
 -- other byte passes through and can never match the named set.
