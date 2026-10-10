@@ -9,8 +9,9 @@ import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as BL
-import Data.Either (isLeft)
+import Data.Either (isLeft, isRight)
 import Data.Foldable (toList)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (isSuffixOf, sort)
@@ -37,11 +38,11 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, createFileLink, doesDirectoryExist, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, removeFile, setModificationTime, setOwnerExecutable, setPermissions)
+import System.Directory (createDirectory, createFileLink, doesDirectoryExist, emptyPermissions, getPermissions, getTemporaryDirectory, listDirectory, readable, removeDirectoryRecursive, removeFile, setModificationTime, setOwnerExecutable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
-import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, choose, elements, forAll, frequency, listOf, listOf1, quickCheckWithResult, stdArgs, sublistOf, suchThat, (===))
+import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, listOf, listOf1, oneof, quickCheckWithResult, stdArgs, sublistOf, suchThat, vectorOf, (===))
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -148,7 +149,8 @@ main = do
       testFileStore,
       testReclaim,
       testValidate,
-      testServer
+      testServer,
+      testStoredNarCheck
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1817,16 +1819,25 @@ validNarInfoHashKey = T.replicate 32 "0"
 zeroNarHash :: Text
 zeroNarHash = "sha256:" <> T.replicate 52 "0"
 
+-- | The file 'validServerNarInfo' names under @nar\/@.
+serverNarName :: Text
+serverNarName = "test.nar"
+
+-- | The bytes 'validServerNarInfo' declares for its NAR.
+serverNarBytes :: ByteString
+serverNarBytes = "nar-payload-bytes"
+
 -- | A narinfo that passes 'Validate.validateNarInfo' end to end, keyed
--- under 'validNarInfoHashKey'.
+-- under 'validNarInfoHashKey', describing 'serverNarBytes' stored as
+-- 'serverNarName'.
 validServerNarInfo :: NarInfo.NarInfo
 validServerNarInfo =
   NarInfo.NarInfo
     { NarInfo.niStorePath = "/nix/store/" <> validNarInfoHashKey <> "-hello-1.0",
-      NarInfo.niUrl = "nar/test.nar",
+      NarInfo.niUrl = "nar/" <> serverNarName,
       NarInfo.niCompression = "none",
-      NarInfo.niFileHash = Nothing,
-      NarInfo.niFileSize = Nothing,
+      NarInfo.niFileHash = Just (Hash.formatNixHash (Hash.hashBytes serverNarBytes)),
+      NarInfo.niFileSize = Just (fromIntegral (BS.length serverNarBytes)),
       NarInfo.niNarHash = zeroNarHash,
       NarInfo.niNarSize = 200,
       NarInfo.niReferences = [validNarInfoHashKey <> "-hello-1.0"],
@@ -1837,8 +1848,28 @@ validServerNarInfo =
 
 -- | Rendered wire form of 'validServerNarInfo'.
 validServerNarInfoBytes :: BL.ByteString
-validServerNarInfoBytes =
-  BL.fromStrict (TE.encodeUtf8 (NarInfo.renderNarInfo validServerNarInfo))
+validServerNarInfoBytes = renderNarInfoBody validServerNarInfo
+
+-- | A narinfo's wire form as a request body.
+renderNarInfoBody :: NarInfo.NarInfo -> BL.ByteString
+renderNarInfoBody = BL.fromStrict . TE.encodeUtf8 . NarInfo.renderNarInfo
+
+-- | Upload bytes as 'serverNarName', authenticated.
+putServerNar :: Server.ServerConfig -> ByteString -> IO WT.SResponse
+putServerNar cfg bytes = serverRequest cfg "PUT" ["nar", serverNarName] [serverAuthHeader] (BL.fromStrict bytes)
+
+-- | Upload a narinfo under 'validNarInfoHashKey', authenticated.
+putServerNarInfo :: Server.ServerConfig -> NarInfo.NarInfo -> IO WT.SResponse
+putServerNarInfo cfg ni = serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] (renderNarInfoBody ni)
+
+-- | Upload a NAR, then a narinfo for it; the narinfo's response, and the
+-- status a GET of that narinfo answers afterwards.
+putNarThenNarInfo :: Server.ServerConfig -> ByteString -> NarInfo.NarInfo -> IO (WT.SResponse, HTTP.Status)
+putNarThenNarInfo cfg bytes ni = do
+  _ <- putServerNar cfg bytes
+  putResp <- putServerNarInfo cfg ni
+  getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
+  pure (putResp, WT.simpleStatus getResp)
 
 -- | Run one test against a fresh server (configurable write key and
 -- signing key), removing the store directory afterwards.
@@ -1900,6 +1931,18 @@ chunkSource chunks = do
 strictBody :: WT.SResponse -> ByteString
 strictBody = BL.toStrict . WT.simpleBody
 
+-- | Take every permission from a file, and say whether that left it
+-- unreadable.  Windows has no mode bit that stops a read (and a
+-- read-only file would then resist the test's cleanup), and root reads
+-- a file whatever its mode, so on either there is no read failure to
+-- cause.
+makeUnreadable :: FilePath -> IO Bool
+makeUnreadable path
+  | System.Info.os == "mingw32" = pure False
+  | otherwise = do
+      setPermissions path emptyPermissions
+      not . readable <$> getPermissions path
+
 testServer :: IO Bool
 testServer =
   runGroup
@@ -1955,6 +1998,7 @@ testServer =
           assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
       test "PUT then GET narinfo roundtrip" $
         withAuthedServer $ \cfg -> do
+          _ <- putServerNar cfg serverNarBytes
           putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
           getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
           ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
@@ -1969,6 +2013,7 @@ testServer =
       test "PUT narinfo signs when a key is configured" $ do
         sigKey <- generateTestSecretKey
         withServer (Just serverTestApiKey) (Just sigKey) $ \cfg -> do
+          _ <- putServerNar cfg serverNarBytes
           putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
           getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
           ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
@@ -1995,6 +2040,80 @@ testServer =
               [serverAuthHeader]
               (fromIntegral Server.maxNarInfoBodySize + 1)
           assertEqual "status" HTTP.status413 (WT.simpleStatus resp),
+      -- A narinfo is signed and stored only over the NAR it describes,
+      -- so an upload that went wrong fails here and the next push sends
+      -- both again.
+      test "PUT narinfo with no NAR stored is 400 and stores nothing" $
+        withAuthedServer $ \cfg -> do
+          putResp <- putServerNarInfo cfg validServerNarInfo
+          getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
+          ok1 <- assertEqual "PUT status" HTTP.status400 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "body" "NAR nar/test.nar is not stored; upload it before its narinfo" (strictBody putResp)
+          ok3 <- assertEqual "GET status" HTTP.status404 (WT.simpleStatus getResp)
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo over a short NAR is 400 and stores nothing" $
+        withAuthedServer $ \cfg -> do
+          (putResp, getStatus) <- putNarThenNarInfo cfg (BS.take 10 serverNarBytes) validServerNarInfo
+          ok1 <- assertEqual "PUT status" HTTP.status400 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "body" "NAR nar/test.nar is 10 bytes, narinfo FileSize is 17" (strictBody putResp)
+          ok3 <- assertEqual "GET status" HTTP.status404 getStatus
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo over a same-size NAR of other content is 400 and stores nothing" $
+        withAuthedServer $ \cfg -> do
+          let other = BS.map (+ 1) serverNarBytes
+          (putResp, getStatus) <- putNarThenNarInfo cfg other validServerNarInfo
+          let expected =
+                "NAR nar/test.nar hashes to "
+                  <> TE.encodeUtf8 (Hash.formatNixHash (Hash.hashBytes other))
+                  <> ", narinfo FileHash is "
+                  <> TE.encodeUtf8 (Hash.formatNixHash (Hash.hashBytes serverNarBytes))
+          ok1 <- assertEqual "PUT status" HTTP.status400 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "body" expected (strictBody putResp)
+          ok3 <- assertEqual "GET status" HTTP.status404 getStatus
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo over its NAR is 200 and stores it" $
+        withAuthedServer $ \cfg -> do
+          (putResp, getStatus) <- putNarThenNarInfo cfg serverNarBytes validServerNarInfo
+          ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "GET status" HTTP.status200 getStatus
+          pure (ok1 && ok2),
+      test "a refused narinfo is accepted once the right NAR is uploaded again" $
+        withAuthedServer $ \cfg -> do
+          (refused, _) <- putNarThenNarInfo cfg (BS.take 10 serverNarBytes) validServerNarInfo
+          (accepted, getStatus) <- putNarThenNarInfo cfg serverNarBytes validServerNarInfo
+          ok1 <- assertEqual "first PUT status" HTTP.status400 (WT.simpleStatus refused)
+          ok2 <- assertEqual "second PUT status" HTTP.status200 (WT.simpleStatus accepted)
+          ok3 <- assertEqual "GET status" HTTP.status200 getStatus
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo whose URL is not under nar/ is 400" $
+        withAuthedServer $ \cfg -> do
+          let elsewhere = validServerNarInfo {NarInfo.niUrl = "https://cache.example/nar/" <> serverNarName}
+          (putResp, getStatus) <- putNarThenNarInfo cfg serverNarBytes elsewhere
+          ok1 <- assertEqual "PUT status" HTTP.status400 (WT.simpleStatus putResp)
+          ok2 <- assertEqual "body" "narinfo URL https://cache.example/nar/test.nar does not name a file under nar/" (strictBody putResp)
+          ok3 <- assertEqual "GET status" HTTP.status404 getStatus
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo without FileSize or FileHash is 400" $
+        withAuthedServer $ \cfg -> do
+          (noSize, _) <- putNarThenNarInfo cfg serverNarBytes validServerNarInfo {NarInfo.niFileSize = Nothing}
+          (noHash, getStatus) <- putNarThenNarInfo cfg serverNarBytes validServerNarInfo {NarInfo.niFileHash = Nothing}
+          ok1 <- assertEqual "no FileSize" (HTTP.status400, "narinfo declares no FileSize to check its NAR against") (WT.simpleStatus noSize, strictBody noSize)
+          ok2 <- assertEqual "no FileHash" (HTTP.status400, "narinfo declares no FileHash to check its NAR against") (WT.simpleStatus noHash, strictBody noHash)
+          ok3 <- assertEqual "GET status" HTTP.status404 getStatus
+          pure (ok1 && ok2 && ok3),
+      test "PUT narinfo over an unreadable NAR is 500 and stores nothing" $
+        withAuthedServer $ \cfg -> do
+          _ <- putServerNar cfg serverNarBytes
+          unreadable <- makeUnreadable (Store.fsRoot (Server.scStore cfg) ++ "/nar/" ++ T.unpack serverNarName)
+          if not unreadable
+            then pure True
+            else do
+              putResp <- putServerNarInfo cfg validServerNarInfo
+              getResp <- serverRequest cfg "GET" [validNarInfoHashKey <> ".narinfo"] [] ""
+              ok1 <- assertEqual "PUT status" HTTP.status500 (WT.simpleStatus putResp)
+              ok2 <- assertEqual "body" "NAR nar/test.nar could not be read" (strictBody putResp)
+              ok3 <- assertEqual "GET status" HTTP.status404 (WT.simpleStatus getResp)
+              pure (ok1 && ok2 && ok3),
       -- The hash listing is push-tool plumbing: authenticated, uncacheable.
       test "GET /narinfo-hashes without auth is 401" $
         withAuthedServer $ \cfg -> do
@@ -2002,6 +2121,7 @@ testServer =
           assertEqual "status" HTTP.status401 (WT.simpleStatus resp),
       test "GET /narinfo-hashes with auth lists hashes, uncacheable" $
         withAuthedServer $ \cfg -> do
+          _ <- putServerNar cfg serverNarBytes
           putResp <- serverRequest cfg "PUT" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] validServerNarInfoBytes
           resp <- serverRequest cfg "GET" ["narinfo-hashes"] [serverAuthHeader] ""
           ok1 <- assertEqual "PUT status" HTTP.status200 (WT.simpleStatus putResp)
@@ -2088,6 +2208,119 @@ testServer =
         removeDirectoryRecursive tmpDir
         assertEqual "path" Nothing located
     ]
+
+-- ---------------------------------------------------------------------------
+-- Stored NAR check (pure)
+-- ---------------------------------------------------------------------------
+
+testStoredNarCheck :: IO Bool
+testStoredNarCheck =
+  runGroup
+    "Stored NAR check"
+    [ test "a narinfo URL resolves to the file its GET is routed to" $
+        let cases =
+              [ ("nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.zst", Just "1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.zst"),
+                ("nar/a%2Bb.nar", Just "a+b.nar"),
+                ("nar/x.nar?v=1", Just "x.nar"),
+                ("/nar/x.nar", Nothing),
+                ("https://cache.example/nar/x.nar", Nothing),
+                ("nar/../x.nar", Nothing),
+                ("nar/a/x.nar", Nothing),
+                ("x.nar", Nothing)
+              ]
+         in assertEqual
+              "mismatches"
+              []
+              [(url, expected, actual) | (url, expected) <- cases, let actual = Server.narUrlFileName url, actual /= expected],
+      test "property: a NAR's request path, as a narinfo URL, resolves to its name" $
+        checkProperty $
+          forAll (T.pack <$> arbitrary) $ \name ->
+            Server.narUrlFileName (relativeRequestPath ["nar", name]) === Just name,
+      test "property: a nar/<name> URL claims that name, FileSize and FileHash" $
+        checkProperty $
+          forAll genClaim $ \claim ->
+            Server.narClaim (claimingNarInfo claim) === Right claim,
+      test "a narinfo with no FileSize, no usable FileHash or no served URL claims nothing" $ do
+        let refusal ni = either Just (const Nothing) (Server.narClaim ni)
+            withUrl url = validServerNarInfo {NarInfo.niUrl = url}
+        ok1 <- assertEqual "no FileSize" (Just Server.NarFileSizeUndeclared) (refusal validServerNarInfo {NarInfo.niFileSize = Nothing})
+        ok2 <- assertEqual "no FileHash" (Just Server.NarFileHashUndeclared) (refusal validServerNarInfo {NarInfo.niFileHash = Nothing})
+        ok3 <-
+          assertTrue
+            "unparseable FileHash"
+            ( case refusal validServerNarInfo {NarInfo.niFileHash = Just "sha256:abc"} of
+                Just (Server.NarFileHashInvalid "sha256:abc" _) -> True
+                _ -> False
+            )
+        ok4 <-
+          assertEqual
+            "names no store could hold"
+            [Just (Server.NarUrlNotServed url) | url <- unservedUrls]
+            (map (refusal . withUrl) unservedUrls)
+        pure (ok1 && ok2 && ok3 && ok4),
+      test "property: a stored NAR is accepted exactly when it is the declared file" $
+        checkProperty $
+          forAll genClaim $ \claim ->
+            forAll (genStoredNear claim) $ \stored ->
+              isRight (Server.judgeStoredNar claim (Just stored))
+                === (stored == Server.StoredNar (Server.ncFileSize claim) (Server.ncFileHash claim)),
+      test "property: a NAR of another size is refused on its size" $
+        checkProperty $
+          forAll genClaim $ \claim ->
+            forAll (genFileSize `suchThat` (/= Server.ncFileSize claim)) $ \size ->
+              forAll genNixHash $ \digest ->
+                Server.judgeStoredNar claim (Just (Server.StoredNar size digest))
+                  === Left (Server.NarSizeMismatch (Server.ncFileName claim) (Server.ncFileSize claim) size),
+      test "property: a same-size NAR of other content is refused on its hash" $
+        checkProperty $
+          forAll genClaim $ \claim ->
+            forAll (genNixHash `suchThat` (/= Server.ncFileHash claim)) $ \digest ->
+              Server.judgeStoredNar claim (Just (Server.StoredNar (Server.ncFileSize claim) digest))
+                === Left (Server.NarHashMismatch (Server.ncFileName claim) (Server.ncFileHash claim) digest),
+      test "property: an absent NAR is refused as not stored" $
+        checkProperty $
+          forAll genClaim $ \claim ->
+            Server.judgeStoredNar claim Nothing === Left (Server.NarNotStored (Server.ncFileName claim))
+    ]
+
+-- | URLs that name nothing under @nar\/@ a store could hold: an empty
+-- name, an upload's temp-file name, and a Windows device.
+unservedUrls :: [Text]
+unservedUrls = ["nar/", "nar/.nova123-4.tmp", "nar/nul"]
+
+-- | The request path a client forms for segments, relative to the cache
+-- root and percent-encoded as http-types encodes a path.
+relativeRequestPath :: [Text] -> Text
+relativeRequestPath =
+  TE.decodeLatin1 . BL.toStrict . Builder.toLazyByteString . HTTP.encodePathSegmentsRelative
+
+-- | 'validServerNarInfo' declaring a claim's name, FileSize and FileHash.
+claimingNarInfo :: Server.NarClaim -> NarInfo.NarInfo
+claimingNarInfo claim =
+  validServerNarInfo
+    { NarInfo.niUrl = "nar/" <> Server.ncFileName claim,
+      NarInfo.niFileSize = Just (Server.ncFileSize claim),
+      NarInfo.niFileHash = Just (Hash.formatNixHash (Server.ncFileHash claim))
+    }
+
+-- | A FileSize the narinfo parser admits: up to the uint64 maximum.
+genFileSize :: Gen Integer
+genFileSize = choose (0, 18446744073709551615)
+
+genNixHash :: Gen Hash.NixHash
+genNixHash = Hash.NixHash . BS.pack <$> vectorOf 32 arbitrary
+
+genClaim :: Gen Server.NarClaim
+genClaim = Server.NarClaim <$> genSafeNarName <*> genFileSize <*> genNixHash
+
+-- | A stored NAR that keeps or replaces each of the claim's size and
+-- hash independently, so the exact file turns up about a quarter of
+-- the time.
+genStoredNear :: Server.NarClaim -> Gen Server.StoredNar
+genStoredNear claim =
+  Server.StoredNar
+    <$> oneof [pure (Server.ncFileSize claim), genFileSize]
+    <*> oneof [pure (Server.ncFileHash claim), genNixHash]
 
 -- ---------------------------------------------------------------------------
 -- Helpers
