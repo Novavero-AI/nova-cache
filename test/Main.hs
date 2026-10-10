@@ -2,7 +2,7 @@
 
 module Main (main) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (IOException, SomeException, try)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
 import Data.ByteArray (convert)
@@ -11,12 +11,17 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Lazy as BL
 import Data.Either (isLeft)
+import Data.Foldable (toList)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (isSuffixOf, sort)
 import Data.Maybe (isJust)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Time.Calendar (fromGregorian)
+import Data.Time.Clock (NominalDiffTime, UTCTime (..), addUTCTime, diffUTCTime, getCurrentTime, nominalDay)
 import Data.Word (Word64, Word8)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, requestBodyLength, requestHeaders, requestMethod)
@@ -26,15 +31,17 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
 import qualified NovaCache.NarInfo as NarInfo
+import qualified NovaCache.Reclaim as Reclaim
 import qualified NovaCache.Server as Server
 import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, createFileLink, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, setOwnerExecutable, setPermissions)
+import System.Directory (createDirectory, createFileLink, doesDirectoryExist, getPermissions, getTemporaryDirectory, listDirectory, removeDirectoryRecursive, removeFile, setModificationTime, setOwnerExecutable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
+import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, choose, elements, forAll, frequency, listOf, listOf1, quickCheckWithResult, stdArgs, sublistOf, suchThat, (===))
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -139,6 +146,7 @@ main = do
       testNarInfo,
       testSigning,
       testFileStore,
+      testReclaim,
       testValidate,
       testServer
     ]
@@ -1393,6 +1401,223 @@ testFileStore =
         removeDirectoryRecursive tmpDir
         assertEqual "empty" [] hashes
     ]
+
+-- ---------------------------------------------------------------------------
+-- Reclaim tests
+-- ---------------------------------------------------------------------------
+
+testReclaim :: IO Bool
+testReclaim =
+  runGroup
+    "Reclaim"
+    [ test "a nar/<file> URL names that file, compression suffix included" $
+        assertEqual
+          "target"
+          (Reclaim.NamesNar "1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.zst")
+          (narInfoBytesTarget (mkValidNarInfo {NarInfo.niUrl = "nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.zst"})),
+      test "a URL in any other spelling is unresolvable" $
+        let spellings =
+              [ "https://cache.example/nar/x.nar",
+                "./nar/x.nar",
+                "nar/../x.nar",
+                "nar/a/x.nar",
+                "nar/x.nar?v=1",
+                "nar/x%2Enar",
+                "nar/.nova1.tmp",
+                "nar/",
+                "x.nar"
+              ]
+            resolved = [url | url <- spellings, not (isUnresolvable (narInfoBytesTarget (mkValidNarInfo {NarInfo.niUrl = url})))]
+         in assertEqual "spellings that resolved" [] resolved,
+      test "an unreadable, undecodable or unparseable narinfo is unresolvable" $ do
+        let unreadable = Reclaim.narInfoTarget (Left (userError "permission denied"))
+            undecodable = Reclaim.narInfoTarget (Right (BS.pack [0x55, 0x52, 0x4c, 0x3a, 0xff]))
+            unparseable = Reclaim.narInfoTarget (Right "StorePath: /nix/store/x\nNarSize: 5\n")
+        assertTrue "all unresolvable" (all isUnresolvable [unreadable, undecodable, unparseable]),
+      test "property: a nar/<name> URL resolves to the name through the parser" $
+        checkProperty $
+          forAll genSafeNarName $ \name ->
+            narInfoBytesTarget (mkValidNarInfo {NarInfo.niUrl = "nar/" <> name}) === Reclaim.NamesNar name,
+      test "property: a referenced NAR is never selected" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            let selected = selectAll minimumAge references nars
+             in all ((`Set.notMember` references) . Store.nfName) selected,
+      test "property: the selection is a subset of the NARs present" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            all (`elem` nars) (selectAll minimumAge references nars),
+      test "property: every unreferenced NAR is either eligible or kept, never both" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            sort (map Store.nfName (selectAll minimumAge references nars))
+              === sort [Store.nfName nar | nar <- nars, Set.notMember (Store.nfName nar) references],
+      test "property: eligible NARs are at least the minimum age, kept ones younger" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            let plan = Reclaim.selectUnreferenced minimumAge referenceTime references nars
+             in all ((>= minimumAge) . ageOf) (Reclaim.rpEligible plan)
+                  && all ((< minimumAge) . ageOf) (Reclaim.rpTooYoung plan),
+      test "property: adding a narinfo never grows the eligible set" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            forAll genNarName $ \added ->
+              let eligible refs = Reclaim.rpEligible (Reclaim.selectUnreferenced minimumAge referenceTime refs nars)
+               in all (`elem` eligible references) (eligible (Set.insert added references)),
+      test "property: raising the minimum age never grows the eligible set" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, references, nars) ->
+            forAll genMinimumAge $ \raise ->
+              let eligible age = Reclaim.rpEligible (Reclaim.selectUnreferenced age referenceTime references nars)
+               in all (`elem` eligible minimumAge) (eligible (minimumAge + raise)),
+      test "property: any unresolvable narinfo blocks the run, and all are reported" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, _, nars) ->
+            forAll (listOf genTarget) $ \targets ->
+              let narInfos = zip [show i | i <- [0 :: Int ..]] targets
+                  scan = Reclaim.StoreScan {Reclaim.scanNarInfos = narInfos, Reclaim.scanNars = nars, Reclaim.scanTime = referenceTime}
+                  blocking = [path | (path, Reclaim.Unresolvable _) <- narInfos]
+               in case Reclaim.planReclaim minimumAge scan of
+                    Left unresolved -> map Reclaim.unresolvedPath (toList unresolved) === blocking
+                    Right _ -> blocking === [],
+      test "a NAR exactly the minimum age old is eligible" $
+        let nar = narAged "edge.nar" Reclaim.defaultMinimumAge
+            plan = Reclaim.selectUnreferenced Reclaim.defaultMinimumAge referenceTime Set.empty [nar]
+         in assertEqual "eligible" [nar] (Reclaim.rpEligible plan),
+      test "a scan of a store: blocked by a broken narinfo, then reclaimed" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        now <- getCurrentTime
+        let monthAgo = addUTCTime (negate (30 * nominalDay)) now
+            narPath name = tmpDir ++ "/nar/" ++ name
+            putNar name modified = do
+              _ <- Store.writeNar store (T.pack name) "nar bytes"
+              setModificationTime (narPath name) modified
+        _ <- Store.writeNarInfo store "referencing" (TE.encodeUtf8 (NarInfo.renderNarInfo (mkValidNarInfo {NarInfo.niUrl = "nar/ref.nar.zst"})))
+        _ <- Store.writeNarInfo store "broken" "not a narinfo\n"
+        putNar "ref.nar.zst" monthAgo
+        putNar "old.nar.zst" monthAgo
+        putNar "young.nar.zst" now
+        -- An upload in progress: the temp name a streaming write uses.
+        BS.writeFile (narPath ".nova123-4.tmp") "partial"
+        setModificationTime (narPath ".nova123-4.tmp") monthAgo
+        blocked <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
+        removeFile (tmpDir ++ "/narinfo/broken")
+        reclaimable <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
+        let blockedBy = either (map Reclaim.unresolvedPath . toList) (const []) blocked
+            eligible = either (const []) (map Store.nfName . Reclaim.rpEligible) reclaimable
+            tooYoung = either (const []) (map Store.nfName . Reclaim.rpTooYoung) reclaimable
+        removals <- traverse (Store.removeNar store) eligible
+        remaining <- sort <$> listDirectory (tmpDir ++ "/nar")
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertTrue "blocked by the broken narinfo alone" (case blockedBy of [path] -> "broken" `isSuffixOf` path; _ -> False)
+        ok2 <- assertEqual "eligible" ["old.nar.zst"] eligible
+        ok3 <- assertEqual "kept" ["young.nar.zst"] tooYoung
+        ok4 <- assertEqual "removals" [Store.NarRemoved] removals
+        ok5 <- assertEqual "remaining" [".nova123-4.tmp", "ref.nar.zst", "young.nar.zst"] remaining
+        pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "a scan of a missing store fails and creates nothing" $ do
+        tmpDir <- createTestDir
+        let missing = tmpDir ++ "/missing"
+        result <- try (Reclaim.scanStore (Store.fileStoreAt missing)) :: IO (Either IOException Reclaim.StoreScan)
+        created <- doesDirectoryExist missing
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertTrue "scan failed" (isLeft result)
+        ok2 <- assertFalse "store created" created
+        pure (ok1 && ok2),
+      test "removeNar reports a missing file and refuses a traversal name" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        missing <- Store.removeNar store "absent.nar"
+        traversal <- Store.removeNar store "../escape.nar"
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertTrue "missing file fails" (case missing of Store.NarRemoveFailed _ -> True; _ -> False)
+        ok2 <- assertEqual "traversal" Store.NarRemoveBadPath traversal
+        pure (ok1 && ok2)
+    ]
+
+-- | Run a QuickCheck property quietly, printing its report on failure.
+checkProperty :: (Testable prop) => prop -> IO Bool
+checkProperty prop = do
+  result <- quickCheckWithResult stdArgs {chatty = False} prop
+  case result of
+    Success {} -> pure True
+    Failure {output = report} -> failWith report
+    GaveUp {output = report} -> failWith report
+    NoExpectedFailure {output = report} -> failWith report
+  where
+    failWith report = do
+      putStrLn ""
+      putStr report
+      pure False
+
+-- | The target of a narinfo rendered and read back as the store holds it.
+narInfoBytesTarget :: NarInfo.NarInfo -> Reclaim.NarInfoTarget
+narInfoBytesTarget = Reclaim.narInfoTarget . Right . TE.encodeUtf8 . NarInfo.renderNarInfo
+
+isUnresolvable :: Reclaim.NarInfoTarget -> Bool
+isUnresolvable (Reclaim.Unresolvable _) = True
+isUnresolvable (Reclaim.NamesNar _) = False
+
+-- | Everything a selection names, eligible or kept.
+selectAll :: NominalDiffTime -> Set Text -> [Store.NarFile] -> [Store.NarFile]
+selectAll minimumAge references nars =
+  let plan = Reclaim.selectUnreferenced minimumAge referenceTime references nars
+   in Reclaim.rpEligible plan ++ Reclaim.rpTooYoung plan
+
+-- | The fixed "now" of the pure selection tests.
+referenceTime :: UTCTime
+referenceTime = UTCTime (fromGregorian 2026 10 9) 0
+
+ageOf :: Store.NarFile -> NominalDiffTime
+ageOf nar = diffUTCTime referenceTime (Store.nfModified nar)
+
+narAged :: Text -> NominalDiffTime -> Store.NarFile
+narAged name age =
+  Store.NarFile
+    { Store.nfName = name,
+      Store.nfPath = "nar/" ++ T.unpack name,
+      Store.nfSize = 0,
+      Store.nfModified = addUTCTime (negate age) referenceTime
+    }
+
+-- | NAR names from a small pool, so references and listings overlap
+-- often.
+narNamePool :: [Text]
+narNamePool = [T.pack ("n" ++ show i ++ ".nar.zst") | i <- [0 .. 11 :: Int]]
+
+genNarName :: Gen Text
+genNarName = elements narNamePool
+
+-- | Whole hours, so ages land on the minimum age exactly now and then;
+-- the negative end is a modification time in the future (a clock that
+-- stepped back).
+genAge :: Gen NominalDiffTime
+genAge = (* 3600) . fromInteger <$> choose (-2, 24 * 30)
+
+genMinimumAge :: Gen NominalDiffTime
+genMinimumAge = (* 3600) . fromInteger <$> choose (0, 24 * 21)
+
+-- | A listing has distinct names, as a directory does.
+genListing :: Gen [Store.NarFile]
+genListing = traverse (\name -> narAged name <$> genAge) =<< sublistOf narNamePool
+
+genSelection :: Gen (NominalDiffTime, Set Text, [Store.NarFile])
+genSelection = (,,) <$> genMinimumAge <*> (Set.fromList <$> sublistOf narNamePool) <*> genListing
+
+genTarget :: Gen Reclaim.NarInfoTarget
+genTarget =
+  frequency
+    [ (4, Reclaim.NamesNar <$> genNarName),
+      (1, pure (Reclaim.Unresolvable "unparseable"))
+    ]
+
+-- | Names 'Store.sanitizePath' admits.
+genSafeNarName :: Gen Text
+genSafeNarName =
+  (T.pack <$> listOf1 (elements safeNameChars)) `suchThat` (isJust . Store.sanitizePath)
+  where
+    safeNameChars = ['a' .. 'z'] ++ ['A' .. 'Z'] ++ ['0' .. '9'] ++ "._+-"
 
 -- ---------------------------------------------------------------------------
 -- Validate tests

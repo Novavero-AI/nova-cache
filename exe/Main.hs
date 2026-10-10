@@ -14,6 +14,7 @@ import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.Server (ServerConfig (..), cacheApp, newTTLCache, onExceptionResponse)
 import NovaCache.Signing (SecretKey, normalizeKeyText, parseSecretKey, renderPublicKey, toPublicKey)
 import NovaCache.Store (listNarInfoHashes, newFileStore)
+import ReclaimNars (reclaimCommand, reclaimMain)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
@@ -76,6 +77,16 @@ requestLogEnvVar = "LOG_REQUESTS"
 main :: IO ()
 main = do
   args <- getArgs
+  case args of
+    command : rest
+      | command == reclaimCommand -> do
+          storeEnv <- lookupEnv storeEnvVar
+          reclaimMain (fromMaybe defaultStoreRoot storeEnv) rest
+    _ -> serve args
+
+-- | Run the cache server.
+serve :: [String] -> IO ()
+serve args = do
   portEnv <- lookupEnv portEnvVar
   hostEnv <- lookupEnv hostEnvVar
   storeEnv <- lookupEnv storeEnvVar

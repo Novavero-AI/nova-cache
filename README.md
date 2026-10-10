@@ -115,6 +115,30 @@ root page. The bundled executable is one such embedding.
 
 `HEAD` is answered wherever `GET` is.
 
+### Reclaiming unreferenced NARs
+
+A client uploads each NAR before its narinfo, so a NAR whose narinfo was
+refused, or never sent because the push died, stays under `nar/` with nothing
+referencing it. No endpoint deletes anything. The `reclaim-nars` subcommand
+does, run on the host against the store directory:
+
+```bash
+nova-cache-server reclaim-nars --store /var/lib/nix-cache           # list
+nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
+```
+
+- A NAR is eligible only once it is at least `--min-age-hours` old (default
+  336, two weeks), measured from its modification time. A NAR is unreferenced
+  until its push sends the narinfo, and a push can run for hours.
+- If any narinfo cannot be read or parsed, or its `URL` is not `nar/<file>`,
+  the run prints those narinfos, lists and deletes nothing, and exits nonzero:
+  the NAR such a narinfo names is unknown, so no NAR can be called unreferenced.
+- A deletion that fails is reported for that file, and the exit status is
+  nonzero.
+- The store root comes from `--store`, then `NIX_CACHE_DIR`, then
+  `./nix-cache`, as for the server. A missing `narinfo/` or `nar/` directory is
+  an error, never an empty store.
+
 ### Public cache
 
 A public instance runs at `cache.novavero.ai`. It serves store paths that
