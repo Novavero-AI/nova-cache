@@ -9,6 +9,7 @@
 module NovaCache.Store
   ( FileStore (..),
     newFileStore,
+    fileStoreAt,
     readNarInfo,
     writeNarInfo,
     readNar,
@@ -16,24 +17,34 @@ module NovaCache.Store
     NarWriteResult (..),
     writeNarStreaming,
     narFilePath,
+    NarRemoveResult (..),
+    removeNar,
     listNarInfoHashes,
+    listNarInfoFiles,
+    NarFile (..),
+    listNarFiles,
     CacheInfo (..),
     getCacheInfo,
     sanitizePath,
   )
 where
 
-import Control.Exception (IOException, SomeException, catch, onException)
+import Control.Exception (IOException, SomeException, catch, onException, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+import Data.List (isPrefixOf)
+import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Time.Clock (UTCTime)
 import NovaCache.SafeName (hasTrailingDotOrSpace, isReservedDeviceName)
 import System.Directory
   ( createDirectoryIfMissing,
     doesFileExist,
+    getFileSize,
+    getModificationTime,
     listDirectory,
     removeFile,
     renameFile,
@@ -90,12 +101,20 @@ newFileStore :: FilePath -> IO FileStore
 newFileStore root = do
   createDirectoryIfMissing True (root </> narinfoSubdir)
   createDirectoryIfMissing True (root </> narSubdir)
-  pure
-    FileStore
-      { fsRoot = root,
-        fsStoreDir = defaultStoreDir,
-        fsPriority = defaultPriority
-      }
+  pure (fileStoreAt root)
+
+-- | A 't:FileStore' over a directory tree as it stands, creating
+-- nothing.  For a host tool that reads the store and acts on what it
+-- finds: a mistyped root, or a store missing its @narinfo@ directory,
+-- must fail the listing, not be scanned as an empty store whose every
+-- NAR looks unreferenced.
+fileStoreAt :: FilePath -> FileStore
+fileStoreAt root =
+  FileStore
+    { fsRoot = root,
+      fsStoreDir = defaultStoreDir,
+      fsPriority = defaultPriority
+    }
 
 -- ---------------------------------------------------------------------------
 -- NarInfo operations
@@ -191,6 +210,26 @@ narFilePath fs fileName = case sanitizePath fileName of
     exists <- doesFileExist path
     pure (if exists then Just path else Nothing)
 
+-- | Outcome of removing a stored NAR.
+data NarRemoveResult
+  = -- | The file is gone.
+    NarRemoved
+  | -- | The filesystem refused; nothing was removed.
+    NarRemoveFailed !IOException
+  | -- | The filename failed 'sanitizePath'; nothing was touched.
+    NarRemoveBadPath
+  deriving (Eq, Show)
+
+-- | Remove a stored NAR by its filename.  Nothing in the HTTP protocol
+-- calls this: deletion is for a tool the host operator runs against
+-- the store directory.
+removeNar :: FileStore -> Text -> IO NarRemoveResult
+removeNar fs fileName = case sanitizePath fileName of
+  Nothing -> pure NarRemoveBadPath
+  Just safe ->
+    either NarRemoveFailed (const NarRemoved)
+      <$> tryIO (removeFile (fsRoot fs </> narSubdir </> safe))
+
 -- ---------------------------------------------------------------------------
 -- Listing
 -- ---------------------------------------------------------------------------
@@ -201,8 +240,57 @@ narFilePath fs fileName = case sanitizePath fileName of
 -- Filters out temporary files from in-progress atomic writes.
 listNarInfoHashes :: FileStore -> IO [Text]
 listNarInfoHashes fs =
-  filter (not . T.isPrefixOf ".") . map T.pack
+  map T.pack . filter (not . isHiddenEntry)
     <$> listDirectory (fsRoot fs </> narinfoSubdir)
+
+-- | The path of every stored narinfo: the files 'listNarInfoHashes'
+-- names.
+listNarInfoFiles :: FileStore -> IO [FilePath]
+listNarInfoFiles fs =
+  map (dir </>) . filter (not . isHiddenEntry) <$> listDirectory dir
+  where
+    dir = fsRoot fs </> narinfoSubdir
+
+-- | A stored NAR as listed.
+data NarFile = NarFile
+  { -- | The filename under @nar\/@, as @PUT \/nar\/\<file\>@ named it.
+    nfName :: !Text,
+    nfPath :: !FilePath,
+    nfSize :: !Integer,
+    nfModified :: !UTCTime
+  }
+  deriving (Eq, Show)
+
+-- | Every stored NAR: the regular files under @nar\/@ whose names
+-- 'sanitizePath' admits, which are exactly the names an upload can
+-- create.  An upload is written to a dotfile and renamed into place
+-- only once complete, and 'sanitizePath' admits no dotfile, so a
+-- partial write is never listed.  The rename keeps the temp file's
+-- modification time, so 'nfModified' is when the upload's last bytes
+-- were written.
+listNarFiles :: FileStore -> IO [NarFile]
+listNarFiles fs = catMaybes <$> (traverse describe =<< listDirectory dir)
+  where
+    dir = fsRoot fs </> narSubdir
+    describe entry = case sanitizePath (T.pack entry) of
+      Nothing -> pure Nothing
+      Just safe -> do
+        let path = dir </> safe
+        isFile <- doesFileExist path
+        if isFile
+          then do
+            size <- getFileSize path
+            modified <- getModificationTime path
+            pure
+              ( Just
+                  NarFile
+                    { nfName = T.pack safe,
+                      nfPath = path,
+                      nfSize = size,
+                      nfModified = modified
+                    }
+              )
+          else pure Nothing
 
 -- ---------------------------------------------------------------------------
 -- Cache metadata
@@ -283,6 +371,17 @@ atomicWriteFile target content = do
       renameFile tmpPath target
     )
     `onException` cleanup
+
+-- | A dotfile: every temp file the atomic writes create (the
+-- template's leading dot survives 'openBinaryTempFile'), and never a
+-- key 'sanitizePath' admits.
+isHiddenEntry :: FilePath -> Bool
+isHiddenEntry = isPrefixOf "."
+
+-- | 'try' at 'IOException', the failure a filesystem call is expected
+-- to raise; anything else (an interrupt among them) propagates.
+tryIO :: IO a -> IO (Either IOException a)
+tryIO = try
 
 -- | Swallow all exceptions from a cleanup action.
 ignoringExceptions :: IO () -> IO ()

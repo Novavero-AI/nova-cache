@@ -44,6 +44,7 @@ library
     NovaCache.NAR
     NovaCache.NAR.Stream
     NovaCache.NarInfo
+    NovaCache.Reclaim
     NovaCache.SafeName
     NovaCache.Server
     NovaCache.Signing
@@ -62,6 +63,7 @@ library
     , http-types          >= 0.12 && < 0.13
     , ram                 >= 0.20 && < 1
     , text                >= 2.0 && < 2.2
+    , time                >= 1.9 && < 1.17
     , vector              >= 0.12 && < 0.14
     , wai                 >= 3.2 && < 3.3
 
@@ -169,7 +171,9 @@ executable nova-cache-server
     buildable: False
 
   main-is:          Main.hs
-  other-modules:    LandingPage
+  other-modules:
+    LandingPage
+    ReclaimNars
   hs-source-dirs:   exe
   default-language:  Haskell2010
   default-extensions:
@@ -182,6 +186,7 @@ executable nova-cache-server
     , nova-cache
     , http-types          >= 0.12 && < 0.13
     , text                >= 2.0 && < 2.2
+    , time                >= 1.9 && < 1.17
     , wai                 >= 3.2 && < 3.3
     , wai-extra           >= 3.1 && < 3.2
     , warp                >= 3.3 && < 3.5
@@ -199,12 +204,17 @@ test-suite nova-cache-test
       base                >= 4.22 && < 5
     , base64-bytestring   >= 1.2 && < 1.3
     , bytestring          >= 0.11 && < 0.13
+    , containers          >= 0.6 && < 0.9
     , crypton             >= 1.1 && < 2
     , directory           >= 1.3 && < 1.4
     , http-types          >= 0.12 && < 0.13
     , nova-cache
+    -- 2.12 dropped InsufficientCoverage, leaving the four Result
+    -- constructors the suite matches exhaustively.
+    , QuickCheck          >= 2.12 && < 2.19
     , ram                 >= 0.20 && < 1
     , text                >= 2.0 && < 2.2
+    , time                >= 1.9 && < 1.17
     , wai                 >= 3.2 && < 3.3
     , wai-extra           >= 3.1 && < 3.2
 
