@@ -160,7 +160,10 @@ data XzSourceState
 -- zlib and bzlib bindings use for the same job.  A pull that
 -- throws, or a consumer that exits early, holds the decoder state
 -- (bounded by 'xzMaxDecoderMemoryBytes') until a GC runs the
--- finalizer.
+-- finalizer.  The binding keeps @endLzmaStream@ in a hidden module,
+-- so nothing here can end a live stream early.  Once xz exports it
+-- (#46), this becomes a real bracket that ends the stream on every
+-- exit.
 withXzSource :: XzLimits -> IO ByteString -> (IO ByteString -> IO a) -> IO a
 withXzSource limits compressedSource consume = do
   start <- Lzma.decompressIO (decompressParams limits)
