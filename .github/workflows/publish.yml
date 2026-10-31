@@ -22,7 +22,7 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # v0.9.0.0 reached Hackage with its changelog section still headed
       # "## Unreleased" (the dating commit landed 73 minutes after the
@@ -100,7 +100,7 @@ jobs:
           # spanning every library).
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
           mkdir -p "$MAIN/src"
-          for LDIR in dist-newstyle/build/*/*/nova-cache-${VERSION}/l/*/; do
+          for LDIR in dist-newstyle/build/*/*/nova-cache-"${VERSION}"/l/*/; do
             [ -d "$LDIR" ] || continue
             NAME=$(basename "$LDIR")
             SUB="$LDIR/doc/html/nova-cache-${VERSION}-docs/$NAME"
