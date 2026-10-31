@@ -21,7 +21,7 @@ jobs:
     name: Upload docs to Hackage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
 
@@ -65,7 +65,7 @@ jobs:
           MAIN=$(find dist-newstyle -type d -name "nova-cache-${VERSION}-docs" -path "*/doc/html/*" -not -path "*/l/*")
           mkdir -p "$MAIN/src"
           GRAFTED_PAGES=""
-          for LDIR in dist-newstyle/build/*/*/nova-cache-${VERSION}/l/*/; do
+          for LDIR in dist-newstyle/build/*/*/nova-cache-"${VERSION}"/l/*/; do
             [ -d "$LDIR" ] || continue
             NAME=$(basename "$LDIR")
             SUB="$LDIR/doc/html/nova-cache-${VERSION}-docs/$NAME"
