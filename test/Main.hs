@@ -42,7 +42,7 @@ import System.Directory (createDirectory, createFileLink, doesDirectoryExist, em
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
-import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, listOf, listOf1, oneof, quickCheckWithResult, stdArgs, sublistOf, suchThat, vectorOf, (===))
+import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, listOf, listOf1, oneof, property, quickCheckWithResult, stdArgs, sublistOf, suchThat, vectorOf, (===))
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -1480,8 +1480,17 @@ testReclaim =
                   scan = Reclaim.StoreScan {Reclaim.scanNarInfos = narInfos, Reclaim.scanNars = nars, Reclaim.scanTime = referenceTime}
                   blocking = [path | (path, Reclaim.Unresolvable _) <- narInfos]
                in case Reclaim.planReclaim minimumAge scan of
-                    Left unresolved -> map Reclaim.unresolvedPath (toList unresolved) === blocking
+                    Left (Reclaim.UnresolvedNarInfos unresolved) -> map Reclaim.unresolvedPath (toList unresolved) === blocking
+                    Left Reclaim.NoNarInfos -> property (null targets && not (null nars))
                     Right _ -> blocking === [],
+      test "property: a store with NARs and no narinfo blocks the run, and an empty store plans nothing" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, _, nars) ->
+            let scan = Reclaim.StoreScan {Reclaim.scanNarInfos = [], Reclaim.scanNars = nars, Reclaim.scanTime = referenceTime}
+                expected = case nars of
+                  [] -> Right Reclaim.ReclaimPlan {Reclaim.rpEligible = [], Reclaim.rpTooYoung = []}
+                  _ -> Left Reclaim.NoNarInfos
+             in Reclaim.planReclaim minimumAge scan === expected,
       test "a NAR exactly the minimum age old is eligible" $
         let nar = narAged "edge.nar" Reclaim.defaultMinimumAge
             plan = Reclaim.selectUnreferenced Reclaim.defaultMinimumAge referenceTime Set.empty [nar]
@@ -1506,7 +1515,9 @@ testReclaim =
         blocked <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
         removeFile (tmpDir ++ "/narinfo/broken")
         reclaimable <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
-        let blockedBy = either (map Reclaim.unresolvedPath . toList) (const []) blocked
+        let blockedBy = case blocked of
+              Left (Reclaim.UnresolvedNarInfos unresolved) -> map Reclaim.unresolvedPath (toList unresolved)
+              _ -> []
             eligible = either (const []) (map Store.nfName . Reclaim.rpEligible) reclaimable
             tooYoung = either (const []) (map Store.nfName . Reclaim.rpTooYoung) reclaimable
         removals <- traverse (Store.removeNar store) eligible
@@ -1518,6 +1529,17 @@ testReclaim =
         ok4 <- assertEqual "removals" [Store.NarRemoved] removals
         ok5 <- assertEqual "remaining" [".nova123-4.tmp", "ref.nar.zst", "young.nar.zst"] remaining
         pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "a store whose narinfo directory the server recreated blocks the run" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        now <- getCurrentTime
+        _ <- Store.writeNar store "old.nar.zst" "nar bytes"
+        setModificationTime (tmpDir ++ "/nar/old.nar.zst") (addUTCTime (negate (30 * nominalDay)) now)
+        removeDirectoryRecursive (tmpDir ++ "/narinfo")
+        restarted <- Store.newFileStore tmpDir
+        plan <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore restarted
+        removeDirectoryRecursive tmpDir
+        assertEqual "blocked" (Left Reclaim.NoNarInfos) plan,
       test "a scan of a missing store fails and creates nothing" $ do
         tmpDir <- createTestDir
         let missing = tmpDir ++ "/missing"

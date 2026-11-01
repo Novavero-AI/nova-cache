@@ -10,9 +10,8 @@ module ReclaimNars (reclaimCommand, reclaimMain) where
 import Control.Exception (IOException, displayException, try)
 import Control.Monad (when)
 import Data.Foldable (for_, traverse_)
-import Data.List.NonEmpty (NonEmpty)
 import Data.Time.Clock (NominalDiffTime)
-import NovaCache.Reclaim (ReclaimPlan (..), Unresolved (..), defaultMinimumAge, planReclaim, scanStore)
+import NovaCache.Reclaim (ReclaimBlocked (..), ReclaimPlan (..), Unresolved (..), defaultMinimumAge, planReclaim, scanStore)
 import NovaCache.Store (FileStore, NarFile (..), NarRemoveResult (..), fileStoreAt, removeNar)
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -82,8 +81,7 @@ parseOptions storeRoot =
 -- ---------------------------------------------------------------------------
 
 -- | Run the subcommand.  Exits nonzero when the arguments are wrong,
--- the store cannot be listed, a narinfo blocks the run, or a deletion
--- fails.
+-- the store cannot be listed, the run is blocked, or a deletion fails.
 reclaimMain :: FilePath -> [String] -> IO ()
 reclaimMain storeRoot args = case parseOptions storeRoot args of
   Left err -> do
@@ -103,7 +101,7 @@ reclaimMain storeRoot args = case parseOptions storeRoot args of
       Left err ->
         fatal ("cannot scan the store: " ++ displayException (err :: IOException))
       Right scan -> case planReclaim (optMinimumAge opts) scan of
-        Left unresolved -> refuse unresolved
+        Left blocked -> refuse blocked
         Right plan -> case optMode opts of
           ListOnly -> listPlan plan
           Delete -> deletePlan store plan
@@ -149,15 +147,21 @@ deletePlan store plan = do
       pure (nar, outcome)
     failed nar reason = hPutStrLn stderr ("FAILED: " ++ nfPath nar ++ ": " ++ reason)
 
--- | Report the narinfos that block the run and exit nonzero.
-refuse :: NonEmpty Unresolved -> IO ()
-refuse unresolved = do
+-- | Report what blocks the run and exit nonzero.
+refuse :: ReclaimBlocked -> IO ()
+refuse (UnresolvedNarInfos unresolved) = do
   for_ unresolved $ \u ->
     hPutStrLn stderr ("UNRESOLVED: " ++ unresolvedPath u ++ ": " ++ unresolvedReason u)
   fatal
     ( counted (length unresolved) "unresolved narinfo"
         ++ ": nothing was listed or deleted, since the NAR an unresolved narinfo names"
         ++ " would look unreferenced.  Fix or remove each one and run again."
+    )
+refuse NoNarInfos =
+  fatal
+    ( "the store holds NARs and no narinfo: nothing was listed or deleted, since a store"
+        ++ " that lost its narinfos looks the same as one whose every NAR is unreferenced."
+        ++ "  Restore the narinfos, or remove the NARs by hand if none is referenced."
     )
 
 reportTooYoung :: ReclaimPlan -> IO ()

@@ -133,6 +133,12 @@ nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
 - If any narinfo cannot be read or parsed, or its `URL` is not `nar/<file>`,
   the run prints those narinfos, lists and deletes nothing, and exits nonzero:
   the NAR such a narinfo names is unknown, so no NAR can be called unreferenced.
+- If the store holds NARs and no narinfo at all, the run lists and deletes
+  nothing and exits nonzero: a store that lost its narinfos looks the same as
+  one whose every NAR is unreferenced.
+- A run is not atomic with the server, so run it with no push in progress. A
+  narinfo that arrives during a run for a NAR past the minimum age loses that
+  NAR, which leaves a signed narinfo with nothing behind it.
 - A deletion that fails is reported for that file, and the exit status is
   nonzero.
 - The store root comes from `--store`, then `NIX_CACHE_DIR`, then
