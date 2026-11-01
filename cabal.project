@@ -3,7 +3,7 @@ packages: .
 -- Pin the dependency universe: local, CI, and contributor builds resolve
 -- identical versions regardless of when they last ran cabal update.  Bump
 -- deliberately - a fresh timestamp - when adopting new releases.
-index-state: 2026-08-20T01:41:58Z
+index-state: 2026-11-01T10:08:12Z
 
 -- The xz binding defaults to a pkg-config-found system liblzma and
 -- falls back to the bundled sources, so which library a build links
