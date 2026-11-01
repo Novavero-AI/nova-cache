@@ -211,7 +211,7 @@ test-suite nova-cache-test
     , nova-cache
     -- 2.12 dropped InsufficientCoverage, leaving the four Result
     -- constructors the suite matches exhaustively.
-    , QuickCheck          >= 2.12 && < 2.19
+    , QuickCheck          >= 2.12 && < 2.20
     , ram                 >= 0.20 && < 1
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.17
