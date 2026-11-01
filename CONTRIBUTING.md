@@ -8,7 +8,7 @@ and pull requests are welcome.
 - Keep PRs focused; one change per PR.
 - Code must build warning-clean and pass the test suite. CI runs
   `cabal build all -f server --enable-tests --ghc-options="-Werror"`, then
-  `cabal test -f server --ghc-options="-Werror"`.
+  `cabal test -f server --enable-tests --ghc-options="-Werror"`.
 - Match the existing style: ormolu 0.9.0.0 and hlint 3.10, the versions CI
   pins.
 

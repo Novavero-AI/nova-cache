@@ -211,7 +211,7 @@ jobs:
         run: cabal build all -f server --enable-tests --ghc-options="-Werror"
 
       - name: Test
-        run: cabal test -f server --ghc-options="-Werror"
+        run: cabal test -f server --enable-tests --ghc-options="-Werror"
 
   # ---------------------------------------------------------------------------
   # Packaging check (Linux-only)
@@ -313,7 +313,7 @@ jobs:
           } > cabal.project.local
 
       - name: Build with instrumented cbits
-        run: cabal build nova-cache-bzip2-test
+        run: cabal build nova-cache-bzip2-test --enable-tests
 
       # cabal reuses an existing C object across a ghc-options change, so a
       # warm build tree can link an uninstrumented shim and leave this job
@@ -338,7 +338,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
           UBSAN_OPTIONS: print_stacktrace=1
-        run: cabal test nova-cache-bzip2-test
+        run: cabal test nova-cache-bzip2-test --enable-tests
 
   # ---------------------------------------------------------------------------
   # Deploy (main branch only): build on the hosted arm64 image, ship the
