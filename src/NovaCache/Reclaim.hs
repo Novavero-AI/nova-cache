@@ -8,12 +8,14 @@
 -- 'scanStore' is the IO edge that reads the store, and deletion is
 -- 'NovaCache.Store.removeNar'.
 --
--- Two rules keep a run from breaking a cache in use.  A NAR younger
--- than the minimum age is never eligible, because a NAR is unreferenced
--- legitimately until its push sends the narinfo.  And a narinfo that
--- cannot be read, parsed, or resolved to a file under @nar\/@ blocks
--- the whole run: the NAR it names is unknown, so no NAR can be shown
--- to be unreferenced.
+-- Three rules keep a run from deleting a NAR the cache still needs.  A
+-- NAR younger than the minimum age is never eligible, because a NAR is
+-- unreferenced legitimately until its push sends the narinfo.  A narinfo
+-- that cannot be read, parsed, or resolved to a file under @nar\/@
+-- blocks the whole run: the NAR it names is unknown, so no NAR can be
+-- shown to be unreferenced.  And a store holding NARs and no narinfo at
+-- all blocks it too ('NoNarInfos').  None of them makes a run atomic
+-- with the server: 'scanStore' says what remains.
 module NovaCache.Reclaim
   ( -- * Narinfo references
     NarInfoTarget (..),
@@ -26,6 +28,7 @@ module NovaCache.Reclaim
     defaultMinimumAge,
     ReclaimPlan (..),
     selectUnreferenced,
+    ReclaimBlocked (..),
     planReclaim,
 
     -- * Scanning a store
@@ -145,12 +148,26 @@ selectUnreferenced minimumAge now references nars =
     unreferenced nar = Set.notMember (nfName nar) references
     oldEnough nar = diffUTCTime now (nfModified nar) >= minimumAge
 
--- | Plan a run from a scan: the unreferenced NARs by age, or every
--- narinfo that blocks it.
-planReclaim :: NominalDiffTime -> StoreScan -> Either (NonEmpty Unresolved) ReclaimPlan
-planReclaim minimumAge scan = do
-  references <- collectReferences (scanNarInfos scan)
-  pure (selectUnreferenced minimumAge (scanTime scan) references (scanNars scan))
+-- | Why a run cannot be planned.
+data ReclaimBlocked
+  = -- | These narinfos name NARs that are unknown.
+    UnresolvedNarInfos !(NonEmpty Unresolved)
+  | -- | The store holds NARs and no narinfo.  A store whose every NAR is
+    -- unreferenced looks like this, and so does one that lost its
+    -- @narinfo\/@ directory, which the server recreates empty when it
+    -- starts.  Deleting is right for the first and destroys the second,
+    -- and a scan cannot tell them apart.
+    NoNarInfos
+  deriving (Eq, Show)
+
+-- | Plan a run from a scan: the unreferenced NARs by age, or why the
+-- run is blocked.
+planReclaim :: NominalDiffTime -> StoreScan -> Either ReclaimBlocked ReclaimPlan
+planReclaim minimumAge scan
+  | null (scanNarInfos scan) && not (null (scanNars scan)) = Left NoNarInfos
+  | otherwise = do
+      references <- first UnresolvedNarInfos (collectReferences (scanNarInfos scan))
+      pure (selectUnreferenced minimumAge (scanTime scan) references (scanNars scan))
 
 -- ---------------------------------------------------------------------------
 -- Scanning a store
@@ -172,11 +189,14 @@ data StoreScan = StoreScan
 -- The narinfos are read before the NARs are listed, the order git's
 -- prune uses (reachability first, then each object's age): a NAR
 -- uploaded again while the narinfos are read shows its new
--- modification time.  What remains is a narinfo that arrives after the
--- narinfo listing for a NAR older than the minimum age.  That is a push
--- slower than the minimum age, or a client (upstream @nix copy@) that
--- skips re-uploading a NAR already present, and only a lock shared with
--- the server would close it.
+-- modification time.  A run is still not atomic with the server, so it
+-- belongs on a cache with no push in progress.  A narinfo that arrives
+-- after the narinfo listing for a NAR older than the minimum age loses
+-- that NAR: a push slower than the minimum age does this, and so does a
+-- client (upstream @nix copy@) that skips re-uploading a NAR already
+-- present.  A NAR uploaded again after the NARs are listed goes too,
+-- since removal does not look at the file again.  Only a lock shared
+-- with the server would close these.
 scanStore :: FileStore -> IO StoreScan
 scanStore store = do
   narInfos <- traverse readTarget =<< listNarInfoFiles store
