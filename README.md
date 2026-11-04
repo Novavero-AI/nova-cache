@@ -19,13 +19,13 @@ writing trees, hashing files, the codecs, the store and the server run in
 ## Installation
 
 ```cabal
-build-depends: nova-cache >= 0.11 && < 0.12
+build-depends: nova-cache >= 0.12 && < 0.13
 ```
 
 The codecs are separate sublibraries, named alongside the main library:
 
 ```cabal
-build-depends: nova-cache:{nova-cache, xz, zstandard} >= 0.11 && < 0.12
+build-depends: nova-cache:{nova-cache, xz, zstandard} >= 0.12 && < 0.13
 ```
 
 libbz2 and libzstd are bundled. liblzma comes from the `xz` package, which
@@ -147,11 +147,10 @@ nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
 
 ### Public cache
 
-A public instance runs at `cache.novavero.ai`. It serves store paths that
-nova-nix builds, which today means its Windows MinGW-w64 toolchain seed
-([nova-nix#207](https://github.com/Novavero-AI/nova-nix/issues/207)). To use
-it from Nix, add it to `/etc/nix/nix.conf`. On a multi-user install, Nix
-ignores substituters set by users it does not trust.
+A public instance runs at `cache.novavero.ai`. It serves the closure of
+nova-nix's Windows `hello` recipe, which nova-nix's CI publishes on every push
+to its main branch. To use it from Nix, add it to `/etc/nix/nix.conf`. On a
+multi-user install, Nix ignores substituters set by users it does not trust.
 
 ```
 extra-substituters = https://cache.novavero.ai
