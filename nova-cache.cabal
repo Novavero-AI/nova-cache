@@ -84,13 +84,11 @@ library
     -Wincomplete-record-updates
     -Wincomplete-uni-patterns
 
--- The bounded xz decoder as a solver-visible opt-in: a consumer that
--- substitutes foreign caches writes build-depends: nova-cache:xz and
--- gets the module; everyone else never builds the xz package's
--- bundled liblzma.  This replaces the manual xz flag - a dependency's flag
--- cannot be set from a consumer's .cabal file, which forced mirror
--- flags and matching constraints downstream (nova-nix#27) - while
--- keeping the 0.5.0.0 lesson: xz stays out of the default install.
+-- The bounded xz decoder as a public sublibrary: a consumer that
+-- substitutes from xz caches depends on nova-cache:xz, and nobody else
+-- builds the xz package's bundled liblzma.  A sublibrary rather than a
+-- flag, because a dependency's flag cannot be set from a consumer's
+-- .cabal file.
 library xz
   visibility:       public
   exposed-modules:  NovaCache.Xz

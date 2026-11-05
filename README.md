@@ -6,14 +6,16 @@
 
 nova-cache implements the Nix binary cache protocol in Haskell: nix-base32,
 NAR serialization (whole-tree and streaming), narinfo parsing, store paths,
-Ed25519 signing and upload validation, and an optional WAI cache server.
+Ed25519 signing and upload validation, a WAI application for a cache server,
+and an optional server executable.
 Bounded xz, zstd and bzip2 codecs are the public `nova-cache:xz`,
 `nova-cache:zstandard` and `nova-cache:bzip2` sublibraries, and the zstd codec
 also compresses for uploads.
 
-Parsing, formatting, hashing, signing and validation are pure. Reading and
-writing trees, hashing files, the codecs, the store and the server run in
-`IO`. nova-cache is the protocol layer under
+Parsing, formatting, hashing, signing, validation, one-shot xz decompression
+and zstd compression are pure. Reading and writing trees, hashing files, the
+streaming codecs, zstd and bzip2 decompression, the store and the server run
+in `IO`. nova-cache is the protocol layer under
 [nova-nix](https://github.com/Novavero-AI/nova-nix).
 
 ## Installation
@@ -50,7 +52,8 @@ import NovaCache.Signing (parseSecretKey, sign)
 -- Parse a narinfo and sign it
 case (parseNarInfo raw, parseSecretKey "mykey:base64...") of
   (Right ni, Right sk) -> print (sign sk ni)  -- Right "mykey:<base64 sig>"
-  _                    -> error "parse failed"
+  (Left err, _)        -> putStrLn err
+  (_, Left err)        -> putStrLn err
 ```
 
 ```haskell
@@ -83,8 +86,11 @@ narHash <- withNarSource defaultCaseHack path $ \pull ->
 ## Server
 
 ```bash
-cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
+CACHE_API_KEY=change-me cabal run --flag server nova-cache-server -- --port 5000 --store ./nix-cache
 ```
+
+Without `CACHE_API_KEY` the server refuses to start. `--allow-open-writes` runs
+it with unauthenticated writes, for local testing only.
 
 The protocol lives in the `NovaCache.Server` library module as a WAI
 `Application`, so the cache can be embedded in another server with its own
@@ -164,7 +170,7 @@ Tested with GHC 9.14.1. CI uses the latest cabal-install release.
 ```bash
 cabal update
 cabal build all -f server --enable-tests --ghc-options="-Werror"
-cabal test -f server --ghc-options="-Werror"
+cabal test -f server --enable-tests --ghc-options="-Werror"
 ```
 
 ## License
