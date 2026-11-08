@@ -275,12 +275,12 @@ nextDecodedChunk limits compressedSource = advance
         | otherwise -> decodeStep decoder
 
     -- Input after a clean stream end.  Upstream C++ Nix decompresses
-    -- bzip2 through libarchive (its own BzipDecompressionSink is gone),
-    -- and libarchive decodes the payload and ignores trailing bytes that
-    -- do not begin another stream: a single stray NUL or newline after
-    -- the last stream substitutes fine under `nix copy` and used to fail
-    -- here.  Bytes that DO begin a stream header are decoded as a
-    -- concatenated stream, and a truncated one still fails, since
+    -- bzip2 through libarchive (it has no BzipDecompressionSink of its
+    -- own), and libarchive decodes the payload and ignores trailing bytes
+    -- that do not begin another stream: a single stray NUL or newline
+    -- after the last stream substitutes fine under `nix copy`, so it is
+    -- ignored here too.  Bytes that DO begin a stream header are decoded
+    -- as a concatenated stream, and a truncated one still fails, since
     -- libarchive refuses those too and silently truncating a real stream
     -- is the failure mode worth keeping.  One measured divergence
     -- remains: a trailer that is a well-formed header carrying no block

@@ -312,7 +312,7 @@ defaultExecBitResolver path = executable <$> (getPermissions =<< encodeFS path)
 -- @access(2)@ - what the CALLING PROCESS may do - and so diverges for
 -- root (any execute bit reads as executable), ACLs, and files the
 -- caller does not own; the flag lands in NAR bytes, so that
--- divergence moves a hash (#65).
+-- divergence moves a hash.
 defaultExecBitResolver :: ExecBitResolver
 defaultExecBitResolver path = do
   status <- Posix.getSymbolicLinkStatus path

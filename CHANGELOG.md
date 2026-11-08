@@ -130,9 +130,8 @@
   protocol endpoint documentation. The cache protocol routes are unchanged;
   the page is briefly cacheable (`max-age=300, must-revalidate`) since its
   stats change as paths are added.
-- **Correctness and hardening sweep** (a post-0.4.0.0 audit; note: shipped in
-  this release without individual entries at tag time - recorded here for the
-  honest history):
+- **Correctness and hardening** (shipped in this release without individual
+  entries at tag time, and recorded here after it):
   - `Base32.decode` rejects non-canonical encodings (overflow bits must be zero).
   - NAR deserialisation is strict on untrusted input: trailing bytes rejected,
     regular nodes require a `contents` token, directory entry names must be

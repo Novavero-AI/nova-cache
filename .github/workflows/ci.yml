@@ -378,13 +378,13 @@ jobs:
           OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
           CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
           # Cloudflare Access service token: reach the box through Access,
-          # since its public port 22 is closed now.
+          # since its public port 22 is closed.
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           # Install cloudflared (the arm64 asset - this runner is arm) and
           # reach the box through Cloudflare Access: its public port 22 is
-          # closed, so SSH is Access-only now.
+          # closed, so SSH is Access-only.
           # Pinned version + checksum: the deploy must not run whatever
           # binary "latest" serves on a given day.
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-arm64 -o /tmp/cloudflared

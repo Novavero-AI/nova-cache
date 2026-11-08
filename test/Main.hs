@@ -584,7 +584,7 @@ testNAR =
             (sort (map baseName planned))
         pure (walkOk && planOk),
       -- A symlink target with a separator serialises to the POSIX
-      -- spelling on every platform (nova-nix #112): Windows stores a
+      -- spelling on every platform: Windows stores a
       -- reparse point with backslashes, so a target written bin/tool
       -- reads back bin\tool, and an unpack-then-recheck round-trip
       -- diverges from the archive unless the NAR boundary normalises
@@ -616,9 +616,9 @@ testNAR =
           (NAR.NarDirectory [(BS.pack [0x63, 0x61, 0x66, 0xC3, 0xA9], NAR.NarRegular False "au lait")])
           entry,
       -- POSIX names are bytes; one that is not valid UTF-8 must archive
-      -- verbatim (it used to be silently rewritten with replacement
-      -- characters).  Linux-gated: NTFS and APFS names are Unicode, so
-      -- the fixture cannot exist there.  "\56575" is the lone surrogate
+      -- verbatim, never rewritten with replacement characters.  Linux-gated:
+      -- NTFS and APFS names are Unicode, so the fixture cannot exist
+      -- there.  "\56575" is the lone surrogate
       -- GHC's filesystem encoding round-trips to byte 0xFF.
       test "serialiseFromPath carries a non-UTF-8 disk name verbatim" $
         if System.Info.os /= "linux"
@@ -2000,7 +2000,7 @@ testServer =
           resp <- serverRequest cfg "GET" ["no", "such", "route"] [] ""
           assertEqual "status" HTTP.status404 (WT.simpleStatus resp),
       -- HEAD is routed exactly like GET (upstream clients probe narinfo
-      -- existence with HEAD; it used to fall through to 404).
+      -- existence with HEAD).
       test "HEAD is served wherever GET is" $
         withServer Nothing Nothing $ \cfg -> do
           okResp <- serverRequest cfg "HEAD" ["nix-cache-info"] [] ""
