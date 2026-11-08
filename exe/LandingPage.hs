@@ -75,7 +75,7 @@ landingHtml info signingEnabled pubKey pathCount =
       "<pre><code>substituters = https://cache.novavero.ai" <> trustAnchorLine <> "</code></pre>",
       "<p>Store dir: <code>" <> ciStoreDir info <> "</code> &middot; protocol endpoints: <code>/nix-cache-info</code>, <code>/&lt;hash&gt;.narinfo</code>, <code>/nar/&lt;file&gt;</code></p>",
       "<h2>What this is</h2>",
-      "<p>The binary cache behind the Novavero Nix toolchain. Powered by <a href=\"https://github.com/Novavero-AI/nova-cache\">nova-cache</a>, a Haskell implementation of the Nix binary cache protocol. Read about the first package built by Nix natively on Windows on <a href=\"https://novavero.ai/blog/first-native-windows-nix-build.html\">the blog</a>.</p>",
+      "<p>The binary cache behind the Novavero Nix toolchain. Powered by <a href=\"https://github.com/Novavero-AI/nova-cache\">nova-cache</a>, a Haskell implementation of the Nix binary cache protocol. Read about nova-nix's native Windows builds on <a href=\"https://novavero.ai/blog/native-windows-builds-in-nova-nix\">the blog</a>.</p>",
       "<div class=\"footer\"><a href=\"https://novavero.ai\">Novavero AI</a> &middot; Waterloo, Canada</div>",
       "</div>",
       "</body>",
