@@ -1,0 +1,2 @@
+# The user nova-cache.service runs as.
+u nova-cache - "nova-cache binary cache server" /var/lib/nix-cache /usr/sbin/nologin
