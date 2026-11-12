@@ -14,9 +14,13 @@ env:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run in flight, so that one
+# is cancelled.  A run on main is never cancelled: it deploys the server,
+# and a cancel between the deploy's stop and start leaves the public cache
+# down with nothing to start it.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # ---------------------------------------------------------------------------
 # Lint jobs (fast, Linux-only)
