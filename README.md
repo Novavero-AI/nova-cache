@@ -153,10 +153,11 @@ nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
 
 ### Public cache
 
-A public instance runs at `cache.novavero.ai`. It serves the closure of
-nova-nix's Windows `hello` recipe, which nova-nix's CI publishes on every push
-to its main branch. To use it from Nix, add it to `/etc/nix/nix.conf`. On a
-multi-user install, Nix ignores substituters set by users it does not trust.
+A public instance runs at `cache.novavero.ai`. It serves the sources
+nova-nix's Windows packages are built from and the closure of its Windows
+`hello` recipe, which nova-nix's CI publishes on every push to its main
+branch. To use it from Nix, add it to `/etc/nix/nix.conf`. On a multi-user
+install, Nix ignores substituters set by users it does not trust.
 
 ```
 extra-substituters = https://cache.novavero.ai
