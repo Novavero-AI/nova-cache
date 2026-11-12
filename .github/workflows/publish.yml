@@ -22,7 +22,7 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # A Hackage tarball is immutable, so whatever heading the changelog
       # carries is frozen into the release.  Nothing is uploaded unless the
@@ -46,7 +46,7 @@ jobs:
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
           sed -i "s/^version:.*/version:            $TAG_VERSION/" nova-cache.cabal
           echo "Set version to $TAG_VERSION"
-      - uses: haskell-actions/setup@v2
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         with:
           ghc-version: '9.14.1'
           cabal-version: 'latest'
