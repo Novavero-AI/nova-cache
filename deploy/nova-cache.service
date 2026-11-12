@@ -1,0 +1,61 @@
+# nova-cache-server on the public cache's host: its own user, one writable
+# directory, and loopback alone.  The deploy job installs this file after
+# deploy/smoke-test.sh has started the server under it.
+
+[Unit]
+Description=Nova Cache Server
+After=network.target
+
+[Service]
+Type=simple
+User=nova-cache
+Group=nova-cache
+ExecStart=/usr/local/bin/nova-cache-server --host 127.0.0.1 --port 5000 --store %S/nix-cache
+Restart=always
+RestartSec=5
+
+# /var/lib/nix-cache.  systemd creates it if it is absent and gives it, with
+# everything under it, to the service's user, whoever owned it before.
+StateDirectory=nix-cache
+
+# The signing key reaches the service as a credential: systemd reads the file
+# as root and shows a copy to this unit alone, so the file stays root-only.
+# The write key comes from an environment file only root reads.
+LoadCredential=signing-key:/etc/nix-cache/secret-key
+Environment=SIGNING_KEY_FILE=%d/signing-key
+EnvironmentFile=/etc/nix-cache/env
+
+# The reverse proxy on the same host is the service's only client.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# The service reads its binary and its two keys, writes its state directory
+# and listens on one port.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

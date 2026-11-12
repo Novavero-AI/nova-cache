@@ -345,16 +345,19 @@ jobs:
         run: cabal test nova-cache-bzip2-test --enable-tests
 
   # ---------------------------------------------------------------------------
-  # Deploy (main branch only): build on the hosted arm64 image, ship the
-  # binary.  anv26 is an Ampere box on the same Ubuntu 24.04, so the
-  # runner's glibc matches - and the production host deliberately carries
-  # no compiler toolchain.
+  # Server (arm64): build the server on the hosted arm64 image, start it
+  # there under deploy/nova-cache.service, and on a push to main ship both
+  # to the public cache's host.  anv26 is an Ampere box on the same Ubuntu
+  # 24.04, so the runner's glibc matches and its systemd is the release the
+  # host runs, and the production host deliberately carries no compiler
+  # toolchain.  The smoke test runs on every pull request, so a unit the
+  # server cannot run under fails before it merges, and a deploy installs
+  # only what just ran.
   # ---------------------------------------------------------------------------
 
-  deploy-server:
-    name: Deploy Server
+  server:
+    name: Server (arm64)
     needs: [build]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -377,7 +380,11 @@ jobs:
           cabal build --flag server --ghc-options="-Wall -Werror"
           cp "$(cabal list-bin --flag server nova-cache-server)" /tmp/nova-cache-server
 
+      - name: Run the server under its unit
+        run: deploy/smoke-test.sh /tmp/nova-cache-server
+
       - name: Deploy to OCI
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
           OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
           CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
@@ -407,35 +414,12 @@ jobs:
             StrictHostKeyChecking accept-new
           SSHCFG
 
-          # Render the service unit.  The API key is not embedded in the
-          # unit: systemd loads it from /etc/nix-cache/env (written below,
-          # root-only), so the unit file carries no credentials.
-          cat > /tmp/nova-cache.service <<'EOF'
-          [Unit]
-          Description=Nova Cache Server
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=ubuntu
-          Group=ubuntu
-          ExecStart=/usr/local/bin/nova-cache-server --port 5000 --store /var/lib/nix-cache
-          Restart=always
-          RestartSec=5
-          Environment=PORT=5000
-          Environment=NIX_CACHE_DIR=/var/lib/nix-cache
-          Environment=SIGNING_KEY_FILE=/etc/nix-cache/secret-key
-          EnvironmentFile=/etc/nix-cache/env
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          scp /tmp/nova-cache.service anv26:/tmp/nova-cache.service
+          # The unit, the user it runs as and Caddy's restart policy are the
+          # files of deploy/, the first two as the smoke test above ran them.
           # The binary rides the same Access tunnel as everything else; the
           # service keeps serving during the transfer and stops only for
           # the install below.
-          scp /tmp/nova-cache-server anv26:/tmp/nova-cache-server
+          scp deploy/nova-cache.service deploy/nova-cache.sysusers deploy/caddy-restart.conf /tmp/nova-cache-server anv26:/tmp/
 
           # Provision the API key as a root-only environment file.  The value
           # travels over stdin, so it appears in no command line, no log, and
@@ -443,11 +427,21 @@ jobs:
           printf 'CACHE_API_KEY=%s\n' "$CACHE_API_KEY" | ssh anv26 \
             "sudo sh -c 'umask 077; mkdir -p /etc/nix-cache; cat > /etc/nix-cache/env; chown root:root /etc/nix-cache/env; chmod 600 /etc/nix-cache/env'"
 
+          # The signing key becomes root's: the unit hands the service a copy
+          # as a credential, so the service's user does not read the file.
+          # The store changes hands when the unit starts.  The last command
+          # fails the deploy if the server does not answer.
           ssh anv26 "\
+            sudo install -D -m 0644 /tmp/nova-cache.sysusers /etc/sysusers.d/nova-cache.conf && \
+            sudo systemd-sysusers /etc/sysusers.d/nova-cache.conf && \
+            sudo chown root:root /etc/nix-cache/secret-key && \
+            sudo chmod 600 /etc/nix-cache/secret-key && \
+            sudo install -D -m 0644 /tmp/caddy-restart.conf /etc/systemd/system/caddy.service.d/restart.conf && \
             sudo systemctl stop nova-cache.service && \
             sudo install -m 0755 /tmp/nova-cache-server /usr/local/bin/nova-cache-server && \
-            sudo cp /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
-            rm -f /tmp/nova-cache-server /tmp/nova-cache.service && \
+            sudo install -m 0644 /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
+            rm -f /tmp/nova-cache-server /tmp/nova-cache.service /tmp/nova-cache.sysusers /tmp/caddy-restart.conf && \
             sudo systemctl daemon-reload && \
             sudo systemctl start nova-cache.service && \
-            sudo systemctl status nova-cache.service --no-pager"
+            sudo systemctl status nova-cache.service --no-pager && \
+            curl --fail --silent --show-error --output /dev/null --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:5000/nix-cache-info"
