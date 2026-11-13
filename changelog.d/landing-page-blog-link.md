@@ -1,1 +1,0 @@
-- **The server's landing page links the blog post at its current address and describes it plainly.** It linked the post's former address, which now redirects, and called the build it describes the first package built by Nix natively on Windows, a claim earlier work by other projects contradicts. It now reads "nova-nix's native Windows builds" and links the post directly.

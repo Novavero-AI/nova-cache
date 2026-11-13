@@ -92,6 +92,10 @@ CACHE_API_KEY=change-me cabal run --flag server nova-cache-server -- --port 5000
 Without `CACHE_API_KEY` the server refuses to start. `--allow-open-writes` runs
 it with unauthenticated writes, for local testing only.
 
+`GET /` answers a line of plain text. `--root-page FILE` serves `FILE` there
+as HTML instead, such as a page about the cache; the server reads it once at
+startup and refuses to start if it cannot.
+
 The protocol lives in the `NovaCache.Server` library module as a WAI
 `Application`, so the cache can be embedded in another server with its own
 root page. The bundled executable is one such embedding.

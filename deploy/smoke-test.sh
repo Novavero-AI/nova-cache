@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Start nova-cache.service on this machine as the deploy installs it, and
 # check what the unit's sandbox could break: that the server starts, reads
-# its signing key, accepts an authenticated write and refuses another, that
-# a store another user owned becomes the service's, and that the server
-# answers on loopback alone.
+# its signing key and the root page the unit names, accepts an
+# authenticated write and refuses another, that a store another user owned
+# becomes the service's, and that the server answers on loopback alone.
 #
 # The keys are made here and stand in for the host's.  The machine is a
 # throwaway: the script installs into /usr/local/bin, /etc and /var/lib and
@@ -58,6 +58,7 @@ printf 'CACHE_API_KEY=%s\n' "$WRITE_KEY" |
   sudo sh -c 'umask 077; cat > /etc/nix-cache/env'
 
 sudo install -m 0755 "$server" /usr/local/bin/nova-cache-server
+sudo install -D -m 0644 "$here/index.html" /usr/local/share/nova-cache/index.html
 sudo install -D -m 0644 "$here/nova-cache.sysusers" /etc/sysusers.d/nova-cache.conf
 sudo systemd-sysusers /etc/sysusers.d/nova-cache.conf
 sudo install -m 0644 "$here/nova-cache.service" /etc/systemd/system/nova-cache.service
@@ -70,10 +71,16 @@ curl --fail --silent --show-error --output /dev/null \
 [ "$(systemctl is-active nova-cache.service)" = active ] || fail "the service is not active"
 pass "the server runs under the unit and answers on loopback"
 
-# The landing page prints the public key of the signing key it loaded.
-curl --fail --silent --show-error "$base/" | grep -q -F "$SIGNING_KEY_NAME:" ||
-  fail "the landing page does not name the signing key, so the server did not read it"
+# The server logs the public key of the signing key it loaded.
+sudo journalctl -u nova-cache.service --no-pager | grep -q -F "public key: $SIGNING_KEY_NAME:" ||
+  fail "the server logged no public key named $SIGNING_KEY_NAME, so it did not read its signing key"
 pass "the server read its signing key"
+
+page=$(sed -n 's/^ExecStart=.* --root-page \([^ ]*\).*$/\1/p' "$here/nova-cache.service")
+[ -n "$page" ] || fail "the unit's ExecStart names no --root-page"
+curl --fail --silent --show-error "$base/" | cmp -s - "$page" ||
+  fail "the root does not serve $page"
+pass "the root serves the page the unit names"
 
 code=$(printf '%s' "$BODY" | curl --silent --output /dev/null --write-out '%{http_code}' \
   -X PUT -H "Authorization: Bearer $WRITE_KEY" --data-binary @- "$base/nar/$NAR")

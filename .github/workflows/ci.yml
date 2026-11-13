@@ -414,12 +414,13 @@ jobs:
             StrictHostKeyChecking accept-new
           SSHCFG
 
-          # The unit, the user it runs as and Caddy's restart policy are the
-          # files of deploy/, the first two as the smoke test above ran them.
+          # The unit, the user it runs as, the root page and Caddy's restart
+          # policy are the files of deploy/, the first three as the smoke test
+          # above ran them.
           # The binary rides the same Access tunnel as everything else; the
           # service keeps serving during the transfer and stops only for
           # the install below.
-          scp deploy/nova-cache.service deploy/nova-cache.sysusers deploy/caddy-restart.conf /tmp/nova-cache-server anv26:/tmp/
+          scp deploy/nova-cache.service deploy/nova-cache.sysusers deploy/index.html deploy/caddy-restart.conf /tmp/nova-cache-server anv26:/tmp/
 
           # Provision the API key as a root-only environment file.  The value
           # travels over stdin, so it appears in no command line, no log, and
@@ -440,7 +441,8 @@ jobs:
             sudo systemctl stop nova-cache.service && \
             sudo install -m 0755 /tmp/nova-cache-server /usr/local/bin/nova-cache-server && \
             sudo install -m 0644 /tmp/nova-cache.service /etc/systemd/system/nova-cache.service && \
-            rm -f /tmp/nova-cache-server /tmp/nova-cache.service /tmp/nova-cache.sysusers /tmp/caddy-restart.conf && \
+            sudo install -D -m 0644 /tmp/index.html /usr/local/share/nova-cache/index.html && \
+            rm -f /tmp/nova-cache-server /tmp/nova-cache.service /tmp/nova-cache.sysusers /tmp/index.html /tmp/caddy-restart.conf && \
             sudo systemctl daemon-reload && \
             sudo systemctl start nova-cache.service && \
             sudo systemctl status nova-cache.service --no-pager && \

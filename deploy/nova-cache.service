@@ -10,7 +10,7 @@ After=network.target
 Type=simple
 User=nova-cache
 Group=nova-cache
-ExecStart=/usr/local/bin/nova-cache-server --host 127.0.0.1 --port 5000 --store %S/nix-cache
+ExecStart=/usr/local/bin/nova-cache-server --host 127.0.0.1 --port 5000 --store %S/nix-cache --root-page /usr/local/share/nova-cache/index.html
 Restart=always
 RestartSec=5
 

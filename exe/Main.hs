@@ -1,23 +1,24 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
+import Control.Exception (IOException, try)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import LandingPage (landingResponse)
+import Network.Wai (Response)
 import qualified Network.Wai.Handler.Warp as Warp
 import Network.Wai.Middleware.RequestLogger (logStdout)
-import NovaCache.Server (ServerConfig (..), cacheApp, newTTLCache, onExceptionResponse)
+import NovaCache.Server (ServerConfig (..), cacheApp, defaultRootResponse, htmlRootResponse, onExceptionResponse)
 import NovaCache.Signing (SecretKey, normalizeKeyText, parseSecretKey, renderPublicKey, toPublicKey)
-import NovaCache.Store (listNarInfoHashes, newFileStore)
+import NovaCache.Store (newFileStore)
 import ReclaimNars (reclaimCommand, reclaimMain)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure)
-import System.IO (hPutStrLn, stderr)
+import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
 import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
@@ -39,12 +40,9 @@ defaultBindHost = "*"
 defaultStoreRoot :: FilePath
 defaultStoreRoot = "./nix-cache"
 
--- | How long the landing page's store-path count may serve stale, in
--- seconds.  The count is a display stat; a minute of staleness is
--- invisible, and the bound keeps the unauthenticated root route at
--- constant cost regardless of request rate or store size.
-pathCountTTLSeconds :: Double
-pathCountTTLSeconds = 60
+-- | The flag naming the HTML file @GET \/@ serves.
+rootPageFlag :: String
+rootPageFlag = "--root-page"
 
 -- | Environment variable for the server port.
 portEnvVar :: String
@@ -87,6 +85,10 @@ main = do
 -- | Run the cache server.
 serve :: [String] -> IO ()
 serve args = do
+  -- Under systemd, stdout is a pipe to the journal, which GHC buffers by
+  -- block: the startup lines and each request's line would reach the
+  -- journal only when a block filled.
+  hSetBuffering stdout LineBuffering
   portEnv <- lookupEnv portEnvVar
   hostEnv <- lookupEnv hostEnvVar
   storeEnv <- lookupEnv storeEnvVar
@@ -105,21 +107,20 @@ serve args = do
       bindHost = fromMaybe defaultBindHost (argValue "--host" <|> hostEnv)
       storeRoot = fromMaybe (fromMaybe defaultStoreRoot storeEnv) (argValue "--store")
       allowOpenWrites = "--allow-open-writes" `elem` args
+      rootPage = argValue rootPageFlag
 
   store <- newFileStore storeRoot
   apiKey <- loadApiKey apiKeyEnv
   sigKey <- loadSigningKey sigKeyPath
   pubKey <- derivePublicKeyLine sigKey
-  -- The landing page's store-path count rescans at most once per TTL;
-  -- the unauthenticated root route must not pay a full store scan per hit.
-  countPaths <- newTTLCache pathCountTTLSeconds (length <$> listNarInfoHashes store)
+  rootResponse <- loadRootResponse rootPage
 
   let cfg =
         ServerConfig
           { scStore = store,
             scApiKey = apiKey,
             scSigningKey = sigKey,
-            scRootResponse = landingResponse countPaths store (isJust sigKey) pubKey
+            scRootResponse = rootResponse
           }
 
   let logRequests = logRequestsEnv /= Just "0"
@@ -131,6 +132,7 @@ serve args = do
   mapM_ (\k -> putStrLn ("public key: " ++ T.unpack k)) pubKey
   putStrLn ("write auth: " ++ maybe "disabled (open writes!)" (const "enabled") apiKey)
   putStrLn ("request logging: " ++ if logRequests then "enabled" else "disabled (LOG_REQUESTS=0)")
+  putStrLn ("root page: " ++ fromMaybe "none, plain text" rootPage)
 
   case apiKey of
     Nothing
@@ -150,6 +152,23 @@ serve args = do
           $ Warp.setPort port
           $ Warp.setOnExceptionResponse onExceptionResponse Warp.defaultSettings
   Warp.runSettings settings (requestLogger (cacheApp cfg))
+
+-- ---------------------------------------------------------------------------
+-- Root response
+-- ---------------------------------------------------------------------------
+
+-- | The response for @GET \/@: the HTML file 'rootPageFlag' names, read
+-- once at startup, or the library's line of plain text without one.  A
+-- file that cannot be read stops the server at startup.
+loadRootResponse :: Maybe FilePath -> IO (IO Response)
+loadRootResponse Nothing = pure defaultRootResponse
+loadRootResponse (Just path) = do
+  readResult <- try (BS.readFile path) :: IO (Either IOException BS.ByteString)
+  case readResult of
+    Right page -> pure (htmlRootResponse page)
+    Left err -> do
+      hPutStrLn stderr ("FATAL: cannot read the root page " ++ path ++ ": " ++ show err)
+      exitFailure
 
 -- ---------------------------------------------------------------------------
 -- Credential loading
@@ -186,9 +205,9 @@ loadSigningKey (Just path) = do
       exitFailure
     Right sk -> pure (Just sk)
 
--- | Derive the rendered public key line from the signing key, if any.
--- The landing page shows this line, so the published trust anchor always
--- matches the key in use; on a derivation failure the page omits it.
+-- | Derive the rendered public key line from the signing key, if any,
+-- for the startup log, so the key an operator publishes can be checked
+-- against the key in use; on a derivation failure the log omits it.
 derivePublicKeyLine :: Maybe SecretKey -> IO (Maybe Text)
 derivePublicKeyLine Nothing = pure Nothing
 derivePublicKeyLine (Just sk) = case toPublicKey sk of
