@@ -24,6 +24,7 @@ module NovaCache.Server
   ( -- * Configuration
     ServerConfig (..),
     defaultRootResponse,
+    htmlRootResponse,
     newTTLCache,
 
     -- * Application
@@ -151,6 +152,11 @@ data ServerConfig = ServerConfig
 defaultRootResponse :: IO Response
 defaultRootResponse =
   pure (responseLBS HTTP.status200 textHeaders "nova-cache: a Nix binary cache\n")
+
+-- | Root response serving a deployment's own HTML page, such as a page
+-- about the cache, as the embedder read it.
+htmlRootResponse :: ByteString -> IO Response
+htmlRootResponse page = pure (responseLBS HTTP.status200 htmlHeaders (BL.fromStrict page))
 
 -- | Memoize an action's result for a time-to-live, in seconds
 -- (monotonic clock, so wall-time jumps cannot starve the refresh).
@@ -587,6 +593,9 @@ onExceptionResponse _ = responseLBS HTTP.status500 textHeaders "internal server 
 -- | Content-Type: text/plain headers.
 textHeaders :: HTTP.ResponseHeaders
 textHeaders = [(HTTP.hContentType, "text/plain")]
+
+htmlHeaders :: HTTP.ResponseHeaders
+htmlHeaders = [(HTTP.hContentType, "text/html; charset=utf-8")]
 
 -- | Headers for the authenticated hash listing: push-tool plumbing that
 -- changes with every upload, so intermediaries must never cache it.

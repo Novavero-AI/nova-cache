@@ -170,7 +170,6 @@ executable nova-cache-server
 
   main-is:          Main.hs
   other-modules:
-    LandingPage
     ReclaimNars
   hs-source-dirs:   exe
   default-language:  Haskell2010
@@ -182,7 +181,6 @@ executable nova-cache-server
       base                >= 4.22 && < 5
     , bytestring          >= 0.11 && < 0.13
     , nova-cache
-    , http-types          >= 0.12 && < 0.13
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.17
     , wai                 >= 3.2 && < 3.3

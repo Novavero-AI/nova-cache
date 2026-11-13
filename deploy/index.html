@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/svg+xml" href="https://novavero.ai/favicon.svg" />
+  <title>cache.novavero.ai - Nix binary cache</title>
+  <meta name="description" content="The Nix binary cache nova-nix's CI publishes to: what it serves and how to use it." />
+  <link rel="canonical" href="https://cache.novavero.ai/" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://novavero.ai/palette.css" />
+  <link rel="stylesheet" href="https://novavero.ai/site.css" />
+</head>
+<body>
+  <div class="container">
+    <a href="https://novavero.ai/" class="back">&larr; Novavero</a>
+    <h1>cache.novavero.ai</h1>
+
+    <p>A Nix binary cache. On every push to main, <a href="https://novavero.ai/docs/nova-nix/">nova-nix</a>'s CI publishes to it what it builds for Windows: GNU Hello with everything its build needs, and the toolchain nova-nix builds from a 1,623-byte seed, with the source archives they come from. A build that names the cache downloads what the cache holds instead of building it.</p>
+
+    <h2>Use it</h2>
+    <p>In <code>nix.conf</code>, or in <code>NIX_CONFIG</code>:</p>
+<pre><code>extra-substituters = https://cache.novavero.ai
+extra-trusted-public-keys = cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=</code></pre>
+    <p>Or for one build:</p>
+<pre><code>nova-nix build FILE.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=</code></pre>
+    <p>The cache signs every narinfo with that key, and a client takes nothing the key does not sign.</p>
+
+    <h2>Protocol</h2>
+    <p>The Nix binary cache protocol over HTTPS, for the store directory <code>/nix/store</code>: <code>/nix-cache-info</code>, <code>/&lt;hash&gt;.narinfo</code> and <code>/nar/&lt;file&gt;</code>.</p>
+
+    <h2>Software</h2>
+    <p>The server is <a href="https://novavero.ai/docs/nova-cache/">nova-cache</a>, the Nix binary cache protocol in Haskell. <a href="https://novavero.ai/blog/native-windows-builds-in-nova-nix">Native Windows builds in nova-nix</a> describes the builds it serves.</p>
+  </div>
+</body>
+</html>

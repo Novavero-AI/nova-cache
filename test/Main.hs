@@ -1975,6 +1975,14 @@ testServer =
           ok1 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
           ok2 <- assertEqual "body" "nova-cache: a Nix binary cache\n" (WT.simpleBody resp)
           pure (ok1 && ok2),
+      test "GET / serves a deployment's root page as HTML" $
+        withServer Nothing Nothing $ \cfg -> do
+          let page = "<!DOCTYPE html><title>cache</title>"
+          resp <- serverRequest cfg {Server.scRootResponse = Server.htmlRootResponse page} "GET" [] [] ""
+          ok1 <- assertEqual "status" HTTP.status200 (WT.simpleStatus resp)
+          ok2 <- assertEqual "content type" (Just "text/html; charset=utf-8") (lookup HTTP.hContentType (WT.simpleHeaders resp))
+          ok3 <- assertEqual "body" page (strictBody resp)
+          pure (ok1 && ok2 && ok3),
       -- newTTLCache: within the TTL the action runs once; a zero TTL
       -- never satisfies the freshness check, so every call re-runs.
       test "newTTLCache memoizes within the TTL and re-runs past it" $ do
