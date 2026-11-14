@@ -115,7 +115,7 @@ root page. The bundled executable is one such embedding.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/` | Landing page: live stats and the cache public key |
+| `GET` | `/` | A line of plain text, or the `--root-page` file |
 | `GET` | `/nix-cache-info` | Cache metadata |
 | `GET` | `/narinfo-hashes` | All cached narinfo hashes, newline-delimited (authenticated) |
 | `GET` | `/<hash>.narinfo` | Fetch a narinfo |
