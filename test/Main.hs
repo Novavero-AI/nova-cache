@@ -3,6 +3,7 @@
 module Main (main) where
 
 import Control.Exception (IOException, SomeException, try)
+import Control.Monad (guard, zipWithM)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
 import Data.ByteArray (convert)
@@ -12,8 +13,8 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as BL
 import Data.Either (isLeft, isRight)
-import Data.Foldable (toList)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Foldable (toList, traverse_)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isSuffixOf, sort)
 import Data.Maybe (isJust)
 import Data.Set (Set)
@@ -23,6 +24,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (NominalDiffTime, UTCTime (..), addUTCTime, diffUTCTime, getCurrentTime, nominalDay)
+import Data.Traversable (for)
 import Data.Word (Word64, Word8)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, requestBodyLength, requestHeaders, requestMethod)
@@ -42,7 +44,7 @@ import System.Directory (createDirectory, createFileLink, doesDirectoryExist, em
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
 import qualified System.Info
-import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, listOf, listOf1, oneof, property, quickCheckWithResult, stdArgs, sublistOf, suchThat, vectorOf, (===))
+import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, ioProperty, listOf, listOf1, oneof, property, quickCheckWithResult, stdArgs, sublistOf, suchThat, suchThatMap, vectorOf, (.&&.), (===))
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -150,7 +152,8 @@ main = do
       testReclaim,
       testValidate,
       testServer,
-      testStoredNarCheck
+      testStoredNarCheck,
+      testMultipartUpload
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1557,6 +1560,77 @@ testReclaim =
         removeDirectoryRecursive tmpDir
         ok1 <- assertTrue "missing file fails" (case missing of Store.NarRemoveFailed _ -> True; _ -> False)
         ok2 <- assertEqual "traversal" Store.NarRemoveBadPath traversal
+        pure (ok1 && ok2),
+      -- Abandoned multipart uploads
+      test "property: a staged upload is eligible exactly when idle for the minimum age" $
+        checkProperty $
+          forAll genMinimumAge $ \minimumAge ->
+            forAll (listOf genStagedUpload) $ \uploads ->
+              let plan = Reclaim.selectAbandoned minimumAge referenceTime uploads
+               in (sort (map Store.suPath (Reclaim.upEligible plan ++ Reclaim.upTooYoung plan)) === sort (map Store.suPath uploads))
+                    .&&. all ((>= minimumAge) . uploadAge) (Reclaim.upEligible plan)
+                    .&&. all ((< minimumAge) . uploadAge) (Reclaim.upTooYoung plan),
+      test "a scan of staged uploads: an idle one is reclaimed, an active one and a stray directory are kept" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
+        idle <- stageUpload store "idle.nar" ["idle", " bytes"]
+        active <- stageUpload store "active.nar" ["active"]
+        createDirectory (tmpDir ++ "/uploads/stray")
+        setModificationTime (tmpDir ++ "/uploads/stray") monthAgo
+        traverse_ (backdateUpload monthAgo) . filter ((== "idle.nar") . Store.suFileName) =<< Store.listStagedUploads store
+        scan <- Reclaim.scanUploads store
+        let plan = Reclaim.selectAbandoned Reclaim.defaultMinimumAge (Reclaim.uploadScanTime scan) (Reclaim.uploadScanUploads scan)
+        removals <- traverse (\upload -> Store.removeUpload store (Store.suFileName upload) (Store.suUploadId upload)) (Reclaim.upEligible plan)
+        remaining <- map Store.suFileName <$> Store.listStagedUploads store
+        strayKept <- doesDirectoryExist (tmpDir ++ "/uploads/stray")
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertTrue "uploads staged" (isJust idle && isJust active)
+        ok2 <- assertEqual "eligible" [("idle.nar", 10)] [(Store.suFileName u, Store.suSize u) | u <- Reclaim.upEligible plan]
+        ok3 <- assertEqual "kept" ["active.nar"] (map Store.suFileName (Reclaim.upTooYoung plan))
+        ok4 <- assertEqual "removals" [Store.UploadRemoved] removals
+        ok5 <- assertEqual "remaining" ["active.nar"] remaining
+        ok6 <- assertTrue "stray directory kept" strayKept
+        pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+      test "a part, or a part in progress, written to an idle upload makes it active again" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
+        staged <- stageUpload store "resumed.nar" ["first"]
+        let ageNow = do
+              scan <- Reclaim.scanUploads store
+              let plan = Reclaim.selectAbandoned Reclaim.defaultMinimumAge (Reclaim.uploadScanTime scan) (Reclaim.uploadScanUploads scan)
+              pure (length (Reclaim.upEligible plan), length (Reclaim.upTooYoung plan))
+            backdateAll = traverse_ (backdateUpload monthAgo) =<< Store.listStagedUploads store
+        backdateAll
+        idle <- ageNow
+        written <- traverse (\uid -> writeStorePart store "resumed.nar" uid 2 ["second"] Server.maxNarBodySize) staged
+        afterPart <- ageNow
+        backdateAll
+        -- A part in progress is a temp file in the upload's directory.
+        uploads <- Store.listStagedUploads store
+        traverse_ (\upload -> BS.writeFile (Store.suPath upload ++ "/.nova123-4.tmp") "partial" >> setModificationTime (Store.suPath upload) monthAgo) uploads
+        afterTemp <- ageNow
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "idle (eligible, kept)" (1, 0) idle
+        ok2 <- assertEqual "part written" (Just (Just Store.PartWritten)) written
+        ok3 <- assertEqual "after a part (eligible, kept)" (0, 1) afterPart
+        ok4 <- assertEqual "after a part in progress (eligible, kept)" (0, 1) afterTemp
+        pure (ok1 && ok2 && ok3 && ok4),
+      test "a store with no uploads directory has no staged uploads" $ do
+        tmpDir <- createTestDir
+        uploads <- Store.listStagedUploads (Store.fileStoreAt tmpDir)
+        removeDirectoryRecursive tmpDir
+        assertEqual "uploads" [] uploads,
+      test "removeUpload refuses a traversal name" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        staged <- stageUpload store "kept.nar" ["kept"]
+        outcomes <- traverse (Store.removeUpload store "../kept.nar") staged
+        remaining <- map Store.suFileName <$> Store.listStagedUploads store
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "outcome" (Just Store.UploadRemoveBadPath) outcomes
+        ok2 <- assertEqual "remaining" ["kept.nar"] remaining
         pure (ok1 && ok2)
     ]
 
@@ -1635,6 +1709,55 @@ genTarget =
     [ (4, Reclaim.NamesNar <$> genNarName),
       (1, pure (Reclaim.Unresolvable "unparseable"))
     ]
+
+-- | An upload staged in a directory of its own, idle for a generated age.
+genStagedUpload :: Gen Store.StagedUpload
+genStagedUpload = do
+  uid <- genUploadId
+  age <- genAge
+  pure
+    Store.StagedUpload
+      { Store.suFileName = "n.nar",
+        Store.suUploadId = uid,
+        Store.suPath = "uploads/" ++ T.unpack (Store.renderUploadId uid) ++ "-n.nar",
+        Store.suSize = 0,
+        Store.suModified = addUTCTime (negate age) referenceTime
+      }
+
+uploadAge :: Store.StagedUpload -> NominalDiffTime
+uploadAge upload = diffUTCTime referenceTime (Store.suModified upload)
+
+genUploadId :: Gen Store.UploadId
+genUploadId = (T.pack <$> vectorOf 32 (elements lowerHexDigits)) `suchThatMap` Store.parseUploadId
+
+lowerHexDigits :: String
+lowerHexDigits = "0123456789abcdef"
+
+-- | Begin an upload of a NAR in a store and write its parts in order:
+-- the upload, when every step succeeded.
+stageUpload :: Store.FileStore -> Text -> [ByteString] -> IO (Maybe Store.UploadId)
+stageUpload store name parts = do
+  begun <- Store.beginUpload store name
+  case begun of
+    Nothing -> pure Nothing
+    Just uid -> do
+      written <- zipWithM (\n bytes -> writeStorePart store name uid n [bytes] Server.maxNarBodySize) [1 ..] parts
+      pure (if all (== Just Store.PartWritten) written then Just uid else Nothing)
+
+-- | Write part @n@ of an upload from chunks, under a cap; 'Nothing' when
+-- @n@ is not a part number.
+writeStorePart :: Store.FileStore -> Text -> Store.UploadId -> Int -> [ByteString] -> Int -> IO (Maybe Store.PartWriteResult)
+writeStorePart store name uid n chunks limit = case Store.parsePartNumber (T.pack (show n)) of
+  Nothing -> pure Nothing
+  Just part -> Just <$> (Store.writeUploadPart store name uid part limit =<< chunkSource chunks)
+
+-- | Set the modification time of an upload's files, then of its
+-- directory, which setting a file's time leaves alone.
+backdateUpload :: UTCTime -> Store.StagedUpload -> IO ()
+backdateUpload time upload = do
+  files <- listDirectory (Store.suPath upload)
+  traverse_ (\file -> setModificationTime (Store.suPath upload ++ "/" ++ file) time) files
+  setModificationTime (Store.suPath upload) time
 
 -- | Names 'Store.sanitizePath' admits.
 genSafeNarName :: Gen Text
@@ -2351,6 +2474,424 @@ genStoredNear claim =
   Server.StoredNar
     <$> oneof [pure (Server.ncFileSize claim), genFileSize]
     <*> oneof [pure (Server.ncFileHash claim), genNixHash]
+
+-- ---------------------------------------------------------------------------
+-- Multipart upload tests
+-- ---------------------------------------------------------------------------
+
+-- | Begin an upload of a NAR, authenticated: the response, and the id
+-- its body carries.
+beginServerUpload :: Server.ServerConfig -> Text -> IO (WT.SResponse, Text)
+beginServerUpload cfg name = do
+  resp <- serverRequest cfg "POST" ["nar", name, "uploads"] [serverAuthHeader] ""
+  pure (resp, T.strip (TE.decodeLatin1 (strictBody resp)))
+
+-- | Send a part of an upload, authenticated, by the part number as the
+-- path spells it.
+putServerPart :: Server.ServerConfig -> Text -> Text -> Text -> ByteString -> IO WT.SResponse
+putServerPart cfg name uploadId part bytes =
+  serverRequest cfg "PUT" ["nar", name, "uploads", uploadId, part] [serverAuthHeader] (BL.fromStrict bytes)
+
+-- | Complete an upload with a body, authenticated.
+completeServerUpload :: Server.ServerConfig -> Text -> Text -> ByteString -> IO WT.SResponse
+completeServerUpload cfg name uploadId body =
+  serverRequest cfg "POST" ["nar", name, "uploads", uploadId] [serverAuthHeader] (BL.fromStrict body)
+
+-- | A completion body, spelled out as the protocol defines it rather
+-- than rendered, so a change to the wire format fails here.
+totalsBody :: Int -> Int -> ByteString
+totalsBody parts size = TE.encodeUtf8 (T.pack ("Parts: " ++ show parts ++ "\nFileSize: " ++ show size ++ "\n"))
+
+-- | Upload bytes as a NAR, one request per part: the statuses of the
+-- begin, of each part and of the completion, in order.
+uploadInParts :: Server.ServerConfig -> Text -> [ByteString] -> IO [HTTP.Status]
+uploadInParts cfg name parts = do
+  (begun, uploadId) <- beginServerUpload cfg name
+  sent <- zipWithM (putServerPart cfg name uploadId . T.pack . show) [1 :: Int ..] parts
+  completed <- completeServerUpload cfg name uploadId (totalsBody (length parts) (sum (map BS.length parts)))
+  pure (map WT.simpleStatus (begun : sent ++ [completed]))
+
+-- | The entries of a store subdirectory, sorted.
+storeEntries :: Server.ServerConfig -> FilePath -> IO [FilePath]
+storeEntries cfg subdir = sort <$> listDirectory (Store.fsRoot (Server.scStore cfg) ++ "/" ++ subdir)
+
+-- | The files each staged upload's directory holds.
+stagedFiles :: Server.ServerConfig -> IO [[FilePath]]
+stagedFiles cfg = traverse (fmap sort . listDirectory . Store.suPath) =<< Store.listStagedUploads (Server.scStore cfg)
+
+-- | A response's status and body.
+statusAndBody :: WT.SResponse -> (HTTP.Status, ByteString)
+statusAndBody resp = (WT.simpleStatus resp, strictBody resp)
+
+-- | Split bytes at each length in turn, the remainder last, so there is
+-- always one part more than lengths.
+splitAtLengths :: [Int] -> ByteString -> [ByteString]
+splitAtLengths [] rest = [rest]
+splitAtLengths (len : lens) bytes = case BS.splitAt len bytes of
+  (piece, rest) -> piece : splitAtLengths lens rest
+
+testMultipartUpload :: IO Bool
+testMultipartUpload =
+  runGroup
+    "Multipart upload"
+    [ test "a NAR uploaded in parts is served back byte for byte, and its narinfo is accepted" $
+        withAuthedServer $ \cfg -> do
+          statuses <- uploadInParts cfg serverNarName ["nar-pay", "load-by", "tes"]
+          getResp <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          narInfoResp <- putServerNarInfo cfg validServerNarInfo
+          staged <- storeEntries cfg "uploads"
+          ok1 <- assertEqual "statuses" (HTTP.status201 : replicate 4 HTTP.status200) statuses
+          ok2 <- assertEqual "GET" (HTTP.status200, serverNarBytes) (statusAndBody getResp)
+          ok3 <- assertEqual "narinfo status" HTTP.status200 (WT.simpleStatus narInfoResp)
+          ok4 <- assertEqual "uploads left staged" [] staged
+          pure (ok1 && ok2 && ok3 && ok4),
+      test "beginning an upload answers 201, its id, and its path relative to the request's" $
+        withAuthedServer $ \cfg -> do
+          (begun, uploadId) <- beginServerUpload cfg serverNarName
+          (_, otherId) <- beginServerUpload cfg serverNarName
+          ok1 <- assertEqual "status" HTTP.status201 (WT.simpleStatus begun)
+          ok2 <- assertTrue "id is 32 lowercase hex digits" (T.length uploadId == 32 && T.all (`elem` lowerHexDigits) uploadId)
+          ok3 <- assertEqual "body" (TE.encodeUtf8 uploadId <> "\n") (strictBody begun)
+          ok4 <- assertEqual "Location" (Just ("uploads/" <> TE.encodeUtf8 uploadId)) (lookup HTTP.hLocation (WT.simpleHeaders begun))
+          ok5 <- assertTrue "each upload has its own id" (uploadId /= otherId)
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "an upload in progress leaves nothing under nar/" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" "nar-payload"
+          _ <- putServerPart cfg serverNarName uploadId "2" "-bytes"
+          refused <- completeServerUpload cfg serverNarName uploadId (totalsBody 3 17)
+          nars <- storeEntries cfg "nar"
+          getResp <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          narInfoResp <- putServerNarInfo cfg validServerNarInfo
+          ok1 <- assertEqual "completion" HTTP.status409 (WT.simpleStatus refused)
+          ok2 <- assertEqual "nar/" [] nars
+          ok3 <- assertEqual "GET status" HTTP.status404 (WT.simpleStatus getResp)
+          ok4 <- assertEqual "narinfo" (HTTP.status400, "NAR nar/test.nar is not stored; upload it before its narinfo") (statusAndBody narInfoResp)
+          pure (ok1 && ok2 && ok3 && ok4),
+      test "every upload request needs the write key" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          let requests headers =
+                [ serverRequest cfg "POST" ["nar", serverNarName, "uploads"] headers "",
+                  serverRequest cfg "PUT" ["nar", serverNarName, "uploads", uploadId, "1"] headers (BL.fromStrict serverNarBytes),
+                  serverRequest cfg "POST" ["nar", serverNarName, "uploads", uploadId] headers (BL.fromStrict (totalsBody 1 17))
+                ]
+          missing <- traverse (fmap WT.simpleStatus) (requests [])
+          wrong <- traverse (fmap WT.simpleStatus) (requests [(HTTP.hAuthorization, "Bearer not-the-key")])
+          staged <- stagedFiles cfg
+          nars <- storeEntries cfg "nar"
+          ok1 <- assertEqual "without a key" (replicate 3 HTTP.status401) missing
+          ok2 <- assertEqual "with the wrong key" (replicate 3 HTTP.status401) wrong
+          ok3 <- assertEqual "staged: the one authenticated upload, holding no part" [[]] staged
+          ok4 <- assertEqual "nar/" [] nars
+          pure (ok1 && ok2 && ok3 && ok4),
+      test "a part that would leave a gap is 409, and the upload still completes" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          early <- putServerPart cfg serverNarName uploadId "2" "load-by"
+          firstPart <- putServerPart cfg serverNarName uploadId "1" "nar-pay"
+          skipped <- putServerPart cfg serverNarName uploadId "3" "tes"
+          staged <- stagedFiles cfg
+          _ <- putServerPart cfg serverNarName uploadId "2" "load-by"
+          _ <- putServerPart cfg serverNarName uploadId "3" "tes"
+          completed <- completeServerUpload cfg serverNarName uploadId (totalsBody 3 17)
+          getResp <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          ok1 <- assertEqual "part 2 first" (HTTP.status409, "upload of nar/test.nar holds 0 parts, so the next is part 1, not part 2") (statusAndBody early)
+          ok2 <- assertEqual "part 1" HTTP.status200 (WT.simpleStatus firstPart)
+          ok3 <- assertEqual "part 3 after part 1" (HTTP.status409, "upload of nar/test.nar holds 1 part, so the next is part 2, not part 3") (statusAndBody skipped)
+          ok4 <- assertEqual "parts held after the refusals" [["1"]] staged
+          ok5 <- assertEqual "completion" HTTP.status200 (WT.simpleStatus completed)
+          ok6 <- assertEqual "GET body" serverNarBytes (strictBody getResp)
+          pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+      test "a part sent again replaces the one held" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" "a first attempt"
+          _ <- putServerPart cfg serverNarName uploadId "2" "-bytes"
+          resent <- putServerPart cfg serverNarName uploadId "1" "nar-payload"
+          completed <- completeServerUpload cfg serverNarName uploadId (totalsBody 2 17)
+          getResp <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          ok1 <- assertEqual "part 1 again" HTTP.status200 (WT.simpleStatus resent)
+          ok2 <- assertEqual "completion" HTTP.status200 (WT.simpleStatus completed)
+          ok3 <- assertEqual "GET body" serverNarBytes (strictBody getResp)
+          pure (ok1 && ok2 && ok3),
+      test "a part number other than 1 to 10000 in canonical decimal is 400" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          let spellings = ["0", "01", "10001", "-1", "+1", "1.0", "one", ""]
+          responses <- traverse (\part -> putServerPart cfg serverNarName uploadId part "x") spellings
+          staged <- stagedFiles cfg
+          ok1 <- assertEqual "statuses" (map (const HTTP.status400) spellings) (map WT.simpleStatus responses)
+          ok2 <- assertEqual "body" "part number must be a whole number from 1 to 10000" (foldMap strictBody (take 1 responses))
+          ok3 <- assertEqual "parts held" [[]] staged
+          pure (ok1 && ok2 && ok3),
+      test "a part declaring more than the NAR cap is 413 before it is read" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          resp <-
+            serverRequestSized
+              cfg
+              "PUT"
+              ["nar", serverNarName, "uploads", uploadId, "1"]
+              [serverAuthHeader]
+              (fromIntegral Server.maxNarBodySize + 1)
+          staged <- stagedFiles cfg
+          ok1 <- assertEqual "status" HTTP.status413 (WT.simpleStatus resp)
+          ok2 <- assertEqual "parts held" [[]] staged
+          pure (ok1 && ok2),
+      test "an upload's parts are held to the cap together, and a part over it changes nothing" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        staged <- stageUpload store "capped.nar" ["abc"]
+        let write n chunks = maybe (pure Nothing) (\uid -> writeStorePart store "capped.nar" uid n chunks 8) staged
+        over <- write 2 ["fgh", "ijk"]
+        heldAfterOver <- traverse (fmap sort . listDirectory . Store.suPath) =<< Store.listStagedUploads store
+        fits <- write 2 ["defgh"]
+        regrown <- write 1 ["abcd"]
+        completed <- traverse (\uid -> traverse (Store.completeUpload store "capped.nar" uid 8) (totalsOf 2 8)) staged
+        stored <- Store.readNar store "capped.nar"
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "part 2 over the cap" (Just Store.PartTooLarge) over
+        ok2 <- assertEqual "files held after it" [["1"]] heldAfterOver
+        ok3 <- assertEqual "part 2 within the cap" (Just Store.PartWritten) fits
+        ok4 <- assertEqual "part 1 again, past the cap with part 2" (Just Store.PartTooLarge) regrown
+        ok5 <- assertEqual "completion" (Just (Just Store.UploadCompleted)) completed
+        ok6 <- assertEqual "stored" (Just "abcdefgh") stored
+        pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+      test "two part writes at once can pass the cap together, and completion refuses what they join to" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        staged <- stageUpload store "raced.nar" ["a", "b"]
+        -- Part 2 is written while part 1 streams, so each finds the other
+        -- at one byte and is allowed seven under a cap of eight.
+        raced <- for staged $ \uid -> do
+          secondWrite <- newIORef Nothing
+          rest <- chunkSource ["1111111"]
+          let source = do
+                pending <- readIORef secondWrite
+                case pending of
+                  Nothing -> writeIORef secondWrite . Just =<< writeStorePart store "raced.nar" uid 2 ["2222222"] 8
+                  Just _ -> pure ()
+                rest
+          first <- traverse (\part -> Store.writeUploadPart store "raced.nar" uid part 8 source) (Store.parsePartNumber "1")
+          second <- readIORef secondWrite
+          completed <- traverse (Store.completeUpload store "raced.nar" uid 8) (totalsOf 2 14)
+          pure (first, second, completed)
+        nars <- listDirectory (tmpDir ++ "/nar")
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "both parts written" (Just (Just Store.PartWritten, Just (Just Store.PartWritten))) (fmap (\(first, second, _) -> (first, second)) raced)
+        ok2 <- assertEqual "completion" (Just (Just (Store.CompletionTooLarge 14))) (fmap (\(_, _, completed) -> completed) raced)
+        ok3 <- assertEqual "nar/" [] nars
+        pure (ok1 && ok2 && ok3),
+      test "a join that cannot be renamed into nar/ leaves no copy behind" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        staged <- stageUpload store "blocked.nar" ["nar", "-bytes"]
+        createDirectory (tmpDir ++ "/nar/blocked.nar")
+        completed <- for staged $ \uid -> traverse (tryIO . Store.completeUpload store "blocked.nar" uid Server.maxNarBodySize) (totalsOf 2 9)
+        held <- traverse (fmap sort . listDirectory . Store.suPath) =<< Store.listStagedUploads store
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertTrue "completion failed" (case completed of Just (Just (Left _)) -> True; _ -> False)
+        ok2 <- assertEqual "files held" [["1", "2"]] held
+        pure (ok1 && ok2),
+      test "a temp file left in an upload is neither joined nor left behind" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        staged <- stageUpload store "tidy.nar" ["abc"]
+        traverse_ (\upload -> BS.writeFile (Store.suPath upload ++ "/.nova123-4.tmp") "leftover") =<< Store.listStagedUploads store
+        completed <- for staged $ \uid -> traverse (Store.completeUpload store "tidy.nar" uid 8) (totalsOf 1 3)
+        stored <- Store.readNar store "tidy.nar"
+        remaining <- listDirectory (tmpDir ++ "/uploads")
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "completion" (Just (Just Store.UploadCompleted)) completed
+        ok2 <- assertEqual "stored" (Just "abc") stored
+        ok3 <- assertEqual "uploads/" [] remaining
+        pure (ok1 && ok2 && ok3),
+      test "a completion declaring a FileSize over the NAR cap is 413" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" serverNarBytes
+          resp <- completeServerUpload cfg serverNarName uploadId (totalsBody 1 (Server.maxNarBodySize + 1))
+          nars <- storeEntries cfg "nar"
+          ok1 <- assertEqual "refusal" (HTTP.status413, "FileSize 4294967297 is over the 4294967296 bytes a NAR may hold") (statusAndBody resp)
+          ok2 <- assertEqual "nar/" [] nars
+          pure (ok1 && ok2),
+      test "a NAR name too long to stage is 400" $
+        withAuthedServer $ \cfg -> do
+          -- The staging directory is named by the 32-digit id, a dash and
+          -- the NAR's name, 256 long here, past the 255 a file name holds.
+          resp <- serverRequest cfg "POST" ["nar", T.replicate 219 "a" <> ".nar", "uploads"] [serverAuthHeader] ""
+          staged <- storeEntries cfg "uploads"
+          ok1 <- assertEqual "refusal" (HTTP.status400, "invalid path") (statusAndBody resp)
+          ok2 <- assertEqual "uploads begun" [] staged
+          pure (ok1 && ok2),
+      test "a request for an upload that is not staged is 404" $
+        withAuthedServer $ \cfg -> do
+          (_, otherId) <- beginServerUpload cfg "other.nar"
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" serverNarBytes
+          _ <- completeServerUpload cfg serverNarName uploadId (totalsBody 1 17)
+          let neverIssued = T.replicate 32 "0"
+          responses <-
+            sequence
+              [ completeServerUpload cfg serverNarName neverIssued (totalsBody 1 17),
+                putServerPart cfg serverNarName neverIssued "1" "x",
+                completeServerUpload cfg serverNarName "not-an-id" (totalsBody 1 17),
+                completeServerUpload cfg serverNarName otherId (totalsBody 1 17),
+                completeServerUpload cfg serverNarName uploadId (totalsBody 1 17),
+                putServerPart cfg serverNarName uploadId "2" "x"
+              ]
+          ok1 <- assertEqual "statuses" (map (const HTTP.status404) responses) (map WT.simpleStatus responses)
+          ok2 <- assertEqual "body" ("no upload " <> TE.encodeUtf8 neverIssued <> " of nar/test.nar") (foldMap strictBody (take 1 responses))
+          pure (ok1 && ok2),
+      test "a NAR name the store cannot hold is 400 on every upload request" $
+        withAuthedServer $ \cfg -> do
+          let uploadId = T.replicate 32 "0"
+          responses <-
+            sequence
+              [ serverRequest cfg "POST" ["nar", "..", "uploads"] [serverAuthHeader] "",
+                serverRequest cfg "POST" ["nar", ".nova.tmp1", "uploads"] [serverAuthHeader] "",
+                putServerPart cfg "nul" uploadId "1" "x",
+                completeServerUpload cfg "a/b" uploadId (totalsBody 1 1)
+              ]
+          staged <- storeEntries cfg "uploads"
+          ok1 <- assertEqual "statuses" (map (const HTTP.status400) responses) (map WT.simpleStatus responses)
+          ok2 <- assertEqual "uploads begun" [] staged
+          pure (ok1 && ok2),
+      test "a completion declaring other parts or another size is 409, and the upload stays" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" "nar-payload"
+          _ <- putServerPart cfg serverNarName uploadId "2" "-bytes"
+          refusals <- traverse (completeServerUpload cfg serverNarName uploadId) [totalsBody 3 17, totalsBody 1 17, totalsBody 2 18, totalsBody 2 16]
+          nars <- storeEntries cfg "nar"
+          staged <- stagedFiles cfg
+          completed <- completeServerUpload cfg serverNarName uploadId (totalsBody 2 17)
+          getResp <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          ok1 <-
+            assertEqual
+              "refusals"
+              [ (HTTP.status409, "upload of nar/test.nar holds 2 parts, Parts is 3"),
+                (HTTP.status409, "upload of nar/test.nar holds 2 parts, Parts is 1"),
+                (HTTP.status409, "upload of nar/test.nar joins to 17 bytes, FileSize is 18"),
+                (HTTP.status409, "upload of nar/test.nar joins to 17 bytes, FileSize is 16")
+              ]
+              (map statusAndBody refusals)
+          ok2 <- assertEqual "nar/" [] nars
+          ok3 <- assertEqual "files held, no join left behind" [["1", "2"]] staged
+          ok4 <- assertEqual "completion" HTTP.status200 (WT.simpleStatus completed)
+          ok5 <- assertEqual "GET body" serverNarBytes (strictBody getResp)
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "a completion body other than one Parts line and one FileSize line is refused" $ do
+        let refused =
+              [ "",
+                "Parts: 1\n",
+                "FileSize: 3\n",
+                "Parts: 1\nFileSize: 3\nFileHash: sha256:00\n",
+                "Parts: 1\nParts: 1\nFileSize: 3\n",
+                "Parts: 01\nFileSize: 3\n",
+                "Parts: 1\nFileSize: 03\n",
+                "Parts: 1\nFileSize: -3\n",
+                "Parts: 1\nFileSize: 3 \n",
+                "Parts: 0\nFileSize: 0\n",
+                "Parts: 10001\nFileSize: 3\n",
+                "Parts 1\nFileSize: 3\n",
+                "Parts: 1\n\nFileSize: 3\n",
+                "Parts: 1\r\nFileSize: 3\r\n",
+                "Parts: 1\nFileSize: 123456789012345678901\n",
+                BS.pack [0x50, 0xff]
+              ]
+            accepted = ["FileSize: 3\nParts: 1\n", "Parts: 1\nFileSize: 3"]
+            expected = map (const (totalsOf 1 3)) accepted
+        ok1 <- assertEqual "refused bodies accepted" [] [body | body <- refused, isRight (Server.parseUploadTotals body)]
+        ok2 <- assertEqual "accepted" expected (map (either (const Nothing) Just . Server.parseUploadTotals) accepted)
+        pure (ok1 && ok2),
+      test "a malformed completion body is 400, and one over its cap is 413" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" serverNarBytes
+          malformed <- completeServerUpload cfg serverNarName uploadId "Parts: 1\n"
+          oversized <- completeServerUpload cfg serverNarName uploadId (BS.replicate (Server.maxUploadTotalsBodySize + 1) 0x20)
+          nars <- storeEntries cfg "nar"
+          ok1 <- assertEqual "malformed" (HTTP.status400, "completion body has no FileSize line") (statusAndBody malformed)
+          ok2 <- assertEqual "oversized" HTTP.status413 (WT.simpleStatus oversized)
+          ok3 <- assertEqual "nar/" [] nars
+          pure (ok1 && ok2 && ok3),
+      test "two uploads of one NAR stage apart" $
+        withAuthedServer $ \cfg -> do
+          (_, firstId) <- beginServerUpload cfg serverNarName
+          (_, secondId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName firstId "1" "first"
+          _ <- putServerPart cfg serverNarName secondId "1" "second"
+          _ <- completeServerUpload cfg serverNarName firstId (totalsBody 1 5)
+          afterFirst <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          _ <- completeServerUpload cfg serverNarName secondId (totalsBody 1 6)
+          afterSecond <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+          ok1 <- assertEqual "after the first" "first" (strictBody afterFirst)
+          ok2 <- assertEqual "after the second" "second" (strictBody afterSecond)
+          pure (ok1 && ok2),
+      test "property: a NAR uploaded in parts of any sizes is served back byte for byte" $
+        withAuthedServer $ \cfg ->
+          checkProperty $
+            forAll genSplitBytes $ \(bytes, lengths) ->
+              ioProperty $ do
+                let parts = splitAtLengths lengths bytes
+                statuses <- uploadInParts cfg serverNarName parts
+                served <- serverRequest cfg "GET" ["nar", serverNarName] [] ""
+                pure ((statuses === HTTP.status201 : replicate (length parts + 1) HTTP.status200) .&&. (strictBody served === bytes)),
+      test "property: completion totals render and parse back" $
+        checkProperty $
+          forAll genUploadTotals $ \totals ->
+            Server.parseUploadTotals (Server.renderUploadTotals totals) === Right totals,
+      test "property: a part number reads back exactly when it is 1 to 10000 in canonical decimal" $
+        checkProperty $
+          forAll (choose (-3, Store.maxUploadParts + 3)) $ \n ->
+            let spelled = T.pack (show n)
+                inRange = n >= 1 && n <= Store.maxUploadParts
+             in ((Store.renderPartNumber <$> Store.parsePartNumber spelled) === (spelled <$ guard inRange))
+                  .&&. (Store.parsePartNumber ("0" <> spelled) === Nothing),
+      test "property: an upload id reads back exactly when it is 32 lowercase hex digits" $
+        checkProperty $
+          forAll genUploadIdText $ \txt ->
+            let wellFormed = T.length txt == 32 && T.all (`elem` lowerHexDigits) txt
+             in (Store.renderUploadId <$> Store.parseUploadId txt) === (txt <$ guard wellFormed)
+    ]
+
+-- | Bytes, and the lengths of the parts to split them into before the
+-- last; a length may run past the bytes, which leaves empty parts.
+genSplitBytes :: Gen (ByteString, [Int])
+genSplitBytes = do
+  bytes <- BS.pack <$> listOf arbitrary
+  lengths <- listOf (choose (0, 24))
+  pure (bytes, lengths)
+
+-- | 'try' at 'IOException'.
+tryIO :: IO a -> IO (Either IOException a)
+tryIO = try
+
+-- | Totals over every part count and any size up to the uint64 maximum.
+genUploadTotals :: Gen Store.UploadTotals
+genUploadTotals =
+  Store.UploadTotals
+    <$> (T.pack . show <$> choose (1, Store.maxUploadParts)) `suchThatMap` Store.parsePartNumber
+    <*> genFileSize
+
+-- | Mostly upload ids, and near misses: a digit short or over, or an
+-- uppercase digit.
+genUploadIdText :: Gen Text
+genUploadIdText =
+  oneof
+    [ T.pack <$> vectorOf 32 (elements lowerHexDigits),
+      T.pack <$> vectorOf 31 (elements lowerHexDigits),
+      T.pack <$> vectorOf 33 (elements lowerHexDigits),
+      T.pack <$> vectorOf 32 (elements (lowerHexDigits ++ "ABCDEF"))
+    ]
+
+-- | 'Store.UploadTotals' of a part count and size; 'Nothing' when the
+-- count is not a part number.
+totalsOf :: Int -> Integer -> Maybe Store.UploadTotals
+totalsOf parts size = (`Store.UploadTotals` size) <$> Store.parsePartNumber (T.pack (show parts))
 
 -- ---------------------------------------------------------------------------
 -- Helpers

@@ -122,15 +122,64 @@ root page. The bundled executable is one such embedding.
 | `GET` | `/nar/<file>` | Fetch a NAR (streamed from disk) |
 | `PUT` | `/<hash>.narinfo` | Upload a narinfo (authenticated, validated; refused unless the NAR its `URL` names is stored with its `FileSize` and `FileHash`) |
 | `PUT` | `/nar/<file>` | Upload a NAR (authenticated, streamed to disk) |
+| `POST` | `/nar/<file>/uploads` | Begin a multipart upload of a NAR (authenticated) |
+| `PUT` | `/nar/<file>/uploads/<id>/<n>` | Upload part `n` of it (authenticated, streamed to disk) |
+| `POST` | `/nar/<file>/uploads/<id>` | Complete it: join the parts into `nar/<file>` (authenticated) |
 
 `HEAD` is answered wherever `GET` is.
+
+### Uploading a NAR in parts
+
+A proxy in front of the server can refuse a request body over its own limit,
+as Cloudflare does over 100 MB on its Free and Pro plans. A NAR over such a
+limit is uploaded in parts, one request each:
+
+1. `POST /nar/<file>/uploads` answers `201` with the upload's id, followed by
+   a newline, as the body, and `Location: uploads/<id>`.
+2. `PUT /nar/<file>/uploads/<id>/<n>` sends part `n` as the body. Parts are
+   numbered from 1 and go in order: part `n` is accepted once parts 1 to
+   `n - 1` are held. A part sent again replaces the one held, so a part whose
+   response was lost can be sent again.
+3. `POST /nar/<file>/uploads/<id>` completes the upload. Its body declares
+   how many parts were sent and how many bytes they hold together:
+
+   ```
+   Parts: 3
+   FileSize: 107200936
+   ```
+
+   The server joins the parts into `nar/<file>` only if it holds that many
+   parts and they join to that size. Nothing of an upload is under `nar/`
+   before then. The narinfo follows as for a NAR sent in one request.
+
+Each part is as large as the client chooses. The parts of an upload together
+are held to the 4 GB of a single `PUT /nar/<file>`, and an upload to 10,000
+parts.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The file name, the part number or the completion body is not valid |
+| `401` | The write key is missing or wrong |
+| `404` | No such upload of that file: never begun, completed, or reclaimed |
+| `409` | The part would leave a gap, or the server holds other parts or another size than the completion declares |
+| `413` | The parts would hold more than 4 GB, the completion declares a `FileSize` over 4 GB, or its body is over 1 KB |
+
+A part whose response is lost can be sent again. To a client that sends its
+parts in order, a `404` or `409` for a part means the server no longer holds
+the parts sent before it, such as an upload `reclaim-nars` removed, so it
+begins a new upload. Completion joins the whole NAR before it answers, so its
+response can be lost, or a retry can meet the first attempt still joining:
+whenever the completion is answered with anything but `200`, or not at all, the
+client uploads the narinfo, whose check of the NAR's `FileSize` and `FileHash`
+decides whether it is stored, and begins a new upload if the narinfo is refused
+for want of its NAR.
 
 ### Reclaiming unreferenced NARs
 
 A client uploads each NAR before its narinfo, so a NAR whose narinfo was
 refused, or never sent because the push died, stays under `nar/` with nothing
-referencing it. No endpoint deletes anything. The `reclaim-nars` subcommand
-does, run on the host against the store directory:
+referencing it. No endpoint deletes a NAR or a narinfo. The `reclaim-nars`
+subcommand does, run on the host against the store directory:
 
 ```bash
 nova-cache-server reclaim-nars --store /var/lib/nix-cache           # list
@@ -151,6 +200,11 @@ nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
   NAR, which leaves a signed narinfo with nothing behind it.
 - A deletion that fails is reported for that file, and the exit status is
   nonzero.
+- The run also removes multipart uploads begun and never completed, whose
+  parts are under `uploads/`, once nothing has been written to one for
+  `--min-age-hours`. No narinfo can name an upload's parts, so removing them
+  never leaves a narinfo without its NAR: a push that resumes the upload is
+  refused and begins a new one. A blocked run removes no upload either.
 - The store root comes from `--store`, then `NIX_CACHE_DIR`, then
   `./nix-cache`, as for the server. A missing `narinfo/` or `nar/` directory is
   an error, never an empty store.

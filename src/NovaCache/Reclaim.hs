@@ -16,6 +16,11 @@
 -- shown to be unreferenced.  And a store holding NARs and no narinfo at
 -- all blocks it too ('NoNarInfos').  None of them makes a run atomic
 -- with the server: 'scanStore' says what remains.
+--
+-- A multipart upload begun and never completed leaves its parts under
+-- @uploads\/@ ("NovaCache.Store").  No narinfo can reference a staged
+-- upload, so the minimum age alone decides ('selectAbandoned'), counted
+-- from the upload's last activity, and 'scanUploads' reads them.
 module NovaCache.Reclaim
   ( -- * Narinfo references
     NarInfoTarget (..),
@@ -34,6 +39,12 @@ module NovaCache.Reclaim
     -- * Scanning a store
     StoreScan (..),
     scanStore,
+
+    -- * Abandoned uploads
+    UploadPlan (..),
+    selectAbandoned,
+    UploadScan (..),
+    scanUploads,
   )
 where
 
@@ -50,7 +61,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime, nominalDay)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo)
-import NovaCache.Store (FileStore, NarFile (..), listNarFiles, listNarInfoFiles, sanitizePath)
+import NovaCache.Store (FileStore, NarFile (..), StagedUpload (..), listNarFiles, listNarInfoFiles, listStagedUploads, sanitizePath)
 import System.IO.Error (ioeGetErrorString)
 
 -- ---------------------------------------------------------------------------
@@ -144,9 +155,14 @@ selectUnreferenced :: NominalDiffTime -> UTCTime -> Set Text -> [NarFile] -> Rec
 selectUnreferenced minimumAge now references nars =
   ReclaimPlan {rpEligible = old, rpTooYoung = young}
   where
-    (old, young) = partition oldEnough (filter unreferenced nars)
+    (old, young) = partitionByAge nfModified minimumAge now (filter unreferenced nars)
     unreferenced nar = Set.notMember (nfName nar) references
-    oldEnough nar = diffUTCTime now (nfModified nar) >= minimumAge
+
+-- | Split by age at the given time, counted from a modification time:
+-- those at least the minimum age old, then the younger.
+partitionByAge :: (a -> UTCTime) -> NominalDiffTime -> UTCTime -> [a] -> ([a], [a])
+partitionByAge modified minimumAge now =
+  partition (\item -> diffUTCTime now (modified item) >= minimumAge)
 
 -- | Why a run cannot be planned.
 data ReclaimBlocked
@@ -210,3 +226,45 @@ scanStore store = do
       contents <- try (BS.readFile path)
       let !target = narInfoTarget contents
       pure (path, target)
+
+-- ---------------------------------------------------------------------------
+-- Abandoned uploads
+-- ---------------------------------------------------------------------------
+
+-- | The staged uploads of a store, split by the minimum age.
+data UploadPlan = UploadPlan
+  { -- | Idle for at least the minimum age: abandoned.
+    upEligible :: ![StagedUpload],
+    -- | Active within the minimum age: a push may yet complete them.
+    upTooYoung :: ![StagedUpload]
+  }
+  deriving (Eq, Show)
+
+-- | Split staged uploads by the time since their last activity, by the
+-- same minimum age as unreferenced NARs.  A staged upload holds only
+-- parts, which nothing serves and no narinfo names, so removing one
+-- never leaves a narinfo without its NAR: a push that resumes an upload
+-- removed under it is refused and begins a new one.  The age is there
+-- for that push, which is the only thing the removal can hurt.
+selectAbandoned :: NominalDiffTime -> UTCTime -> [StagedUpload] -> UploadPlan
+selectAbandoned minimumAge now uploads =
+  UploadPlan {upEligible = old, upTooYoung = young}
+  where
+    (old, young) = partitionByAge suModified minimumAge now uploads
+
+-- | What a scan of the staged uploads read, and when.
+data UploadScan = UploadScan
+  { uploadScanUploads :: ![StagedUpload],
+    uploadScanTime :: !UTCTime
+  }
+  deriving (Eq, Show)
+
+-- | Read a store's staged uploads for 'selectAbandoned'.  The time is
+-- taken after the listing, so activity the listing saw is never in the
+-- future of it.  A directory that cannot be read fails the scan with its
+-- 'IOException', as 'scanStore' does.
+scanUploads :: FileStore -> IO UploadScan
+scanUploads store = do
+  uploads <- listStagedUploads store
+  now <- getCurrentTime
+  pure UploadScan {uploadScanUploads = uploads, uploadScanTime = now}
