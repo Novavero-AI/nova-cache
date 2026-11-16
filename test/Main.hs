@@ -4,7 +4,7 @@
 module Main (main) where
 
 import Control.Concurrent (myThreadId)
-import Control.Exception (AsyncException (UserInterrupt), IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
+import Control.Exception (AsyncException (UserInterrupt), Exception, IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
 import Control.Monad (guard, void, zipWithM)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
@@ -42,10 +42,10 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (Permissions, createDirectory, createFileLink, doesDirectoryExist, emptyPermissions, getPermissions, getTemporaryDirectory, listDirectory, readable, removeDirectoryRecursive, removeFile, searchable, setModificationTime, setOwnerExecutable, setOwnerReadable, setOwnerSearchable, setPermissions)
+import System.Directory (Permissions, createDirectory, createDirectoryLink, createFileLink, doesDirectoryExist, emptyPermissions, getPermissions, getTemporaryDirectory, listDirectory, readable, removeDirectoryRecursive, removeFile, searchable, setModificationTime, setOwnerExecutable, setOwnerReadable, setOwnerSearchable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
-import System.IO.Error (isPermissionError, mkIOError, permissionErrorType)
+import System.IO.Error (ioeGetErrorString, isPermissionError, isUserError, mkIOError, permissionErrorType)
 import qualified System.Info
 import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, ioProperty, listOf, listOf1, oneof, property, quickCheckWithResult, stdArgs, sublistOf, suchThat, suchThatMap, vectorOf, (.&&.), (===))
 #if defined(darwin_HOST_OS)
@@ -55,6 +55,10 @@ import Foreign.C.Types (CInt (..))
 import System.Directory (getSymbolicLinkTarget)
 import System.Posix.Internals (withFilePath)
 import System.Posix.Types (CMode (..))
+#endif
+#if !defined(mingw32_HOST_OS)
+import qualified Network.Socket as Socket
+import qualified System.Posix.Files as Posix
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -619,6 +623,31 @@ testNAR =
             eagerOk <- assertEqual "eager target spelling" expectedEntry eager
             streamOk <- assertEqual "streamed target spelling" (NAR.serialise expectedEntry) streamed
             pure (eagerOk && streamOk),
+      -- The type the walk reads decides the archive's bytes: a symlink
+      -- to a directory archives as the symlink, not the directory it
+      -- leads to, a symlink walked as the root likewise, and an empty
+      -- directory as a directory.  Guarded on symlink privilege, as
+      -- above.
+      test "a symlink to a directory, a symlink root and an empty directory archive as their own types" $
+        withWalkTree $ \root -> do
+          createDirectory (root ++ "/empty")
+          createDirectory (root ++ "/real")
+          BS.writeFile (root ++ "/real/file") "x"
+          linked <- try (createDirectoryLink "real" (root ++ "/link")) :: IO (Either IOException ())
+          case linked of
+            Left _ -> pure True
+            Right () -> do
+              treeOk <-
+                expectArchive
+                  ( NAR.NarDirectory
+                      [ ("empty", NAR.NarDirectory []),
+                        ("link", NAR.NarSymlink "real"),
+                        ("real", NAR.NarDirectory [("file", NAR.NarRegular False "x")])
+                      ]
+                  )
+                  root
+              rootOk <- expectArchive (NAR.NarSymlink "real") (root ++ "/link")
+              pure (treeOk && rootOk),
       -- The walk's boundary encoding: a Unicode disk name enters the
       -- archive as its UTF-8 bytes on every platform.
       test "serialiseFromPath encodes a Unicode disk name as UTF-8" $ do
@@ -948,8 +977,8 @@ testStream =
 -- NAR walk failure tests
 -- ---------------------------------------------------------------------------
 
--- | Each failed access is provoked on an entry below the root and
--- walked through both entry points.
+-- | Each failed access, and each type a NAR cannot hold, is provoked on
+-- an entry and walked through both entry points.
 testWalkFailures :: IO Bool
 testWalkFailures =
   runGroup
@@ -983,6 +1012,25 @@ testWalkFailures =
           createDirectory (root ++ "/sub")
           withUnreadableLink link $
             expectWalkFailure NAR.WalkReadLink link root,
+      test "a FIFO in a tree is refused as an unsupported type" $
+        withWalkTree $ \root -> do
+          let pipe = root ++ "/sub/pipe"
+          createDirectory (root ++ "/sub")
+          withFifo pipe $
+            expectUnsupportedType pipe root,
+      test "a Unix socket in a tree is refused as an unsupported type" $
+        withWalkTree $ \root -> do
+          let socketPath = root ++ "/sub/socket"
+          createDirectory (root ++ "/sub")
+          withUnixSocket socketPath $
+            expectUnsupportedType socketPath root,
+      -- Making a device takes privilege, and /dev/null is one every
+      -- POSIX system has; as the root it goes through the same
+      -- classification as an entry below.  Windows has no /dev/null.
+      test "a device walked as the root is refused as an unsupported type" $
+        if System.Info.os == "mingw32"
+          then pure True
+          else expectUnsupportedType "/dev/null" "/dev/null",
       -- The resolver is the one place a test can raise an interrupt
       -- mid-walk: no access blocks long enough to be interrupted on
       -- cue.  The handler around each access catches 'IOException' by
@@ -1025,24 +1073,49 @@ walkOutcomes opts root = do
 -- 'NAR.NarWalkError' naming the access and the entry, over the
 -- permission error the test caused.
 expectWalkFailure :: NAR.WalkAccess -> FilePath -> FilePath -> IO Bool
-expectWalkFailure access path root = do
+expectWalkFailure access path =
+  expectWalkRefusal
+    "NarWalkError"
+    (\failure -> (NAR.nweAccess failure, NAR.nwePath failure, isPermissionError (NAR.nweCause failure)))
+    (access, path, True)
+
+-- | Assert that both entry points refuse a tree with upstream's
+-- unsupported-type error, naming the entry.
+expectUnsupportedType :: FilePath -> FilePath -> IO Bool
+expectUnsupportedType path =
+  expectWalkRefusal
+    "IOException"
+    (\refusal -> (isUserError refusal, ioeGetErrorString refusal))
+    (True, "file '" ++ path ++ "' has an unsupported type")
+
+-- | Assert that both entry points archive a path as an entry: the walk
+-- builds the entry itself, and the stream pulls its serialised bytes.
+expectArchive :: NAR.NarEntry -> FilePath -> IO Bool
+expectArchive expected path = do
+  walked <- NAR.serialiseFromPathOpts walkOptions path
+  streamed <- NAR.withNarSourceOpts walkOptions path drainSource
+  walkedOk <- assertEqual (path ++ " walked") expected walked
+  streamedOk <- assertEqual (path ++ " streamed") (NAR.serialise expected) streamed
+  pure (walkedOk && streamedOk)
+
+-- | Assert that both entry points fail to walk a tree with an exception
+-- of the type named, and that what the test reads off it is expected.
+expectWalkRefusal :: (Exception e, Eq a, Show a) => String -> (e -> a) -> a -> FilePath -> IO Bool
+expectWalkRefusal typeName observe expected root = do
   outcomes <- walkOutcomes walkOptions root
   and <$> traverse check outcomes
   where
     check (entryPoint, outcome) = case outcome of
       Left raised
-        | Just failure <- fromException raised ->
-            assertEqual
-              (entryPoint ++ " access, path, permission error")
-              (access, path, True)
-              (NAR.nweAccess failure, NAR.nwePath failure, isPermissionError (NAR.nweCause failure))
+        | Just refusal <- fromException raised ->
+            assertEqual (entryPoint ++ " refusal") expected (observe refusal)
       Left raised -> do
         putStrLn ""
-        putStrLn ("    " ++ entryPoint ++ ": expected NarWalkError, got: " ++ displayException raised)
+        putStrLn ("    " ++ entryPoint ++ ": expected " ++ typeName ++ ", got: " ++ displayException raised)
         pure False
       Right () -> do
         putStrLn ""
-        putStrLn ("    " ++ entryPoint ++ ": expected NarWalkError, the walk succeeded")
+        putStrLn ("    " ++ entryPoint ++ ": expected " ++ typeName ++ ", the walk succeeded")
         pure False
 
 -- | Take one of the owner's permissions from a path and run a check
@@ -1076,6 +1149,31 @@ foreign import ccall unsafe "lchmod"
   c_lchmod :: CString -> CMode -> IO CInt
 #else
 withUnreadableLink _ _ = pure True
+#endif
+
+-- | Make a FIFO at a path and run a check.  Windows has no FIFO a
+-- directory holds and no file mode the walk reads, so the check is
+-- skipped there.
+withFifo :: FilePath -> IO Bool -> IO Bool
+#if defined(mingw32_HOST_OS)
+withFifo _ _ = pure True
+#else
+withFifo path check = do
+  Posix.createNamedPipe path (Posix.unionFileModes Posix.ownerReadMode Posix.ownerWriteMode)
+  check
+#endif
+
+-- | Bind a Unix socket at a path and run a check on the file the bind
+-- leaves, which outlives the socket.  The walk on Windows reads no
+-- file mode, so the check is skipped there.
+withUnixSocket :: FilePath -> IO Bool -> IO Bool
+#if defined(mingw32_HOST_OS)
+withUnixSocket _ _ = pure True
+#else
+withUnixSocket path check = do
+  bound <- Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
+  Socket.bind bound (Socket.SockAddrUnix path) `finally` Socket.close bound
+  check
 #endif
 
 -- ---------------------------------------------------------------------------
