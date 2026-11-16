@@ -214,8 +214,9 @@ test-suite nova-cache-test
     , wai                 >= 3.2 && < 3.3
     , wai-extra           >= 3.1 && < 3.2
 
-  -- The walk refuses a FIFO or a socket by its file mode, which only
-  -- POSIX has, so the tests that make one run on POSIX alone.
+  -- The tests that make a FIFO or a socket, or cut short a file a
+  -- stream holds open, run on POSIX alone: Windows has no file mode for
+  -- the walk to refuse them by, and no truncate(2).
   if !os(windows)
     build-depends:
         network           >= 3.0 && < 3.3

@@ -44,7 +44,7 @@ module NovaCache.NAR
   )
 where
 
-import Control.Exception (Exception (displayException), IOException, bracketOnError, catch, finally, throwIO)
+import Control.Exception (Exception (displayException), IOException, SomeException, bracketOnError, catch, finally, mask, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
@@ -643,6 +643,13 @@ data SourceState
   | -- | Mid-file: the open handle, its path for error text, the bytes
     -- still owed, the padding after them, and the remaining segments.
     SourceFile !Handle !OsPath !Word64 !Int ![NarSegment]
+  | -- | An exception was raised while a pull ran, and every later pull
+    -- rethrows it, so a consumer that catches the failure and pulls
+    -- again never reads the empty chunk that marks a clean end.  Held at
+    -- 'SomeException', as the codec sources hold theirs: a pull
+    -- interrupted after its read consumed bytes it never returned
+    -- leaves the archive as torn as one that failed.
+    SourceFailed !SomeException
   | SourceDrained
 
 -- | Serialise a filesystem tree as a pull source of NAR chunks,
@@ -664,8 +671,13 @@ data SourceState
 -- mid-stream fails loudly rather than emitting a torn archive.  A
 -- failure of an access 'WalkAccess' names throws t'NarWalkError':
 -- before the continuation runs for the structure, from the pull for a
--- file's contents.  Any file handle still open when the continuation
--- exits is closed.
+-- file's contents.  An exception raised while a pull runs is rethrown
+-- by every later pull, so none of them reads as a clean end.  An
+-- asynchronous exception can also arrive as a pull returns, after the
+-- source has moved past the chunk it was returning, and is not
+-- latched, so a consumer must not pull again after an asynchronous
+-- exception.  Any file handle still open when the continuation exits
+-- is closed.
 withNarSource :: CaseHack -> FilePath -> (IO ByteString -> IO a) -> IO a
 withNarSource mode = withNarSourceOpts defaultSerialiseOptions {soCaseHack = mode}
 
@@ -675,49 +687,68 @@ withNarSourceOpts opts root consume = do
   rootPath <- encodeFS root
   segments <- planSegments opts rootPath
   stateRef <- newIORef (SourceSegments segments)
-  consume (pullChunk stateRef) `finally` closeCurrent stateRef
-  where
-    closeCurrent stateRef = do
-      state <- readIORef stateRef
-      case state of
-        SourceFile handle _ _ _ _ -> hClose handle
-        _ -> pure ()
+  consume (pullChunk stateRef) `finally` (closeHeldFile =<< readIORef stateRef)
 
--- | Produce the next chunk of the planned archive.
+-- | Close the file a source state holds open, if it holds one.
+closeHeldFile :: SourceState -> IO ()
+closeHeldFile state = case state of
+  SourceFile handle _ _ _ _ -> hClose handle
+  _ -> pure ()
+
+-- | Produce the next chunk of the planned archive, latching any
+-- exception raised while the pull runs as 'SourceFailed'.
 pullChunk :: IORef SourceState -> IO ByteString
-pullChunk stateRef = advance =<< readIORef stateRef
+pullChunk stateRef = dispatch =<< readIORef stateRef
   where
-    advance (SourceSegments []) = do
+    dispatch (SourceSegments segments) = latching (fromSegments segments)
+    dispatch (SourceFile handle path owed padLen rest) = latching (inFile handle path owed padLen rest)
+    dispatch (SourceFailed failure) = throwIO failure
+    dispatch SourceDrained = pure BS.empty
+
+    -- Only the pull itself runs unmasked, so no asynchronous exception
+    -- lands between its failure and the latch, or between recording
+    -- the failure and closing the file the state held, which once the
+    -- state no longer names it only the garbage collector would close.
+    -- One delivered as the mask ends after a pull succeeded is not
+    -- latched: the state has already moved past the chunk it loses.
+    latching pull = mask $ \restore -> either latch pure =<< tryPull (restore pull)
+
+    latch failure = do
+      held <- readIORef stateRef
+      writeIORef stateRef (SourceFailed failure)
+      closeHeldFile held
+      throwIO failure
+
+    fromSegments [] = do
       writeIORef stateRef SourceDrained
       pure BS.empty
-    advance (SourceSegments (SegmentBytes bytes : rest)) = do
+    fromSegments (SegmentBytes bytes : rest) = do
       writeIORef stateRef (SourceSegments rest)
       pure bytes
-    advance (SourceSegments (SegmentFile path : rest)) = do
+    fromSegments (SegmentFile path : rest) = do
       shownPath <- decodeFS path
       -- hFileSize throws after a successful open when the entry is no
       -- longer a regular file (replaced by a FIFO or a device after the
       -- plan read its type); until the state ref records the handle,
-      -- closeCurrent cannot see it, so ownership transfers under
-      -- bracketOnError - the same discipline as the shrink path below.
+      -- the latch and the continuation's exit cannot see it, so
+      -- ownership transfers under bracketOnError.
       accessing WalkReadFile path $
         bracketOnError (openBinaryFile shownPath ReadMode) hClose $ \handle -> do
           size <- hFileSize handle
           let owed = fromIntegral size :: Word64
           writeIORef stateRef (SourceFile handle path owed (narPadOf owed) rest)
           pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
-    advance (SourceFile handle _ 0 padLen rest) = do
+
+    inFile handle _ 0 padLen rest = do
       hClose handle
       writeIORef stateRef (SourceSegments rest)
       if padLen == 0
-        then pullChunk stateRef
+        then fromSegments rest
         else pure (BS.replicate padLen 0)
-    advance (SourceFile handle path owed padLen rest) = do
+    inFile handle path owed padLen rest = do
       chunk <- accessing WalkReadFile path (BS.hGet handle (fromIntegral (min owed (fromIntegral narSourceChunkBytes))))
       if BS.null chunk
         then do
-          hClose handle
-          writeIORef stateRef SourceDrained
           shownPath <- decodeFS path
           ioError (userError ("withNarSource: " ++ shownPath ++ " shrank while streaming"))
         else do
@@ -725,7 +756,12 @@ pullChunk stateRef = advance =<< readIORef stateRef
             stateRef
             (SourceFile handle path (owed - fromIntegral (BS.length chunk)) padLen rest)
           pure chunk
-    advance SourceDrained = pure BS.empty
+
+-- | 'try' at 'SomeException', monomorphic so the catch-all needs no
+-- annotation at the call site.  The caller latches whatever this
+-- catches and rethrows it, asynchronous exceptions included.
+tryPull :: IO ByteString -> IO (Either SomeException ByteString)
+tryPull = try
 
 -- | Plan the archive: every structural byte rendered, file contents
 -- deferred as 'SegmentFile's.  Holds structure only - O(entries),
