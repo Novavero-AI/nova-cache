@@ -98,8 +98,9 @@ main = do
 serve :: [String] -> IO ()
 serve args = do
   -- Under systemd, stdout is a pipe to the journal, which GHC buffers by
-  -- block: the startup lines and each request's line would reach the
-  -- journal only when a block filled.
+  -- block.  The request logger flushes after each line it writes, so
+  -- without this the startup lines would wait for the first request, or,
+  -- with request logging off, for a block to fill.
   hSetBuffering stdout LineBuffering
   portEnv <- lookupEnv portEnvVar
   hostEnv <- lookupEnv hostEnvVar
