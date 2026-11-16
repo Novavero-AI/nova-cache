@@ -75,13 +75,7 @@ import NovaCache.NAR.Stream
     tokTarget,
     tokType,
   )
-import System.Directory.OsPath
-  ( doesDirectoryExist,
-    doesFileExist,
-    getSymbolicLinkTarget,
-    listDirectory,
-    pathIsSymbolicLink,
-  )
+import System.Directory.OsPath (getSymbolicLinkTarget, listDirectory)
 import System.IO.Error (annotateIOError)
 import qualified System.Info
 import System.OsPath (OsPath, decodeFS, encodeFS, (</>))
@@ -89,12 +83,13 @@ import qualified System.OsPath as OP
 #ifdef mingw32_HOST_OS
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import System.Directory.OsPath (executable, getPermissions)
+import System.Directory.OsPath (doesDirectoryExist, executable, getPermissions, pathIsSymbolicLink)
 import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, openBinaryFile)
 #else
 import qualified Data.ByteString.Char8 as BS8
 import System.IO (Handle, IOMode (ReadMode), hClose, hFileSize, latin1, openBinaryFile)
 import qualified System.Posix.Files as Posix
+import qualified System.Posix.Files.ByteString as PosixBytes
 #endif
 
 -- ---------------------------------------------------------------------------
@@ -263,7 +258,7 @@ narHash = Hash.hashBytes . serialise
 -- | A filesystem access the walk makes on an entry.
 data WalkAccess
   = -- | Reading the entry's own status, without following a symlink
-    -- (@lstat@ on POSIX), to tell a symlink from anything else.
+    -- (@lstat@ on POSIX), for its type.
     WalkStatus
   | -- | Reading a symlink's target (@readlink@ on POSIX).
     WalkReadLink
@@ -279,11 +274,12 @@ data WalkAccess
 -- unlistable directory without parsing GHC's text.
 --
 -- Refusals the walk raises itself rather than an access raising them
--- (a case-hack name collision, a file that shrinks while it streams)
--- stay 'IOException's.  The 'ExecBitResolver' runs outside these
--- accesses, since a caller's resolver may throw anything, so what a
--- resolver throws arrives as thrown; that includes the status read
--- 'defaultExecBitResolver' makes.
+-- (an entry of a type a NAR cannot hold, a case-hack name collision, a
+-- file that shrinks while it streams) stay 'IOException's.  The
+-- 'ExecBitResolver' runs outside these accesses, since a caller's
+-- resolver may throw anything, so what a resolver throws arrives as
+-- thrown; that includes the status read 'defaultExecBitResolver'
+-- makes.
 data NarWalkError = NarWalkError
   { -- | The access that failed.
     nweAccess :: !WalkAccess,
@@ -413,9 +409,11 @@ defaultSerialiseOptions =
 -- 'defaultCaseHack'.
 --
 -- This is the module's IO boundary: the platform-native walk
--- classifies each path as symlink, directory, or regular file and
--- delegates to pure constructors.  A failure of an access
--- 'WalkAccess' names throws t'NarWalkError'.
+-- classifies each path as regular file, directory, or symlink and
+-- delegates to pure constructors.  Any other type (a FIFO, a socket, a
+-- device) is refused with the 'IOException' @file \'\<path\>\' has an
+-- unsupported type@, as upstream's dump refuses it.  A failure of an
+-- access 'WalkAccess' names throws t'NarWalkError'.
 serialiseFromPath :: FilePath -> IO NarEntry
 serialiseFromPath = serialiseFromPathOpts defaultSerialiseOptions
 
@@ -434,14 +432,60 @@ serialiseFromPathOpts opts path = walkPath opts =<< encodeFS path
 -- NAR.
 walkPath :: SerialiseOptions -> OsPath -> IO NarEntry
 walkPath opts path = do
-  isSym <- accessing WalkStatus path (pathIsSymbolicLink path)
+  kind <- entryType path
+  case kind of
+    RegularEntry -> buildRegularFile (soExecBit opts) path
+    DirectoryEntry -> buildDirectory opts path
+    SymlinkEntry -> NarSymlink <$> (symlinkTargetBytes =<< accessing WalkReadLink path (getSymbolicLinkTarget path))
+    UnsupportedEntry -> unsupportedType path
+
+-- | An entry's type as the walk reads it: one of the three a NAR holds,
+-- or any other (a FIFO, a socket, a device).
+data EntryType
+  = RegularEntry
+  | DirectoryEntry
+  | SymlinkEntry
+  | UnsupportedEntry
+
+-- | Read an entry's type without following a symlink.  On POSIX this
+-- is one @lstat@, classified by its file mode as upstream's dump
+-- classifies it: @S_ISREG@, @S_ISDIR@, @S_ISLNK@, and any other type
+-- unsupported.
+entryType :: OsPath -> IO EntryType
+#ifdef mingw32_HOST_OS
+-- Windows has no file mode.  The directory package reads any reparse
+-- point as a link and anything that is neither a link nor a directory
+-- as a file, so no entry reads as unsupported here; a reparse point
+-- that is not a symlink or a junction fails its target read instead.
+entryType path = accessing WalkStatus path $ do
+  isSym <- pathIsSymbolicLink path
   if isSym
-    then NarSymlink <$> (symlinkTargetBytes =<< accessing WalkReadLink path (getSymbolicLinkTarget path))
+    then pure SymlinkEntry
     else do
       isDir <- doesDirectoryExist path
-      if isDir
-        then buildDirectory opts path
-        else buildRegularFile (soExecBit opts) path
+      pure (if isDir then DirectoryEntry else RegularEntry)
+#else
+-- The status read takes the path's raw bytes ('osPathBytes' is exact
+-- on POSIX), as the directory package's own reads do, so no text
+-- decoding stands between the walk's path and the lstat.
+entryType path = do
+  pathBytes <- osPathBytes path
+  typeOf <$> accessing WalkStatus path (PosixBytes.getSymbolicLinkStatus pathBytes)
+  where
+    typeOf status
+      | Posix.isRegularFile status = RegularEntry
+      | Posix.isDirectory status = DirectoryEntry
+      | Posix.isSymbolicLink status = SymlinkEntry
+      | otherwise = UnsupportedEntry
+#endif
+
+-- | Refuse an entry of a type a NAR cannot hold, in upstream's words.
+-- Archiving it as any type a NAR holds would change the archive and
+-- its hash.
+unsupportedType :: OsPath -> IO a
+unsupportedType path = do
+  shownPath <- decodeFS path
+  fail ("file '" ++ shownPath ++ "' has an unsupported type")
 
 -- | Build a directory entry by recursively walking children.
 buildDirectory :: SerialiseOptions -> OsPath -> IO NarEntry
@@ -508,23 +552,9 @@ unhackedDirNames CaseHackEnabled named =
 -- | Build a regular file entry, checking the executable bit.
 buildRegularFile :: ExecBitResolver -> OsPath -> IO NarEntry
 buildRegularFile resolver path = do
-  isFile <- doesFileExist path
-  if isFile
-    then do
-      contents <- readFileBytes path
-      isExec <- resolveExecBit resolver path
-      pure (NarRegular isExec contents)
-    else specialFileFailure path
-
--- | The shared refusal for a path that is not a symlink, directory, or
--- regular file: a special file (FIFO, socket, device) or a path that
--- vanished mid-walk.  Fail loudly rather than fabricating an empty
--- regular (which would silently change the NAR and its hash) -
--- matching Nix, which aborts on unsupported types.
-specialFileFailure :: OsPath -> IO a
-specialFileFailure path = do
-  shownPath <- decodeFS path
-  fail ("serialiseFromPath: not a regular file (special or vanished): " ++ shownPath)
+  contents <- readFileBytes path
+  isExec <- resolveExecBit resolver path
+  pure (NarRegular isExec contents)
 
 -- | Run the resolver on a platform-native path.  The resolver contract
 -- is 'FilePath', so the path bridges through 'decodeFS' - the same
@@ -550,7 +580,7 @@ readFileBytes path = do
 -- path.  The one refusal is a Windows name holding an unpaired
 -- surrogate: it has no UTF-8 form and upstream defines no byte
 -- spelling for it, so failing loudly beats inventing a name (the same
--- policy 'buildRegularFile' applies to special files).
+-- policy 'unsupportedType' applies to a FIFO, a socket or a device).
 #ifdef mingw32_HOST_OS
 osPathBytes :: OsPath -> IO ByteString
 osPathBytes path = case OP.decodeUtf path of
@@ -665,11 +695,11 @@ pullChunk stateRef = advance =<< readIORef stateRef
       pure bytes
     advance (SourceSegments (SegmentFile path : rest)) = do
       shownPath <- decodeFS path
-      -- hFileSize can throw after a successful open (the path swapped
-      -- for a FIFO between plan and pull); until the state ref records
-      -- the handle, closeCurrent cannot see it, so ownership transfers
-      -- under bracketOnError - the same discipline as the shrink path
-      -- below.
+      -- hFileSize throws after a successful open when the entry is no
+      -- longer a regular file (replaced by a FIFO or a device after the
+      -- plan read its type); until the state ref records the handle,
+      -- closeCurrent cannot see it, so ownership transfers under
+      -- bracketOnError - the same discipline as the shrink path below.
       accessing WalkReadFile path $
         bracketOnError (openBinaryFile shownPath ReadMode) hClose $ \handle -> do
           size <- hFileSize handle
@@ -728,16 +758,14 @@ coalesce = go mempty
 -- | Plan one node, mirroring 'walkPath'.
 planNode :: SerialiseOptions -> OsPath -> IO [PlanPiece]
 planNode opts path = do
-  isSym <- accessing WalkStatus path (pathIsSymbolicLink path)
-  if isSym
-    then do
+  kind <- entryType path
+  case kind of
+    RegularEntry -> planRegular (soExecBit opts) path
+    DirectoryEntry -> planDirectory opts path
+    SymlinkEntry -> do
       target <- symlinkTargetBytes =<< accessing WalkReadLink path (getSymbolicLinkTarget path)
       pure [PieceBytes (buildNode (NarSymlink target))]
-    else do
-      isDir <- doesDirectoryExist path
-      if isDir
-        then planDirectory opts path
-        else planRegular (soExecBit opts) path
+    UnsupportedEntry -> unsupportedType path
 
 -- | Plan a directory.  Children are ordered by their NAR-name bytes -
 -- the same order 'buildNode' emits - not by on-disk order, which can
@@ -771,19 +799,15 @@ planDirectory opts path = do
 -- with the contents wire string (length, bytes, padding) deferred.
 planRegular :: ExecBitResolver -> OsPath -> IO [PlanPiece]
 planRegular resolver path = do
-  isFile <- doesFileExist path
-  if isFile
-    then do
-      isExec <- resolveExecBit resolver path
-      pure
-        [ PieceBytes
-            ( narStr tokLParen
-                <> narStr tokType
-                <> narStr tokRegular
-                <> execFlag isExec
-                <> narStr tokContents
-            ),
-          PieceFile path,
-          PieceBytes (narStr tokRParen)
-        ]
-    else specialFileFailure path
+  isExec <- resolveExecBit resolver path
+  pure
+    [ PieceBytes
+        ( narStr tokLParen
+            <> narStr tokType
+            <> narStr tokRegular
+            <> execFlag isExec
+            <> narStr tokContents
+        ),
+      PieceFile path,
+      PieceBytes (narStr tokRParen)
+    ]
