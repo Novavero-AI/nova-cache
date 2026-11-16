@@ -1,9 +1,11 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE LambdaCase #-}
 
 module Main (main) where
 
-import Control.Exception (IOException, SomeException, try)
-import Control.Monad (guard, zipWithM)
+import Control.Concurrent (myThreadId)
+import Control.Exception (AsyncException (UserInterrupt), IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
+import Control.Monad (guard, void, zipWithM)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
 import Data.ByteArray (convert)
@@ -40,11 +42,20 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Store as Store
 import qualified NovaCache.StorePath as StorePath
 import qualified NovaCache.Validate as Validate
-import System.Directory (createDirectory, createFileLink, doesDirectoryExist, emptyPermissions, getPermissions, getTemporaryDirectory, listDirectory, readable, removeDirectoryRecursive, removeFile, setModificationTime, setOwnerExecutable, setPermissions)
+import System.Directory (Permissions, createDirectory, createFileLink, doesDirectoryExist, emptyPermissions, getPermissions, getTemporaryDirectory, listDirectory, readable, removeDirectoryRecursive, removeFile, searchable, setModificationTime, setOwnerExecutable, setOwnerReadable, setOwnerSearchable, setPermissions)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (hFlush, stdout)
+import System.IO.Error (isPermissionError, mkIOError, permissionErrorType)
 import qualified System.Info
 import Test.QuickCheck (Args (chatty), Gen, Result (Failure, GaveUp, NoExpectedFailure, Success, output), Testable, arbitrary, choose, elements, forAll, frequency, ioProperty, listOf, listOf1, oneof, property, quickCheckWithResult, stdArgs, sublistOf, suchThat, suchThatMap, vectorOf, (.&&.), (===))
+#if defined(darwin_HOST_OS)
+import Foreign.C.Error (throwErrnoPathIfMinus1_)
+import Foreign.C.String (CString)
+import Foreign.C.Types (CInt (..))
+import System.Directory (getSymbolicLinkTarget)
+import System.Posix.Internals (withFilePath)
+import System.Posix.Types (CMode (..))
+#endif
 
 -- ---------------------------------------------------------------------------
 -- Test harness (hand-rolled, no framework)
@@ -146,6 +157,7 @@ main = do
       testStorePath,
       testNAR,
       testStream,
+      testWalkFailures,
       testNarInfo,
       testSigning,
       testFileStore,
@@ -931,6 +943,140 @@ testStream =
         removeDirectoryRecursive dir
         assertEqual "hash matches" (NAR.narHash entry) digest
     ]
+
+-- ---------------------------------------------------------------------------
+-- NAR walk failure tests
+-- ---------------------------------------------------------------------------
+
+-- | Each failed access is provoked on an entry below the root and
+-- walked through both entry points.
+testWalkFailures :: IO Bool
+testWalkFailures =
+  runGroup
+    "NAR walk failures"
+    [ test "an unreadable file fails the walk as a file read" $
+        withWalkTree $ \root -> do
+          let locked = root ++ "/sub/locked"
+          createDirectory (root ++ "/sub")
+          BS.writeFile locked "secret"
+          withoutPermission readable setOwnerReadable locked $
+            expectWalkFailure NAR.WalkReadFile locked root,
+      test "an unlistable directory fails the walk as a directory listing" $
+        withWalkTree $ \root -> do
+          let sub = root ++ "/sub"
+          createDirectory sub
+          BS.writeFile (sub ++ "/file") "x"
+          withoutPermission readable setOwnerReadable sub $
+            expectWalkFailure NAR.WalkListDirectory sub root,
+      -- A directory with read but not search permission lists its
+      -- entries' names and refuses an lstat of any of them.
+      test "an entry of an unsearchable directory fails the walk as a status read" $
+        withWalkTree $ \root -> do
+          let sub = root ++ "/sub"
+          createDirectory sub
+          BS.writeFile (sub ++ "/file") "x"
+          withoutPermission searchable setOwnerSearchable sub $
+            expectWalkFailure NAR.WalkStatus (sub ++ "/file") root,
+      test "a symlink whose target cannot be read fails the walk as a readlink" $
+        withWalkTree $ \root -> do
+          let link = root ++ "/sub/link"
+          createDirectory (root ++ "/sub")
+          withUnreadableLink link $
+            expectWalkFailure NAR.WalkReadLink link root,
+      -- The resolver is the one place a test can raise an interrupt
+      -- mid-walk: no access blocks long enough to be interrupted on
+      -- cue.  The handler around each access catches 'IOException' by
+      -- its type alone.
+      test "an interrupt raised by the resolver mid-walk reaches the caller as itself" $
+        withWalkTree $ \root -> do
+          BS.writeFile (root ++ "/file") "x"
+          let interrupt = myThreadId >>= (`throwTo` UserInterrupt) >> pure False
+          outcomes <- walkOutcomes walkOptions {NAR.soExecBit = const interrupt} root
+          and
+            <$> traverse
+              (\(entryPoint, outcome) -> assertEqual (entryPoint ++ " raised") (Just UserInterrupt) (either fromException (const Nothing) outcome))
+              outcomes,
+      test "a walk failure renders as its IOException, the access as location" $
+        let cause = mkIOError permissionErrorType "openBinaryFile" Nothing (Just "/d/tree/sub/locked")
+         in assertEqual
+              "rendering"
+              "/d/tree/sub/locked: reading file: permission denied"
+              (displayException (NAR.NarWalkError NAR.WalkReadFile "/d/tree/sub/locked" cause))
+    ]
+
+-- | The options every walk-failure test walks with.
+walkOptions :: NAR.SerialiseOptions
+walkOptions = NAR.defaultSerialiseOptions {NAR.soCaseHack = NAR.CaseHackDisabled}
+
+-- | A fresh tree for one test, removed however the test ends.
+withWalkTree :: (FilePath -> IO Bool) -> IO Bool
+withWalkTree body = do
+  root <- createTestDir
+  body root `finally` removeDirectoryRecursive root
+
+-- | What each entry point raised walking a tree, by name.
+walkOutcomes :: NAR.SerialiseOptions -> FilePath -> IO [(String, Either SomeException ())]
+walkOutcomes opts root = do
+  eager <- try (void (NAR.serialiseFromPathOpts opts root))
+  streamed <- try (void (NAR.withNarSourceOpts opts root drainSource))
+  pure [("serialiseFromPathOpts", eager), ("withNarSourceOpts", streamed)]
+
+-- | Assert that both entry points fail to walk a tree with a
+-- 'NAR.NarWalkError' naming the access and the entry, over the
+-- permission error the test caused.
+expectWalkFailure :: NAR.WalkAccess -> FilePath -> FilePath -> IO Bool
+expectWalkFailure access path root = do
+  outcomes <- walkOutcomes walkOptions root
+  and <$> traverse check outcomes
+  where
+    check (entryPoint, outcome) = case outcome of
+      Left raised
+        | Just failure <- fromException raised ->
+            assertEqual
+              (entryPoint ++ " access, path, permission error")
+              (access, path, True)
+              (NAR.nweAccess failure, NAR.nwePath failure, isPermissionError (NAR.nweCause failure))
+      Left raised -> do
+        putStrLn ""
+        putStrLn ("    " ++ entryPoint ++ ": expected NarWalkError, got: " ++ displayException raised)
+        pure False
+      Right () -> do
+        putStrLn ""
+        putStrLn ("    " ++ entryPoint ++ ": expected NarWalkError, the walk succeeded")
+        pure False
+
+-- | Take one of the owner's permissions from a path and run a check
+-- while it is gone, then give it back.  Windows has no mode bit to
+-- take, and root's access ignores the mode, so on either there is no
+-- refusal to cause and the check is skipped, as 'makeUnreadable''s
+-- callers skip theirs.
+withoutPermission :: (Permissions -> Bool) -> (Bool -> Permissions -> Permissions) -> FilePath -> IO Bool -> IO Bool
+withoutPermission held setHeld path check
+  | System.Info.os == "mingw32" = pure True
+  | otherwise = do
+      original <- getPermissions path
+      bracket_ (setPermissions path (setHeld False original)) (setPermissions path original) $ do
+        refused <- not . held <$> getPermissions path
+        if refused then check else pure True
+
+-- | Create a symlink with no permissions of its own and run a check if
+-- that leaves its target unreadable.  macOS checks a symlink's own
+-- mode on readlink (root exempt); Linux ignores the mode and Windows
+-- has none, so on both no permission refuses a readlink that the lstat
+-- before it was allowed, and the check is skipped.
+withUnreadableLink :: FilePath -> IO Bool -> IO Bool
+#if defined(darwin_HOST_OS)
+withUnreadableLink link check = do
+  createFileLink "target" link
+  withFilePath link (throwErrnoPathIfMinus1_ "lchmod" link . (`c_lchmod` 0))
+  refused <- isLeft <$> (try (getSymbolicLinkTarget link) :: IO (Either IOException FilePath))
+  if refused then check else pure True
+
+foreign import ccall unsafe "lchmod"
+  c_lchmod :: CString -> CMode -> IO CInt
+#else
+withUnreadableLink _ _ = pure True
+#endif
 
 -- ---------------------------------------------------------------------------
 -- NarInfo tests
