@@ -3,8 +3,8 @@
 
 module Main (main) where
 
-import Control.Concurrent (myThreadId)
-import Control.Exception (AsyncException (UserInterrupt), Exception, IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
+import Control.Concurrent (MVar, ThreadId, forkFinally, killThread, myThreadId, newEmptyMVar, putMVar, takeMVar, yield)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), Exception, IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
 import Control.Monad (guard, replicateM, void, zipWithM)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
@@ -28,8 +28,9 @@ import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (NominalDiffTime, UTCTime (..), addUTCTime, diffUTCTime, getCurrentTime, nominalDay)
 import Data.Traversable (for)
 import Data.Word (Word64, Word8)
+import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import qualified Network.HTTP.Types as HTTP
-import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, requestBodyLength, requestHeaders, requestMethod)
+import Network.Wai (RequestBodyLength (..), defaultRequest, pathInfo, queryString, requestBodyLength, requestHeaders, requestMethod)
 import qualified Network.Wai.Test as WT
 import qualified NovaCache.Base32 as Base32
 import qualified NovaCache.Hash as Hash
@@ -169,7 +170,8 @@ main = do
       testValidate,
       testServer,
       testStoredNarCheck,
-      testMultipartUpload
+      testMultipartUpload,
+      testRemoval
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1700,7 +1702,18 @@ testFileStore =
         store <- Store.newFileStore tmpDir
         hashes <- Store.listNarInfoHashes store
         removeDirectoryRecursive tmpDir
-        assertEqual "empty" [] hashes
+        assertEqual "empty" [] hashes,
+      test "removeNarInfo removes a narinfo, reports one that is absent, and refuses a traversal name" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        _ <- Store.writeNarInfo store "hash1" "content1"
+        _ <- Store.writeNarInfo store "hash2" "content2"
+        outcomes <- traverse (Store.removeNarInfo store) ["hash1", "hash1", "../hash2"]
+        hashes <- Store.listNarInfoHashes store
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "outcomes" [Store.NarInfoRemoved, Store.NarInfoAbsent, Store.NarInfoRemoveBadPath] outcomes
+        ok2 <- assertEqual "remaining" ["hash2"] hashes
+        pure (ok1 && ok2)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1776,7 +1789,7 @@ testReclaim =
           forAll genSelection $ \(minimumAge, _, nars) ->
             forAll (listOf genTarget) $ \targets ->
               let narInfos = zip [show i | i <- [0 :: Int ..]] targets
-                  scan = Reclaim.StoreScan {Reclaim.scanNarInfos = narInfos, Reclaim.scanNars = nars, Reclaim.scanTime = referenceTime}
+                  scan = scanOf narInfos nars
                   blocking = [path | (path, Reclaim.Unresolvable _) <- narInfos]
                in case Reclaim.planReclaim minimumAge scan of
                     Left (Reclaim.UnresolvedNarInfos unresolved) -> map Reclaim.unresolvedPath (toList unresolved) === blocking
@@ -1785,11 +1798,21 @@ testReclaim =
       test "property: a store with NARs and no narinfo blocks the run, and an empty store plans nothing" $
         checkProperty $
           forAll genSelection $ \(minimumAge, _, nars) ->
-            let scan = Reclaim.StoreScan {Reclaim.scanNarInfos = [], Reclaim.scanNars = nars, Reclaim.scanTime = referenceTime}
+            let scan = scanOf [] nars
                 expected = case nars of
                   [] -> Right Reclaim.ReclaimPlan {Reclaim.rpEligible = [], Reclaim.rpTooYoung = []}
                   _ -> Left Reclaim.NoNarInfos
              in Reclaim.planReclaim minimumAge scan === expected,
+      test "property: a run plans its uploads as selectAbandoned splits them, and a blocked run plans nothing" $
+        checkProperty $
+          forAll genSelection $ \(minimumAge, _, nars) ->
+            forAll (listOf genTarget) $ \targets ->
+              forAll (listOf genStagedUpload) $ \uploads ->
+                let scan = (scanOf (zip [show i | i <- [0 :: Int ..]] targets) nars) {Reclaim.scanStagedUploads = uploads}
+                 in Reclaim.planStore minimumAge scan
+                      === ( (\narPlan -> Reclaim.StorePlan narPlan (Reclaim.selectAbandoned minimumAge referenceTime uploads))
+                              <$> Reclaim.planReclaim minimumAge scan
+                          ),
       test "a NAR exactly the minimum age old is eligible" $
         let nar = narAged "edge.nar" Reclaim.defaultMinimumAge
             plan = Reclaim.selectUnreferenced Reclaim.defaultMinimumAge referenceTime Set.empty [nar]
@@ -1811,9 +1834,9 @@ testReclaim =
         -- An upload in progress: the temp name a streaming write uses.
         BS.writeFile (narPath ".nova123-4.tmp") "partial"
         setModificationTime (narPath ".nova123-4.tmp") monthAgo
-        blocked <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
+        blocked <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store getCurrentTime
         removeFile (tmpDir ++ "/narinfo/broken")
-        reclaimable <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store
+        reclaimable <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore store getCurrentTime
         let blockedBy = case blocked of
               Left (Reclaim.UnresolvedNarInfos unresolved) -> map Reclaim.unresolvedPath (toList unresolved)
               _ -> []
@@ -1836,17 +1859,18 @@ testReclaim =
         setModificationTime (tmpDir ++ "/nar/old.nar.zst") (addUTCTime (negate (30 * nominalDay)) now)
         removeDirectoryRecursive (tmpDir ++ "/narinfo")
         restarted <- Store.newFileStore tmpDir
-        plan <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore restarted
+        plan <- Reclaim.planReclaim Reclaim.defaultMinimumAge <$> Reclaim.scanStore restarted getCurrentTime
         removeDirectoryRecursive tmpDir
         assertEqual "blocked" (Left Reclaim.NoNarInfos) plan,
-      test "a scan of a missing store fails and creates nothing" $ do
+      test "a scan of a store that lost its narinfo directory fails and creates nothing" $ do
         tmpDir <- createTestDir
-        let missing = tmpDir ++ "/missing"
-        result <- try (Reclaim.scanStore (Store.fileStoreAt missing)) :: IO (Either IOException Reclaim.StoreScan)
-        created <- doesDirectoryExist missing
+        store <- Store.newFileStore tmpDir
+        removeDirectoryRecursive (tmpDir ++ "/narinfo")
+        result <- tryIO (Reclaim.scanStore store getCurrentTime)
+        created <- doesDirectoryExist (tmpDir ++ "/narinfo")
         removeDirectoryRecursive tmpDir
         ok1 <- assertTrue "scan failed" (isLeft result)
-        ok2 <- assertFalse "store created" created
+        ok2 <- assertFalse "narinfo directory created" created
         pure (ok1 && ok2),
       test "removeNar reports a missing file and refuses a traversal name" $ do
         tmpDir <- createTestDir
@@ -1866,7 +1890,7 @@ testReclaim =
                in (sort (map Store.suPath (Reclaim.upEligible plan ++ Reclaim.upTooYoung plan)) === sort (map Store.suPath uploads))
                     .&&. all ((>= minimumAge) . uploadAge) (Reclaim.upEligible plan)
                     .&&. all ((< minimumAge) . uploadAge) (Reclaim.upTooYoung plan),
-      test "a scan of staged uploads: an idle one is reclaimed, an active one and a stray directory are kept" $ do
+      test "a reclaim of staged uploads: an idle one is removed, an active one and a stray directory are kept" $ do
         tmpDir <- createTestDir
         store <- Store.newFileStore tmpDir
         monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
@@ -1875,27 +1899,26 @@ testReclaim =
         createDirectory (tmpDir ++ "/uploads/stray")
         setModificationTime (tmpDir ++ "/uploads/stray") monthAgo
         traverse_ (backdateUpload monthAgo) . filter ((== "idle.nar") . Store.suFileName) =<< Store.listStagedUploads store
-        scan <- Reclaim.scanUploads store
-        let plan = Reclaim.selectAbandoned Reclaim.defaultMinimumAge (Reclaim.uploadScanTime scan) (Reclaim.uploadScanUploads scan)
-        removals <- traverse (\upload -> Store.removeUpload store (Store.suFileName upload) (Store.suUploadId upload)) (Reclaim.upEligible plan)
+        reclaimed <- Reclaim.reclaim store Reclaim.defaultMinimumAge getCurrentTime
         remaining <- map Store.suFileName <$> Store.listStagedUploads store
         strayKept <- doesDirectoryExist (tmpDir ++ "/uploads/stray")
         removeDirectoryRecursive tmpDir
+        let removals = either (const []) Reclaim.rdUploads reclaimed
+            kept = either (const []) (Reclaim.upTooYoung . Reclaim.spUploads . Reclaim.rdPlan) reclaimed
         ok1 <- assertTrue "uploads staged" (isJust idle && isJust active)
-        ok2 <- assertEqual "eligible" [("idle.nar", 10)] [(Store.suFileName u, Store.suSize u) | u <- Reclaim.upEligible plan]
-        ok3 <- assertEqual "kept" ["active.nar"] (map Store.suFileName (Reclaim.upTooYoung plan))
-        ok4 <- assertEqual "removals" [Store.UploadRemoved] removals
-        ok5 <- assertEqual "remaining" ["active.nar"] remaining
-        ok6 <- assertTrue "stray directory kept" strayKept
-        pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+        ok2 <- assertEqual "removed" [("idle.nar", 10, Store.UploadRemoved)] [(Store.suFileName u, Store.suSize u, outcome) | (u, outcome) <- removals]
+        ok3 <- assertEqual "kept" ["active.nar"] (map Store.suFileName kept)
+        ok4 <- assertEqual "remaining" ["active.nar"] remaining
+        ok5 <- assertTrue "stray directory kept" strayKept
+        pure (ok1 && ok2 && ok3 && ok4 && ok5),
       test "a part, or a part in progress, written to an idle upload makes it active again" $ do
         tmpDir <- createTestDir
         store <- Store.newFileStore tmpDir
         monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
         staged <- stageUpload store "resumed.nar" ["first"]
         let ageNow = do
-              scan <- Reclaim.scanUploads store
-              let plan = Reclaim.selectAbandoned Reclaim.defaultMinimumAge (Reclaim.uploadScanTime scan) (Reclaim.uploadScanUploads scan)
+              scan <- Reclaim.scanStore store getCurrentTime
+              let plan = Reclaim.selectAbandoned Reclaim.defaultMinimumAge (Reclaim.scanTime scan) (Reclaim.scanStagedUploads scan)
               pure (length (Reclaim.upEligible plan), length (Reclaim.upTooYoung plan))
             backdateAll = traverse_ (backdateUpload monthAgo) =<< Store.listStagedUploads store
         backdateAll
@@ -1915,7 +1938,9 @@ testReclaim =
         pure (ok1 && ok2 && ok3 && ok4),
       test "a store with no uploads directory has no staged uploads" $ do
         tmpDir <- createTestDir
-        uploads <- Store.listStagedUploads (Store.fileStoreAt tmpDir)
+        store <- Store.newFileStore tmpDir
+        removeDirectoryRecursive (tmpDir ++ "/uploads")
+        uploads <- Store.listStagedUploads store
         removeDirectoryRecursive tmpDir
         assertEqual "uploads" [] uploads,
       test "removeUpload refuses a traversal name" $ do
@@ -1958,6 +1983,17 @@ selectAll :: NominalDiffTime -> Set Text -> [Store.NarFile] -> [Store.NarFile]
 selectAll minimumAge references nars =
   let plan = Reclaim.selectUnreferenced minimumAge referenceTime references nars
    in Reclaim.rpEligible plan ++ Reclaim.rpTooYoung plan
+
+-- | A scan at 'referenceTime' of narinfos and NARs, with no staged
+-- upload.
+scanOf :: [(FilePath, Reclaim.NarInfoTarget)] -> [Store.NarFile] -> Reclaim.StoreScan
+scanOf narInfos nars =
+  Reclaim.StoreScan
+    { Reclaim.scanNarInfos = narInfos,
+      Reclaim.scanNars = nars,
+      Reclaim.scanStagedUploads = [],
+      Reclaim.scanTime = referenceTime
+    }
 
 -- | The fixed "now" of the pure selection tests.
 referenceTime :: UTCTime
@@ -3188,6 +3224,436 @@ genUploadIdText =
 -- count is not a part number.
 totalsOf :: Int -> Integer -> Maybe Store.UploadTotals
 totalsOf parts size = (`Store.UploadTotals` size) <$> Store.parsePartNumber (T.pack (show parts))
+
+-- ---------------------------------------------------------------------------
+-- Removal tests
+-- ---------------------------------------------------------------------------
+
+-- | The hash of a second store path, for an entry a test keeps.
+otherHashKey :: Text
+otherHashKey = T.replicate 32 "1"
+
+-- | 'validServerNarInfo' for the store path of a hash, describing bytes
+-- stored under a NAR's name.
+entryNarInfo :: Text -> Text -> ByteString -> NarInfo.NarInfo
+entryNarInfo hashKey narName bytes =
+  validServerNarInfo
+    { NarInfo.niStorePath = "/nix/store/" <> hashKey <> "-entry-1.0",
+      NarInfo.niUrl = "nar/" <> narName,
+      NarInfo.niFileHash = Just (Hash.formatNixHash (Hash.hashBytes bytes)),
+      NarInfo.niFileSize = Just (fromIntegral (BS.length bytes)),
+      NarInfo.niReferences = []
+    }
+
+-- | Upload a NAR, then a narinfo naming it, authenticated: the status
+-- the narinfo is answered with.
+putEntry :: Server.ServerConfig -> NarInfo.NarInfo -> Text -> ByteString -> IO HTTP.Status
+putEntry cfg ni narName bytes = do
+  _ <- serverRequest cfg "PUT" ["nar", narName] [serverAuthHeader] (BL.fromStrict bytes)
+  WT.simpleStatus <$> putEntryNarInfo cfg ni
+
+-- | Upload a narinfo under its own store path's hash, authenticated.
+putEntryNarInfo :: Server.ServerConfig -> NarInfo.NarInfo -> IO WT.SResponse
+putEntryNarInfo cfg ni =
+  serverRequest cfg "PUT" [T.take 32 (T.drop (T.length "/nix/store/") (NarInfo.niStorePath ni)) <> ".narinfo"] [serverAuthHeader] (renderNarInfoBody ni)
+
+-- | Store an entry the tests keep, so a store holds a narinfo besides
+-- the ones a test removes and a reclaim is not blocked for want of one.
+putKeptEntry :: Server.ServerConfig -> IO HTTP.Status
+putKeptEntry cfg = putEntry cfg (entryNarInfo otherHashKey "kept.nar" "kept-bytes") "kept.nar" "kept-bytes"
+
+-- | Set a stored NAR's modification time a month back, past the default
+-- minimum age.
+ageNar :: Server.ServerConfig -> Text -> IO ()
+ageNar cfg name = do
+  monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
+  setModificationTime (Store.fsRoot (Server.scStore cfg) ++ "/nar/" ++ T.unpack name) monthAgo
+
+-- | A GET's status and body.
+getResource :: Server.ServerConfig -> [Text] -> IO (HTTP.Status, ByteString)
+getResource cfg segments = statusAndBody <$> serverRequest cfg "GET" segments [] ""
+
+-- | A reclaim request with a query, authenticated.
+reclaimQuery :: Server.ServerConfig -> BS.ByteString -> HTTP.Query -> IO WT.SResponse
+reclaimQuery cfg method query =
+  WT.runSession (WT.srequest (WT.SRequest req "")) (Server.cacheApp cfg)
+  where
+    req =
+      defaultRequest
+        { requestMethod = method,
+          pathInfo = ["reclaim"],
+          requestHeaders = [serverAuthHeader],
+          queryString = query
+        }
+
+-- | The report a reclaim at the default minimum age answers with,
+-- spelled out, so a change to its form fails here.
+reclaimReport :: [ByteString] -> ByteString
+reclaimReport body = BS.concat (map (<> "\n") ("minimum age: 336 hours" : body))
+
+-- | How a thread stands once it has run as far as it can.
+data Settled
+  = -- | Waiting in STM, which in these tests is a store's gate.
+    AtGate
+  | Finished
+  | -- | Waiting on an MVar, which nothing in these tests releases.
+    BlockedElsewhere
+  deriving (Eq, Show)
+
+-- | Yield to a thread until it finishes or waits, and say which.  This
+-- suite runs on the single-threaded runtime, where a thread that has
+-- neither finished nor blocked is runnable and runs while this one
+-- yields, so the loop waits on the thread's own progress and no clock.
+settle :: ThreadId -> IO Settled
+settle thread = do
+  status <- threadStatus thread
+  case status of
+    ThreadFinished -> pure Finished
+    ThreadDied -> pure Finished
+    ThreadBlocked BlockedOnSTM -> pure AtGate
+    ThreadBlocked BlockedOnMVar -> pure BlockedElsewhere
+    ThreadBlocked _ -> yield >> settle thread
+    ThreadRunning -> yield >> settle thread
+
+-- | Run an action in a thread of its own: the thread, and where its
+-- outcome arrives.
+spawn :: IO a -> IO (ThreadId, MVar (Either SomeException a))
+spawn action = do
+  done <- newEmptyMVar
+  thread <- forkFinally action (putMVar done)
+  pure (thread, done)
+
+-- | An outcome with its exception, if any, as text.
+described :: Either SomeException a -> Either String a
+described = either (Left . displayException) Right
+
+-- | Run a reclaim of a server's store at the default minimum age and
+-- stop it once it has listed the store, then run @during@ in a thread of
+-- its own, and let the reclaim go on once @during@ has run as far as it
+-- can: how @during@ stood then, and both outcomes.  The reclaim reads
+-- its clock after every listing and before any removal, inside its hold
+-- on the gate, so the clock is where it stops: between the listing and
+-- the removals, the window no narinfo and no NAR may enter.
+duringReclaim :: Server.ServerConfig -> IO a -> IO (Settled, Either String (Either Reclaim.ReclaimBlocked Reclaim.Reclaimed), Either String a)
+duringReclaim cfg during = do
+  now <- getCurrentTime
+  listed <- newEmptyMVar
+  resume <- newEmptyMVar
+  let clock = putMVar listed () >> takeMVar resume >> pure now
+  (_, reclaimed) <- spawn (Reclaim.reclaim (Server.scStore cfg) Reclaim.defaultMinimumAge clock)
+  takeMVar listed
+  (thread, outcome) <- spawn during
+  standing <- settle thread
+  putMVar resume ()
+  reclaimOutcome <- described <$> takeMVar reclaimed
+  duringOutcome <- described <$> takeMVar outcome
+  pure (standing, reclaimOutcome, duringOutcome)
+
+-- | The NARs a reclaim removed, by name, with each outcome.
+removedNars :: Either String (Either Reclaim.ReclaimBlocked Reclaim.Reclaimed) -> Either String (Either Reclaim.ReclaimBlocked [(Text, Store.NarRemoveResult)])
+removedNars = fmap (fmap (\done -> [(Store.nfName nar, outcome) | (nar, outcome) <- Reclaim.rdNars done]))
+
+testRemoval :: IO Bool
+testRemoval =
+  runGroup
+    "Removal"
+    [ test "DELETE of a narinfo needs the write key, removes it, and leaves its NAR served" $
+        withAuthedServer $ \cfg -> do
+          stored <- putEntry cfg validServerNarInfo serverNarName serverNarBytes
+          let narInfoPath = [validNarInfoHashKey <> ".narinfo"]
+          unauthorized <- serverRequest cfg "DELETE" narInfoPath [] ""
+          kept <- fst <$> getResource cfg narInfoPath
+          deleted <- serverRequest cfg "DELETE" narInfoPath [serverAuthHeader] ""
+          gone <- fst <$> getResource cfg narInfoPath
+          again <- serverRequest cfg "DELETE" narInfoPath [serverAuthHeader] ""
+          traversal <- serverRequest cfg "DELETE" ["...narinfo"] [serverAuthHeader] ""
+          nar <- getResource cfg ["nar", serverNarName]
+          ok1 <- assertEqual "stored" HTTP.status200 stored
+          ok2 <- assertEqual "without the key" (HTTP.status401, HTTP.status200) (WT.simpleStatus unauthorized, kept)
+          ok3 <- assertEqual "deleted" (HTTP.status200, HTTP.status404) (WT.simpleStatus deleted, gone)
+          ok4 <- assertEqual "deleted again" HTTP.status404 (WT.simpleStatus again)
+          ok5 <- assertEqual "traversal" HTTP.status400 (WT.simpleStatus traversal)
+          ok6 <- assertEqual "NAR" (HTTP.status200, serverNarBytes) nar
+          pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+      test "an entry deleted, GET /reclaim lists its NAR, and POST /reclaim removes it" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          stored <- putEntry cfg validServerNarInfo serverNarName serverNarBytes
+          ageNar cfg serverNarName
+          ageNar cfg "kept.nar"
+          _ <- serverRequest cfg "DELETE" [validNarInfoHashKey <> ".narinfo"] [serverAuthHeader] ""
+          listed <- reclaimQuery cfg "GET" []
+          afterListing <- fst <$> getResource cfg ["nar", serverNarName]
+          removed <- reclaimQuery cfg "POST" []
+          afterRemoval <- fst <$> getResource cfg ["nar", serverNarName]
+          kept <- fst <$> getResource cfg ["nar", "kept.nar"]
+          ok1 <- assertEqual "stored" HTTP.status200 stored
+          ok2 <-
+            assertEqual
+              "listed"
+              ( HTTP.status200,
+                reclaimReport
+                  [ "unreferenced: nar/test.nar (17 bytes)",
+                    "eligible: 1 NAR, 17 bytes; 0 abandoned uploads, 0 bytes",
+                    "kept, younger than the minimum age: 0 NARs, 0 uploads"
+                  ]
+              )
+              (statusAndBody listed)
+          ok3 <- assertEqual "served after the listing" HTTP.status200 afterListing
+          ok4 <-
+            assertEqual
+              "removed"
+              ( HTTP.status200,
+                reclaimReport
+                  [ "removed: nar/test.nar (17 bytes)",
+                    "reclaimed: 1 NAR, 17 bytes; 0 abandoned uploads, 0 bytes",
+                    "kept, younger than the minimum age: 0 NARs, 0 uploads"
+                  ]
+              )
+              (statusAndBody removed)
+          ok5 <- assertEqual "after the removal" (HTTP.status404, HTTP.status200) (afterRemoval, kept)
+          ok6 <- assertEqual "uncacheable" [Just "no-store", Just "no-store"] (map (lookup HTTP.hCacheControl . WT.simpleHeaders) [listed, removed])
+          pure (ok1 && ok2 && ok3 && ok4 && ok5 && ok6),
+      test "GET and POST /reclaim need the write key" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg serverNarBytes
+          ageNar cfg serverNarName
+          responses <- traverse (\method -> serverRequest cfg method ["reclaim"] [] "") ["GET", "POST"]
+          nar <- fst <$> getResource cfg ["nar", serverNarName]
+          ok1 <- assertEqual "statuses" [HTTP.status401, HTTP.status401] (map WT.simpleStatus responses)
+          ok2 <- assertEqual "NAR" HTTP.status200 nar
+          pure (ok1 && ok2),
+      test "min-age-hours sets a reclaim's minimum age, and any other query is 400" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg serverNarBytes
+          byDefault <- statusAndBody <$> reclaimQuery cfg "POST" []
+          refusals <-
+            traverse
+              (fmap WT.simpleStatus . reclaimQuery cfg "POST")
+              [ [("min-age-hours", Just "01")],
+                [("min-age-hours", Just "-1")],
+                [("min-age-hours", Just "1.5")],
+                [("min-age-hours", Nothing)],
+                [("min-age", Just "0")],
+                [("min-age-hours", Just "0"), ("min-age-hours", Just "0")],
+                [("min-age-hours", Just "0"), ("delete", Nothing)]
+              ]
+          survived <- fst <$> getResource cfg ["nar", serverNarName]
+          atZero <- statusAndBody <$> reclaimQuery cfg "POST" [("min-age-hours", Just "0")]
+          gone <- fst <$> getResource cfg ["nar", serverNarName]
+          ok1 <-
+            assertEqual
+              "at the default age"
+              ( HTTP.status200,
+                reclaimReport
+                  [ "reclaimed: 0 NARs, 0 bytes; 0 abandoned uploads, 0 bytes",
+                    "kept, younger than the minimum age: 1 NAR, 0 uploads"
+                  ]
+              )
+              byDefault
+          ok2 <- assertEqual "refusals" (map (const HTTP.status400) refusals) refusals
+          ok3 <- assertEqual "kept through the refusals" HTTP.status200 survived
+          ok4 <-
+            assertEqual
+              "at zero"
+              ( HTTP.status200,
+                "minimum age: 0 hours\nremoved: nar/test.nar (17 bytes)\nreclaimed: 1 NAR, 17 bytes; 0 abandoned uploads, 0 bytes\nkept, younger than the minimum age: 0 NARs, 0 uploads\n"
+              )
+              atZero
+          ok5 <- assertEqual "removed at zero" HTTP.status404 gone
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "property: min-age-hours reads back as that many hours" $
+        checkProperty $
+          forAll (choose (0, 1000000 :: Integer)) $ \hours ->
+            Server.parseMinimumAge [("min-age-hours", Just (TE.encodeUtf8 (T.pack (show hours))))]
+              === Right (fromInteger hours * 3600)
+              .&&. Server.parseMinimumAge [] === Right Reclaim.defaultMinimumAge,
+      test "a narinfo that cannot be resolved blocks a reclaim with 409, which removes nothing" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg serverNarBytes
+          ageNar cfg serverNarName
+          _ <- Store.writeNarInfo (Server.scStore cfg) "broken" "not a narinfo\n"
+          responses <- traverse (\method -> reclaimQuery cfg method []) ["GET", "POST"]
+          nar <- fst <$> getResource cfg ["nar", serverNarName]
+          ok1 <- assertEqual "statuses" [HTTP.status409, HTTP.status409] (map WT.simpleStatus responses)
+          ok2 <- assertTrue "names the narinfo" (all (BS.isPrefixOf "unresolved: broken.narinfo: " . strictBody) responses)
+          ok3 <- assertEqual "NAR" HTTP.status200 nar
+          pure (ok1 && ok2 && ok3),
+      test "POST /reclaim removes an upload idle for the minimum age, named by its request path" $
+        withAuthedServer $ \cfg -> do
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" "abandoned"
+          monthAgo <- addUTCTime (negate (30 * nominalDay)) <$> getCurrentTime
+          traverse_ (backdateUpload monthAgo) =<< Store.listStagedUploads (Server.scStore cfg)
+          removed <- reclaimQuery cfg "POST" []
+          staged <- storeEntries cfg "uploads"
+          completion <- completeServerUpload cfg serverNarName uploadId (totalsBody 1 9)
+          ok1 <-
+            assertEqual
+              "removed"
+              ( HTTP.status200,
+                reclaimReport
+                  [ "removed: nar/test.nar/uploads/" <> TE.encodeUtf8 uploadId <> " (9 bytes)",
+                    "reclaimed: 0 NARs, 0 bytes; 1 abandoned upload, 9 bytes",
+                    "kept, younger than the minimum age: 0 NARs, 0 uploads"
+                  ]
+              )
+              (statusAndBody removed)
+          ok2 <- assertEqual "uploads/" [] staged
+          ok3 <- assertEqual "completion" HTTP.status404 (WT.simpleStatus completion)
+          pure (ok1 && ok2 && ok3),
+      -- The server checks a narinfo's file fields against the file it
+      -- names, never the encoding, so the bytes stand in for a zstd
+      -- frame.
+      test "a narinfo over an entry replaces its NAR with a smaller encoding, and a reclaim removes the old one alone" $
+        withAuthedServer $ \cfg -> do
+          let uncompressed = BS.replicate 64 0x61
+              compressed = "zstd-frame"
+              replacement = (entryNarInfo validNarInfoHashKey "small.nar.zst" compressed) {NarInfo.niCompression = "zstd"}
+          stored <- putEntry cfg (entryNarInfo validNarInfoHashKey "big.nar" uncompressed) "big.nar" uncompressed
+          ageNar cfg "big.nar"
+          replaced <- putEntry cfg replacement "small.nar.zst" compressed
+          narInfo <- getResource cfg [validNarInfoHashKey <> ".narinfo"]
+          oldBefore <- fst <$> getResource cfg ["nar", "big.nar"]
+          removed <- reclaimQuery cfg "POST" []
+          oldAfter <- fst <$> getResource cfg ["nar", "big.nar"]
+          newAfter <- getResource cfg ["nar", "small.nar.zst"]
+          ok1 <- assertEqual "stored, then replaced" (HTTP.status200, HTTP.status200) (stored, replaced)
+          ok2 <- assertTrue "narinfo names the smaller NAR" (all (`BS.isInfixOf` snd narInfo) ["URL: nar/small.nar.zst\n", "Compression: zstd\n", "FileSize: 10\n"])
+          ok3 <- assertEqual "old NAR served until the reclaim" HTTP.status200 oldBefore
+          ok4 <-
+            assertEqual
+              "removed"
+              ( HTTP.status200,
+                reclaimReport
+                  [ "removed: nar/big.nar (64 bytes)",
+                    "reclaimed: 1 NAR, 64 bytes; 0 abandoned uploads, 0 bytes",
+                    "kept, younger than the minimum age: 0 NARs, 0 uploads"
+                  ]
+              )
+              (statusAndBody removed)
+          ok5 <- assertEqual "after the reclaim" (HTTP.status404, (HTTP.status200, compressed)) (oldAfter, newAfter)
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      -- A narinfo and a reclaim at once
+      test "a narinfo stored before a reclaim keeps its NAR, however old" $
+        withAuthedServer $ \cfg -> do
+          stored <- putEntry cfg validServerNarInfo serverNarName serverNarBytes
+          ageNar cfg serverNarName
+          reclaimed <- Reclaim.reclaim (Server.scStore cfg) Reclaim.defaultMinimumAge getCurrentTime
+          nar <- fst <$> getResource cfg ["nar", serverNarName]
+          ok1 <- assertEqual "stored" HTTP.status200 stored
+          ok2 <- assertEqual "removed" (Right (Right [])) (removedNars (Right reclaimed))
+          ok3 <- assertEqual "NAR" HTTP.status200 nar
+          pure (ok1 && ok2 && ok3),
+      test "a narinfo sent during a reclaim waits for it, and is refused once its NAR is gone" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg serverNarBytes
+          ageNar cfg serverNarName
+          (standing, reclaimed, put) <- duringReclaim cfg (putServerNarInfo cfg validServerNarInfo)
+          narInfo <- fst <$> getResource cfg [validNarInfoHashKey <> ".narinfo"]
+          ok1 <- assertEqual "the narinfo, during the reclaim" AtGate standing
+          ok2 <- assertEqual "removed" (Right (Right [(serverNarName, Store.NarRemoved)])) (removedNars reclaimed)
+          ok3 <- assertEqual "narinfo" (Right (HTTP.status400, "NAR nar/test.nar is not stored; upload it before its narinfo")) (statusAndBody <$> put)
+          ok4 <- assertEqual "narinfo stored" HTTP.status404 narInfo
+          pure (ok1 && ok2 && ok3 && ok4),
+      -- The signer runs after the narinfo upload has checked its NAR and
+      -- before it writes the narinfo, so this one stops there.
+      test "a reclaim started between a narinfo upload's check and its write waits, and keeps the NAR" $
+        withAuthedServer $ \cfg -> case Server.narClaim validServerNarInfo of
+          Left refusal -> assertEqual "claim" Nothing (Just refusal)
+          Right claim -> do
+            let store = Server.scStore cfg
+            _ <- putKeptEntry cfg
+            _ <- putServerNar cfg serverNarBytes
+            ageNar cfg serverNarName
+            checked <- newEmptyMVar
+            resume <- newEmptyMVar
+            let signer ni = putMVar checked () >> takeMVar resume >> Server.signNarInfo Nothing ni
+            (_, written) <- spawn (Server.storeNarInfo store signer validNarInfoHashKey validServerNarInfo claim)
+            takeMVar checked
+            (reclaiming, reclaimed) <- spawn (Reclaim.reclaim store Reclaim.defaultMinimumAge getCurrentTime)
+            standing <- settle reclaiming
+            putMVar resume ()
+            writeOutcome <- described <$> takeMVar written
+            reclaimOutcome <- described <$> takeMVar reclaimed
+            nar <- fst <$> getResource cfg ["nar", serverNarName]
+            narInfo <- fst <$> getResource cfg [validNarInfoHashKey <> ".narinfo"]
+            ok1 <- assertEqual "the reclaim, during the upload" AtGate standing
+            ok2 <- assertEqual "upload" (Right Server.NarInfoWritten) writeOutcome
+            ok3 <- assertEqual "removed" (Right (Right [])) (removedNars reclaimOutcome)
+            ok4 <- assertEqual "NAR and narinfo" (HTTP.status200, HTTP.status200) (nar, narInfo)
+            pure (ok1 && ok2 && ok3 && ok4),
+      -- A NAR and a reclaim at once
+      test "a NAR uploaded during a reclaim lands after it, so the reclaim never removes it" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg "an earlier upload"
+          ageNar cfg serverNarName
+          (standing, reclaimed, put) <- duringReclaim cfg (putServerNar cfg serverNarBytes)
+          nar <- getResource cfg ["nar", serverNarName]
+          narInfo <- WT.simpleStatus <$> putServerNarInfo cfg validServerNarInfo
+          ok1 <- assertEqual "the upload, during the reclaim" AtGate standing
+          ok2 <- assertEqual "removed: the earlier upload" (Right (Right [(serverNarName, Store.NarRemoved)])) (removedNars reclaimed)
+          ok3 <- assertEqual "upload" (Right HTTP.status200) (WT.simpleStatus <$> put)
+          ok4 <- assertEqual "NAR" (HTTP.status200, serverNarBytes) nar
+          ok5 <- assertEqual "narinfo" HTTP.status200 narInfo
+          pure (ok1 && ok2 && ok3 && ok4 && ok5),
+      test "a multipart upload completed during a reclaim lands after it" $
+        withAuthedServer $ \cfg -> do
+          _ <- putKeptEntry cfg
+          _ <- putServerNar cfg "an earlier upload"
+          ageNar cfg serverNarName
+          (_, uploadId) <- beginServerUpload cfg serverNarName
+          _ <- putServerPart cfg serverNarName uploadId "1" "nar-payload"
+          _ <- putServerPart cfg serverNarName uploadId "2" "-bytes"
+          (standing, reclaimed, completed) <- duringReclaim cfg (completeServerUpload cfg serverNarName uploadId (totalsBody 2 17))
+          nar <- getResource cfg ["nar", serverNarName]
+          ok1 <- assertEqual "the completion, during the reclaim" AtGate standing
+          ok2 <- assertEqual "removed: the earlier upload" (Right (Right [(serverNarName, Store.NarRemoved)])) (removedNars reclaimed)
+          ok3 <- assertEqual "completion" (Right HTTP.status200) (WT.simpleStatus <$> completed)
+          ok4 <- assertEqual "NAR" (HTTP.status200, serverNarBytes) nar
+          pure (ok1 && ok2 && ok3 && ok4),
+      -- The gate itself
+      test "a removal waits for the gate's holders, and holds new ones off until it is done" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        events <- newIORef []
+        let record event = atomicModifyIORef' events (\done -> (done ++ [event], ()))
+        (removalStanding, removalDone, holderStanding, holderDone) <- Store.withoutRemoval store $ do
+          (removal, removalDone) <- spawn (Store.withRemoval store (record "removal"))
+          removalStanding <- settle removal
+          (holder, holderDone) <- spawn (Store.withoutRemoval store (record "new holder"))
+          holderStanding <- settle holder
+          record "first holder"
+          pure (removalStanding, removalDone, holderStanding, holderDone)
+        outcomes <- traverse (fmap described . takeMVar) [removalDone, holderDone]
+        order <- readIORef events
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "standing, while the first holder holds" (AtGate, AtGate) (removalStanding, holderStanding)
+        ok2 <- assertEqual "outcomes" [Right (), Right ()] outcomes
+        ok3 <- assertEqual "order" ["first holder", "removal", "new holder" :: String] order
+        pure (ok1 && ok2 && ok3),
+      test "a removal interrupted while it waits withdraws, and new holders go ahead" $ do
+        tmpDir <- createTestDir
+        store <- Store.newFileStore tmpDir
+        (removalStanding, interrupted, holderStanding) <- Store.withoutRemoval store $ do
+          (removal, removalDone) <- spawn (Store.withRemoval store (pure ()))
+          removalStanding <- settle removal
+          killThread removal
+          outcome <- takeMVar removalDone
+          (holder, _) <- spawn (Store.withoutRemoval store (pure ()))
+          holderStanding <- settle holder
+          pure (removalStanding, either fromException (const Nothing) outcome, holderStanding)
+        removeDirectoryRecursive tmpDir
+        ok1 <- assertEqual "removal, waiting" AtGate removalStanding
+        ok2 <- assertEqual "removal, interrupted" (Just ThreadKilled) interrupted
+        ok3 <- assertEqual "new holder" Finished holderStanding
+        pure (ok1 && ok2 && ok3)
+    ]
 
 -- ---------------------------------------------------------------------------
 -- Helpers
