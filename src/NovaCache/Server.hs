@@ -16,10 +16,19 @@
 -- GET  \/narinfo-hashes      stored-hash listing (authenticated; push-tool plumbing)
 -- PUT  \/\<hash\>.narinfo      validated, checked against its stored NAR, signed, stored (authenticated)
 -- PUT  \/nar\/\<file\>          streamed to disk under a size cap (authenticated)
+--
+-- POST \/nar\/\<file\>\/uploads              begin a multipart upload (authenticated)
+-- PUT  \/nar\/\<file\>\/uploads\/\<id\>\/\<n\>     part n, streamed to disk under the same cap (authenticated)
+-- POST \/nar\/\<file\>\/uploads\/\<id\>         join the parts into nar\/\<file\> (authenticated)
 -- @
 --
 -- HEAD is answered wherever GET is: routing treats the two identically
 -- and Warp elides the body while keeping the status and headers.
+--
+-- A multipart upload carries a NAR past a proxy that refuses large
+-- request bodies.  Its parts are staged outside @nar\/@ (see
+-- "NovaCache.Store"), and the NAR appears there only when the request
+-- that completes the upload joins them.
 module NovaCache.Server
   ( -- * Configuration
     ServerConfig (..),
@@ -34,6 +43,11 @@ module NovaCache.Server
     -- * Body limits
     maxNarInfoBodySize,
     maxNarBodySize,
+    maxUploadTotalsBodySize,
+
+    -- * Multipart upload
+    parseUploadTotals,
+    renderUploadTotals,
 
     -- * Handler pieces (exported for tests)
     requireAuth,
@@ -66,6 +80,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Read as TR
 import GHC.Clock (getMonotonicTime)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai
@@ -87,15 +102,27 @@ import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (SecretKey, sign)
 import NovaCache.Store
   ( CacheInfo (..),
+    CompletionResult (..),
     FileStore,
     NarWriteResult (..),
+    PartWriteResult (..),
+    UploadId,
+    UploadTotals (..),
+    beginUpload,
+    completeUpload,
     getCacheInfo,
     listNarInfoHashes,
+    maxUploadParts,
     narFilePath,
+    parsePartNumber,
+    parseUploadId,
     readNarInfo,
+    renderPartNumber,
+    renderUploadId,
     sanitizePath,
     writeNarInfo,
     writeNarStreaming,
+    writeUploadPart,
   )
 import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
@@ -115,6 +142,11 @@ maxNarInfoBodySize = 4 * 1024 * 1024 -- 4 MB
 maxNarBodySize :: Int
 maxNarBodySize = 4 * 1024 * 1024 * 1024 -- 4 GB
 
+-- | Maximum body of the request that completes a multipart upload: two
+-- short lines (see 'renderUploadTotals').
+maxUploadTotalsBodySize :: Int
+maxUploadTotalsBodySize = 1024
+
 -- | Suffix of narinfo request paths (@\/\<hash\>.narinfo@).
 narInfoSuffix :: Text
 narInfoSuffix = ".narinfo"
@@ -122,6 +154,11 @@ narInfoSuffix = ".narinfo"
 -- | First path segment of NAR request paths (@\/nar\/\<file\>@).
 narRouteSegment :: Text
 narRouteSegment = "nar"
+
+-- | Path segment under @\/nar\/\<file\>@ that holds the file's multipart
+-- uploads.
+uploadsRouteSegment :: Text
+uploadsRouteSegment = "uploads"
 
 -- | Bytes read per step while hashing a stored NAR.
 storedNarReadBytes :: Int
@@ -232,6 +269,10 @@ cacheApp cfg req respond = case (routeMethod, pathInfo req) of
   ("PUT", segments)
     | Just fileName <- narRoute segments ->
         requireAuth cfg req respond (putNar cfg req respond fileName)
+  -- /nar/<file>/uploads... - multipart upload (auth required)
+  (method, segments)
+    | Just route <- uploadRoute segments ->
+        uploadRequest cfg req respond method route
   -- Fallback
   _ ->
     respond notFound
@@ -269,31 +310,208 @@ putNarInfo cfg req respond hashKey body = case decodeAndValidate body of
           Right signed -> do
             ok <- writeNarInfo (scStore cfg) hashKey signed
             if ok
-              then respond (responseLBS HTTP.status200 textHeaders "ok")
-              else do
-                logWarn req "BADPATH"
-                respond (badRequest "invalid path")
+              then respond okResponse
+              else badPath req respond
 
 -- | Stream a NAR upload into the store.  A declared @Content-Length@ over
 -- the cap is refused before reading anything; chunked or lying transfers
 -- are cut off by the store's running size check, so memory and storage
 -- stay bounded either way.
 putNar :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> IO ResponseReceived
-putNar cfg req respond fileName = case requestBodyLength req of
-  KnownLength len
-    | len > fromIntegral maxNarBodySize -> overLimit
-  _ -> do
-    result <- writeNarStreaming (scStore cfg) fileName maxNarBodySize (getRequestBodyChunk req)
-    case result of
-      NarWriteOk -> respond (responseLBS HTTP.status200 textHeaders "ok")
-      NarWriteTooLarge -> overLimit
-      NarWriteBadPath -> do
-        logWarn req "BADPATH"
-        respond (badRequest "invalid path")
+putNar cfg req respond fileName = refuseDeclaredOver maxNarBodySize req respond $ do
+  result <- writeNarStreaming (scStore cfg) fileName maxNarBodySize (getRequestBodyChunk req)
+  case result of
+    NarWriteOk -> respond okResponse
+    NarWriteTooLarge -> overLimit req respond
+    NarWriteBadPath -> badPath req respond
+
+-- ---------------------------------------------------------------------------
+-- Multipart upload
+-- ---------------------------------------------------------------------------
+
+-- | A request path under @\/nar\/\<file\>\/uploads@.
+data UploadRoute
+  = -- | @\/nar\/\<file\>\/uploads@, where an upload of the file begins.
+    UploadsOf !Text
+  | -- | @\/nar\/\<file\>\/uploads\/\<id\>@, one upload. (file, id)
+    UploadOf !Text !Text
+  | -- | @\/nar\/\<file\>\/uploads\/\<id\>\/\<n\>@, one part of it.
+    -- (file, id, part number)
+    PartOf !Text !Text !Text
+
+-- | The upload request a path names.  A NAR's name holds no @\/@, so no
+-- such path names a file under @nar\/@.
+uploadRoute :: [Text] -> Maybe UploadRoute
+uploadRoute (segment : fileName : uploads : rest)
+  | segment == narRouteSegment && uploads == uploadsRouteSegment = case rest of
+      [] -> Just (UploadsOf fileName)
+      [uploadId] -> Just (UploadOf fileName uploadId)
+      [uploadId, part] -> Just (PartOf fileName uploadId part)
+      _ -> Nothing
+uploadRoute _ = Nothing
+
+-- | Answer a request under @\/nar\/\<file\>\/uploads@, each one
+-- authenticated as the other writes are.
+uploadRequest :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> HTTP.Method -> UploadRoute -> IO ResponseReceived
+uploadRequest cfg req respond method route = case (method, route) of
+  ("POST", UploadsOf fileName) ->
+    authed (beginNarUpload cfg req respond fileName)
+  ("PUT", PartOf fileName rawId rawPart) ->
+    authed (withUpload req respond fileName rawId (putNarPart cfg req respond fileName rawPart))
+  ("POST", UploadOf fileName rawId) ->
+    authed (withUpload req respond fileName rawId (completeNarUpload cfg req respond fileName))
+  _ -> respond notFound
   where
-    overLimit = do
-      logWarn req "OVERLIMIT"
-      respond (responseLBS HTTP.status413 textHeaders "request body too large")
+    authed = requireAuth cfg req respond
+
+-- | Run an action on the upload a request names: 400 when the NAR's name
+-- is not one the store admits, 404 when the id is not one the server
+-- issues.
+withUpload :: Request -> (Response -> IO ResponseReceived) -> Text -> Text -> (UploadId -> IO ResponseReceived) -> IO ResponseReceived
+withUpload req respond fileName rawId action = case (sanitizePath fileName, parseUploadId rawId) of
+  (Nothing, _) -> badPath req respond
+  (Just _, Nothing) -> unknownUpload req respond fileName rawId
+  (Just _, Just uid) -> action uid
+
+-- | Begin a multipart upload: 201, with the upload's id as the body and
+-- its path in @Location@.  The path is relative to the request's, so it
+-- stays right when the cache is served under a path prefix.
+beginNarUpload :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> IO ResponseReceived
+beginNarUpload cfg req respond fileName = do
+  begun <- beginUpload (scStore cfg) fileName
+  case begun of
+    Nothing -> badPath req respond
+    Just uid ->
+      let location = TE.encodeUtf8 (uploadsRouteSegment <> "/" <> renderUploadId uid)
+       in respond
+            ( responseLBS
+                HTTP.status201
+                ((HTTP.hLocation, location) : textHeaders)
+                (textBody (renderUploadId uid <> "\n"))
+            )
+
+-- | Stream one part of an upload to disk.  A declared @Content-Length@
+-- over the NAR cap is refused before anything is read, as for a whole
+-- NAR; otherwise the store's running check holds the part, with the
+-- parts the upload holds, to the same cap.
+putNarPart :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> Text -> UploadId -> IO ResponseReceived
+putNarPart cfg req respond fileName rawPart uid = case parsePartNumber rawPart of
+  Nothing -> do
+    logWarn req "BADPART"
+    respond (badRequest ("part number must be a whole number from 1 to " <> showText maxUploadParts))
+  Just part -> refuseDeclaredOver maxNarBodySize req respond $ do
+    result <- writeUploadPart (scStore cfg) fileName uid part maxNarBodySize (getRequestBodyChunk req)
+    case result of
+      PartWritten -> respond okResponse
+      PartTooLarge -> overLimit req respond
+      PartOutOfOrder held ->
+        refuseConflict
+          req
+          respond
+          ( "upload of "
+              <> narPath fileName
+              <> " holds "
+              <> countedParts held
+              <> ", so the next is part "
+              <> showText (held + 1)
+              <> ", not part "
+              <> renderPartNumber part
+          )
+      PartUploadUnknown -> unknownUpload req respond fileName (renderUploadId uid)
+      PartBadPath -> badPath req respond
+
+-- | Complete an upload from the totals its body declares.
+completeNarUpload :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> UploadId -> IO ResponseReceived
+completeNarUpload cfg req respond fileName uid =
+  withLimitedBody maxUploadTotalsBodySize req respond $ \body -> case parseUploadTotals body of
+    Left err -> do
+      logWarn req ("BADTOTALS: " <> T.unpack err)
+      respond (badRequest err)
+    Right totals -> do
+      result <- completeUpload (scStore cfg) fileName uid maxNarBodySize totals
+      case result of
+        UploadCompleted -> respond okResponse
+        UploadCompletedStagingKept err -> do
+          logWarn req ("STAGINGKEPT: " <> show err)
+          respond okResponse
+        CompletionPartsMismatch declared held ->
+          refuseConflict req respond ("upload of " <> narPath fileName <> " holds " <> countedParts held <> ", Parts is " <> showText declared)
+        CompletionSizeMismatch declared joined ->
+          refuseConflict req respond ("upload of " <> narPath fileName <> " joins to " <> showText joined <> " bytes, FileSize is " <> showText declared)
+        CompletionTooLarge declared -> do
+          logWarn req "OVERLIMIT"
+          respond
+            ( responseLBS
+                HTTP.status413
+                textHeaders
+                (textBody ("FileSize " <> showText declared <> " is over the " <> showText maxNarBodySize <> " bytes a NAR may hold"))
+            )
+        CompletionUploadUnknown -> unknownUpload req respond fileName (renderUploadId uid)
+        CompletionBadPath -> badPath req respond
+
+-- | A count of parts with its noun.
+countedParts :: Int -> Text
+countedParts 1 = "1 part"
+countedParts n = showText n <> " parts"
+
+-- | Keys of the body that completes an upload.
+partsKey, fileSizeKey :: Text
+partsKey = "Parts"
+fileSizeKey = "FileSize"
+
+-- | Separates a key from its value, as in a narinfo.
+fieldSeparator :: Text
+fieldSeparator = ": "
+
+-- | Digits in a declared size: at most a uint64's 20, as for a narinfo's
+-- FileSize.  The length is bounded before the parse, so an overlong
+-- number costs nothing to refuse; a size past 'maxNarBodySize' is
+-- refused when the upload is completed.
+maxByteCountDigits :: Int
+maxByteCountDigits = 20
+
+-- | The body that completes an upload: how many parts it holds and how
+-- many bytes they join to, as @Parts@ and @FileSize@ lines in narinfo's
+-- @Key: value@ form.
+renderUploadTotals :: UploadTotals -> ByteString
+renderUploadTotals totals =
+  TE.encodeUtf8 $
+    T.unlines
+      [ partsKey <> fieldSeparator <> renderPartNumber (utParts totals),
+        fileSizeKey <> fieldSeparator <> showText (utFileSize totals)
+      ]
+
+-- | Read the body that completes an upload: a @Parts@ line and a
+-- @FileSize@ line, in either order, each once, each value in canonical
+-- decimal.  Any other line is refused rather than skipped, so a field a
+-- client means to have checked is never silently ignored.
+parseUploadTotals :: ByteString -> Either Text UploadTotals
+parseUploadTotals body = do
+  text <- first (const "completion body is not valid UTF-8") (TE.decodeUtf8' body)
+  fields <- traverse splitField (T.lines text)
+  parts <- field partsKey fields >>= orRefuse ("Parts must be a whole number from 1 to " <> showText maxUploadParts) . parsePartNumber
+  size <- field fileSizeKey fields >>= orRefuse "FileSize must be a whole number of bytes" . parseByteCount
+  pure UploadTotals {utParts = parts, utFileSize = size}
+  where
+    splitField line = case T.stripPrefix fieldSeparator <$> T.breakOn fieldSeparator line of
+      (key, Just value)
+        | key `elem` [partsKey, fileSizeKey] -> Right (key, value)
+        | otherwise -> Left ("completion body has an unknown field " <> key)
+      (_, Nothing) -> Left ("completion body line is not Key: value: " <> line)
+    field key fields = case [value | (named, value) <- fields, named == key] of
+      [value] -> Right value
+      [] -> Left ("completion body has no " <> key <> " line")
+      _ -> Left ("completion body has more than one " <> key <> " line")
+    orRefuse msg = maybe (Left msg) Right
+
+-- | A byte count in canonical decimal: digits only, with no sign and no
+-- leading zero.
+parseByteCount :: Text -> Maybe Integer
+parseByteCount txt
+  | T.length txt > maxByteCountDigits = Nothing
+  | otherwise = case TR.decimal txt of
+      Right (n, _) | showText n == txt -> Just n
+      _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- Validation pipeline
@@ -413,8 +631,6 @@ renderNarRefusal refusal = case refusal of
     "NAR " <> narPath name <> " is " <> showText stored <> " bytes, narinfo FileSize is " <> showText declared
   NarHashMismatch name declared stored ->
     "NAR " <> narPath name <> " hashes to " <> formatNixHash stored <> ", narinfo FileHash is " <> formatNixHash declared
-  where
-    showText = T.pack . show
 
 -- | The request path, relative to the cache root, that serves a NAR.
 narPath :: Text -> Text
@@ -488,11 +704,7 @@ readBodyLimited limit req = case requestBodyLength req of
 withLimitedBody :: Int -> Request -> (Response -> IO ResponseReceived) -> (ByteString -> IO ResponseReceived) -> IO ResponseReceived
 withLimitedBody limit req respond action = do
   bodyResult <- readBodyLimited limit req
-  case bodyResult of
-    Nothing -> do
-      logWarn req "OVERLIMIT"
-      respond (responseLBS HTTP.status413 textHeaders "request body too large")
-    Just body -> action body
+  maybe (overLimit req respond) action bodyResult
 
 -- ---------------------------------------------------------------------------
 -- Auth
@@ -580,6 +792,49 @@ notFound = responseLBS HTTP.status404 textHeaders "not found"
 -- | 400 Bad Request with a text error message.
 badRequest :: Text -> Response
 badRequest msg = responseLBS HTTP.status400 textHeaders (textBody msg)
+
+-- | 200, the answer to every write that succeeds.
+okResponse :: Response
+okResponse = responseLBS HTTP.status200 textHeaders "ok"
+
+-- | Refuse a request naming a file the store cannot hold.
+badPath :: Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+badPath req respond = do
+  logWarn req "BADPATH"
+  respond (badRequest "invalid path")
+
+-- | Refuse a request body over its cap.
+overLimit :: Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+overLimit req respond = do
+  logWarn req "OVERLIMIT"
+  respond (responseLBS HTTP.status413 textHeaders "request body too large")
+
+-- | Refuse a body whose declared @Content-Length@ is over the cap before
+-- reading any of it, or run the action.
+refuseDeclaredOver :: Int -> Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived -> IO ResponseReceived
+refuseDeclaredOver limit req respond action = case requestBodyLength req of
+  KnownLength len
+    | len > fromIntegral limit -> overLimit req respond
+  _ -> action
+
+-- | Refuse a request naming no staged upload of the file: one never
+-- begun, already completed, or removed by @reclaim-nars@.
+unknownUpload :: Request -> (Response -> IO ResponseReceived) -> Text -> Text -> IO ResponseReceived
+unknownUpload req respond fileName rawId = do
+  logWarn req "NOUPLOAD"
+  respond (responseLBS HTTP.status404 textHeaders (textBody ("no upload " <> rawId <> " of " <> narPath fileName)))
+
+-- | Refuse a well-formed request that disagrees with the upload as
+-- stored, with 409: the client can resolve it (send the missing part,
+-- declare what it sent) and try again.
+refuseConflict :: Request -> (Response -> IO ResponseReceived) -> Text -> IO ResponseReceived
+refuseConflict req respond msg = do
+  logWarn req ("CONFLICT: " <> T.unpack msg)
+  respond (responseLBS HTTP.status409 textHeaders (textBody msg))
+
+-- | A value shown as text.
+showText :: (Show a) => a -> Text
+showText = T.pack . show
 
 -- | A text response body.
 textBody :: Text -> BL.ByteString

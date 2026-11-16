@@ -1,5 +1,6 @@
 -- | The @reclaim-nars@ subcommand: list, and with @--delete@ remove,
--- the NARs in a store directory that no narinfo references.
+-- the NARs in a store directory that no narinfo references, and the
+-- multipart uploads begun there and abandoned.
 --
 -- A host tool run against the store directory rather than a route,
 -- since nothing over HTTP should be able to delete.  The decision is
@@ -11,8 +12,28 @@ import Control.Exception (IOException, displayException, try)
 import Control.Monad (when)
 import Data.Foldable (for_, traverse_)
 import Data.Time.Clock (NominalDiffTime)
-import NovaCache.Reclaim (ReclaimBlocked (..), ReclaimPlan (..), Unresolved (..), defaultMinimumAge, planReclaim, scanStore)
-import NovaCache.Store (FileStore, NarFile (..), NarRemoveResult (..), fileStoreAt, removeNar)
+import NovaCache.Reclaim
+  ( ReclaimBlocked (..),
+    ReclaimPlan (..),
+    Unresolved (..),
+    UploadPlan (..),
+    UploadScan (..),
+    defaultMinimumAge,
+    planReclaim,
+    scanStore,
+    scanUploads,
+    selectAbandoned,
+  )
+import NovaCache.Store
+  ( FileStore,
+    NarFile (..),
+    NarRemoveResult (..),
+    StagedUpload (..),
+    UploadRemoveResult (..),
+    fileStoreAt,
+    removeNar,
+    removeUpload,
+  )
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
 import System.IO.Error (ioeGetErrorString)
@@ -82,6 +103,7 @@ parseOptions storeRoot =
 
 -- | Run the subcommand.  Exits nonzero when the arguments are wrong,
 -- the store cannot be listed, the run is blocked, or a deletion fails.
+-- A blocked run lists and deletes nothing, abandoned uploads included.
 reclaimMain :: FilePath -> [String] -> IO ()
 reclaimMain storeRoot args = case parseOptions storeRoot args of
   Left err -> do
@@ -96,56 +118,62 @@ reclaimMain storeRoot args = case parseOptions storeRoot args of
         store = fileStoreAt root
     putStrLn ("store root: " ++ root)
     putStrLn ("minimum age: " ++ counted (wholeHours (optMinimumAge opts)) "hour")
-    scanned <- try (scanStore store)
+    scanned <- try ((,) <$> scanStore store <*> scanUploads store)
     case scanned of
       Left err ->
         fatal ("cannot scan the store: " ++ displayException (err :: IOException))
-      Right scan -> case planReclaim (optMinimumAge opts) scan of
+      Right (scan, uploadScan) -> case planReclaim (optMinimumAge opts) scan of
         Left blocked -> refuse blocked
-        Right plan -> case optMode opts of
-          ListOnly -> listPlan plan
-          Delete -> deletePlan store plan
+        Right plan -> do
+          let uploads = selectAbandoned (optMinimumAge opts) (uploadScanTime uploadScan) (uploadScanUploads uploadScan)
+          case optMode opts of
+            ListOnly -> listPlan plan uploads
+            Delete -> deletePlan store plan uploads
 
 -- | List what a deleting run would remove.
-listPlan :: ReclaimPlan -> IO ()
-listPlan plan = do
+listPlan :: ReclaimPlan -> UploadPlan -> IO ()
+listPlan plan uploads = do
   traverse_ (putStrLn . ("unreferenced: " ++) . describe) (rpEligible plan)
+  traverse_ (putStrLn . ("abandoned: " ++) . describeUpload) (upEligible uploads)
   putStrLn
     ( "eligible: "
-        ++ counted (length (rpEligible plan)) "NAR"
-        ++ ", "
-        ++ counted (sum (map nfSize (rpEligible plan))) "byte"
+        ++ totals (rpEligible plan) (upEligible uploads)
         ++ " (pass "
         ++ deleteFlag
         ++ " to remove)"
     )
-  reportTooYoung plan
+  reportTooYoung plan uploads
 
--- | Remove every eligible NAR, reporting each, and exit nonzero if any
--- removal failed.
-deletePlan :: FileStore -> ReclaimPlan -> IO ()
-deletePlan store plan = do
-  outcomes <- traverse removeOne (rpEligible plan)
-  let removed = [nar | (nar, NarRemoved) <- outcomes]
-      failures = length outcomes - length removed
-  putStrLn
-    ( "reclaimed: "
-        ++ counted (length removed) "NAR"
-        ++ ", "
-        ++ counted (sum (map nfSize removed)) "byte"
-    )
-  reportTooYoung plan
-  when (failures > 0) $
-    fatal ("failed to delete " ++ counted failures "NAR")
+-- | Remove every eligible NAR and upload, reporting each, and exit
+-- nonzero if any removal failed.
+deletePlan :: FileStore -> ReclaimPlan -> UploadPlan -> IO ()
+deletePlan store plan uploads = do
+  narOutcomes <- traverse removeOne (rpEligible plan)
+  uploadOutcomes <- traverse removeOneUpload (upEligible uploads)
+  let removed = [nar | (nar, NarRemoved) <- narOutcomes]
+      removedUploads = [upload | (upload, UploadRemoved) <- uploadOutcomes]
+      narFailures = length narOutcomes - length removed
+      uploadFailures = length uploadOutcomes - length removedUploads
+  putStrLn ("reclaimed: " ++ totals removed removedUploads)
+  reportTooYoung plan uploads
+  when (narFailures + uploadFailures > 0) $
+    fatal ("failed to delete " ++ counted narFailures "NAR" ++ " and " ++ counted uploadFailures "upload")
   where
     removeOne nar = do
       outcome <- removeNar store (nfName nar)
       case outcome of
         NarRemoved -> putStrLn ("deleted: " ++ describe nar)
-        NarRemoveFailed err -> failed nar (ioeGetErrorString err)
-        NarRemoveBadPath -> failed nar "not a NAR filename"
+        NarRemoveFailed err -> failed (nfPath nar) (ioeGetErrorString err)
+        NarRemoveBadPath -> failed (nfPath nar) "not a NAR filename"
       pure (nar, outcome)
-    failed nar reason = hPutStrLn stderr ("FAILED: " ++ nfPath nar ++ ": " ++ reason)
+    removeOneUpload upload = do
+      outcome <- removeUpload store (suFileName upload) (suUploadId upload)
+      case outcome of
+        UploadRemoved -> putStrLn ("deleted: " ++ describeUpload upload)
+        UploadRemoveFailed err -> failed (suPath upload) (ioeGetErrorString err)
+        UploadRemoveBadPath -> failed (suPath upload) "not an upload of a NAR filename"
+      pure (upload, outcome)
+    failed path reason = hPutStrLn stderr ("FAILED: " ++ path ++ ": " ++ reason)
 
 -- | Report what blocks the run and exit nonzero.
 refuse :: ReclaimBlocked -> IO ()
@@ -164,12 +192,31 @@ refuse NoNarInfos =
         ++ "  Restore the narinfos, or remove the NARs by hand if none is referenced."
     )
 
-reportTooYoung :: ReclaimPlan -> IO ()
-reportTooYoung plan =
-  putStrLn ("kept, younger than the minimum age: " ++ counted (length (rpTooYoung plan)) "NAR")
+reportTooYoung :: ReclaimPlan -> UploadPlan -> IO ()
+reportTooYoung plan uploads =
+  putStrLn
+    ( "kept, younger than the minimum age: "
+        ++ counted (length (rpTooYoung plan)) "NAR"
+        ++ ", "
+        ++ counted (length (upTooYoung uploads)) "upload"
+    )
+
+-- | How many NARs and uploads, and how many bytes each hold.
+totals :: [NarFile] -> [StagedUpload] -> String
+totals nars uploads =
+  counted (length nars) "NAR"
+    ++ ", "
+    ++ counted (sum (map nfSize nars)) "byte"
+    ++ "; "
+    ++ counted (length uploads) "abandoned upload"
+    ++ ", "
+    ++ counted (sum (map suSize uploads)) "byte"
 
 describe :: NarFile -> String
 describe nar = nfPath nar ++ " (" ++ counted (nfSize nar) "byte" ++ ")"
+
+describeUpload :: StagedUpload -> String
+describeUpload upload = suPath upload ++ " (" ++ counted (suSize upload) "byte" ++ ")"
 
 fatal :: String -> IO ()
 fatal msg = do
