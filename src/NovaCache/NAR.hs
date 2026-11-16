@@ -32,6 +32,8 @@ module NovaCache.NAR
     serialiseFromPathOpts,
     withNarSource,
     withNarSourceOpts,
+    NarWalkError (..),
+    WalkAccess (..),
     SerialiseOptions (..),
     defaultSerialiseOptions,
     ExecBitResolver,
@@ -42,7 +44,7 @@ module NovaCache.NAR
   )
 where
 
-import Control.Exception (bracketOnError, finally)
+import Control.Exception (Exception (displayException), IOException, bracketOnError, catch, finally, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as B
@@ -80,6 +82,7 @@ import System.Directory.OsPath
     listDirectory,
     pathIsSymbolicLink,
   )
+import System.IO.Error (annotateIOError)
 import qualified System.Info
 import System.OsPath (OsPath, decodeFS, encodeFS, (</>))
 import qualified System.OsPath as OP
@@ -254,6 +257,74 @@ narHash :: NarEntry -> Hash.NixHash
 narHash = Hash.hashBytes . serialise
 
 -- ---------------------------------------------------------------------------
+-- Walk failures
+-- ---------------------------------------------------------------------------
+
+-- | A filesystem access the walk makes on an entry.
+data WalkAccess
+  = -- | Reading the entry's own status, without following a symlink
+    -- (@lstat@ on POSIX), to tell a symlink from anything else.
+    WalkStatus
+  | -- | Reading a symlink's target (@readlink@ on POSIX).
+    WalkReadLink
+  | -- | Listing a directory's entries.
+    WalkListDirectory
+  | -- | Opening a regular file and reading its size and contents.
+    WalkReadFile
+  deriving (Eq, Show)
+
+-- | A filesystem access that failed while a tree was walked for
+-- serialisation: which access, on which entry, and the 'IOException'
+-- it raised, so a caller can tell an unreadable file from an
+-- unlistable directory without parsing GHC's text.
+--
+-- Refusals the walk raises itself rather than an access raising them
+-- (a case-hack name collision, a file that shrinks while it streams)
+-- stay 'IOException's.  The 'ExecBitResolver' runs outside these
+-- accesses, since a caller's resolver may throw anything, so what a
+-- resolver throws arrives as thrown; that includes the status read
+-- 'defaultExecBitResolver' makes.
+data NarWalkError = NarWalkError
+  { -- | The access that failed.
+    nweAccess :: !WalkAccess,
+    -- | The entry it failed on: the root as given, extended by the
+    -- on-disk name of each entry below it (under 'CaseHackEnabled',
+    -- the suffixed spelling the walk was reading).  The same
+    -- 'decodeFS' rendering an 'ExecBitResolver' receives, so
+    -- 'encodeFS' recovers its exact bytes.
+    nwePath :: !FilePath,
+    -- | What the access raised.
+    nweCause :: !IOException
+  }
+  deriving (Eq, Show)
+
+-- | Rendered as GHC renders an 'IOException', with the walk's access
+-- standing in for the location: @\/d\/tree\/sub: listing directory:
+-- permission denied (Permission denied)@.
+instance Exception NarWalkError where
+  displayException (NarWalkError access path cause) =
+    displayException (annotateIOError cause (accessLabel access) Nothing (Just path))
+
+-- | The location each access takes in the rendering of a t'NarWalkError'.
+accessLabel :: WalkAccess -> String
+accessLabel access = case access of
+  WalkStatus -> "reading status"
+  WalkReadLink -> "reading symlink target"
+  WalkListDirectory -> "listing directory"
+  WalkReadFile -> "reading file"
+
+-- | Run one access of the walk on an entry, raising the 'IOException'
+-- it throws as a t'NarWalkError'.  Nothing else is caught, so an
+-- asynchronous exception passes through as itself.
+accessing :: WalkAccess -> OsPath -> IO a -> IO a
+accessing access path action = action `catch` failed
+  where
+    failed :: IOException -> IO b
+    failed cause = do
+      shownPath <- decodeFS path
+      throwIO (NarWalkError access shownPath cause)
+
+-- ---------------------------------------------------------------------------
 -- Filesystem to NarEntry (IO boundary)
 -- ---------------------------------------------------------------------------
 
@@ -343,7 +414,8 @@ defaultSerialiseOptions =
 --
 -- This is the module's IO boundary: the platform-native walk
 -- classifies each path as symlink, directory, or regular file and
--- delegates to pure constructors.
+-- delegates to pure constructors.  A failure of an access
+-- 'WalkAccess' names throws t'NarWalkError'.
 serialiseFromPath :: FilePath -> IO NarEntry
 serialiseFromPath = serialiseFromPathOpts defaultSerialiseOptions
 
@@ -362,9 +434,9 @@ serialiseFromPathOpts opts path = walkPath opts =<< encodeFS path
 -- NAR.
 walkPath :: SerialiseOptions -> OsPath -> IO NarEntry
 walkPath opts path = do
-  isSym <- pathIsSymbolicLink path
+  isSym <- accessing WalkStatus path (pathIsSymbolicLink path)
   if isSym
-    then NarSymlink <$> (symlinkTargetBytes =<< getSymbolicLinkTarget path)
+    then NarSymlink <$> (symlinkTargetBytes =<< accessing WalkReadLink path (getSymbolicLinkTarget path))
     else do
       isDir <- doesDirectoryExist path
       if isDir
@@ -390,7 +462,7 @@ buildDirectory opts path = do
 -- accepts.
 resolvedDirEntries :: CaseHack -> OsPath -> IO [(ByteString, OsPath)]
 resolvedDirEntries mode path = do
-  names <- sort <$> listDirectory path
+  names <- sort <$> accessing WalkListDirectory path (listDirectory path)
   named <- traverse withNameBytes names
   case unhackedDirNames mode named of
     Left (collidedA, collidedB) -> do
@@ -467,7 +539,9 @@ resolveExecBit resolver path = resolver =<< decodeFS path
 -- reopened path names the same file even when the name has no text
 -- decoding.
 readFileBytes :: OsPath -> IO ByteString
-readFileBytes path = BS.readFile =<< decodeFS path
+readFileBytes path = do
+  shownPath <- decodeFS path
+  accessing WalkReadFile path (BS.readFile shownPath)
 
 -- | The NAR name for one platform-native path component: on POSIX the
 -- raw bytes the filesystem reports, on Windows the UTF-8 encoding of
@@ -536,10 +610,9 @@ data NarSegment
 -- documented boundary as the streaming write in "NovaCache.Store".
 data SourceState
   = SourceSegments ![NarSegment]
-  | -- | Mid-file: the open handle, its decoded path for error text,
-    -- the bytes still owed, the padding after them, and the remaining
-    -- segments.
-    SourceFile !Handle !FilePath !Word64 !Int ![NarSegment]
+  | -- | Mid-file: the open handle, its path for error text, the bytes
+    -- still owed, the padding after them, and the remaining segments.
+    SourceFile !Handle !OsPath !Word64 !Int ![NarSegment]
   | SourceDrained
 
 -- | Serialise a filesystem tree as a pull source of NAR chunks,
@@ -558,8 +631,11 @@ data SourceState
 -- order, so the pulled bytes equal @'serialise' \<tree\>@ exactly.  A
 -- file's size is read when its streaming starts and exactly that many
 -- bytes are emitted, as upstream's dump does; a file that shrinks
--- mid-stream fails loudly rather than emitting a torn archive.  Any
--- file handle still open when the continuation exits is closed.
+-- mid-stream fails loudly rather than emitting a torn archive.  A
+-- failure of an access 'WalkAccess' names throws t'NarWalkError':
+-- before the continuation runs for the structure, from the pull for a
+-- file's contents.  Any file handle still open when the continuation
+-- exits is closed.
 withNarSource :: CaseHack -> FilePath -> (IO ByteString -> IO a) -> IO a
 withNarSource mode = withNarSourceOpts defaultSerialiseOptions {soCaseHack = mode}
 
@@ -594,28 +670,30 @@ pullChunk stateRef = advance =<< readIORef stateRef
       -- the handle, closeCurrent cannot see it, so ownership transfers
       -- under bracketOnError - the same discipline as the shrink path
       -- below.
-      bracketOnError (openBinaryFile shownPath ReadMode) hClose $ \handle -> do
-        size <- hFileSize handle
-        let owed = fromIntegral size :: Word64
-        writeIORef stateRef (SourceFile handle shownPath owed (narPadOf owed) rest)
-        pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
+      accessing WalkReadFile path $
+        bracketOnError (openBinaryFile shownPath ReadMode) hClose $ \handle -> do
+          size <- hFileSize handle
+          let owed = fromIntegral size :: Word64
+          writeIORef stateRef (SourceFile handle path owed (narPadOf owed) rest)
+          pure (BL.toStrict (B.toLazyByteString (B.word64LE owed)))
     advance (SourceFile handle _ 0 padLen rest) = do
       hClose handle
       writeIORef stateRef (SourceSegments rest)
       if padLen == 0
         then pullChunk stateRef
         else pure (BS.replicate padLen 0)
-    advance (SourceFile handle shownPath owed padLen rest) = do
-      chunk <- BS.hGet handle (fromIntegral (min owed (fromIntegral narSourceChunkBytes)))
+    advance (SourceFile handle path owed padLen rest) = do
+      chunk <- accessing WalkReadFile path (BS.hGet handle (fromIntegral (min owed (fromIntegral narSourceChunkBytes))))
       if BS.null chunk
         then do
           hClose handle
           writeIORef stateRef SourceDrained
+          shownPath <- decodeFS path
           ioError (userError ("withNarSource: " ++ shownPath ++ " shrank while streaming"))
         else do
           writeIORef
             stateRef
-            (SourceFile handle shownPath (owed - fromIntegral (BS.length chunk)) padLen rest)
+            (SourceFile handle path (owed - fromIntegral (BS.length chunk)) padLen rest)
           pure chunk
     advance SourceDrained = pure BS.empty
 
@@ -650,10 +728,10 @@ coalesce = go mempty
 -- | Plan one node, mirroring 'walkPath'.
 planNode :: SerialiseOptions -> OsPath -> IO [PlanPiece]
 planNode opts path = do
-  isSym <- pathIsSymbolicLink path
+  isSym <- accessing WalkStatus path (pathIsSymbolicLink path)
   if isSym
     then do
-      target <- symlinkTargetBytes =<< getSymbolicLinkTarget path
+      target <- symlinkTargetBytes =<< accessing WalkReadLink path (getSymbolicLinkTarget path)
       pure [PieceBytes (buildNode (NarSymlink target))]
     else do
       isDir <- doesDirectoryExist path
