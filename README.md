@@ -21,13 +21,13 @@ in `IO`. nova-cache is the protocol layer under
 ## Installation
 
 ```cabal
-build-depends: nova-cache >= 0.12 && < 0.13
+build-depends: nova-cache >= 0.13 && < 0.14
 ```
 
 The codecs are separate sublibraries, named alongside the main library:
 
 ```cabal
-build-depends: nova-cache:{nova-cache, xz, zstandard} >= 0.12 && < 0.13
+build-depends: nova-cache:{nova-cache, xz, zstandard} >= 0.13 && < 0.14
 ```
 
 libbz2 and libzstd are bundled. liblzma comes from the `xz` package, which
