@@ -90,7 +90,7 @@ CACHE_API_KEY=change-me cabal run --flag server nova-cache-server -- --port 5000
 ```
 
 Without `CACHE_API_KEY` the server refuses to start. `--allow-open-writes` runs
-it with unauthenticated writes, for local testing only.
+it with unauthenticated writes and removals, for local testing only.
 
 `GET /` answers a line of plain text. `--root-page FILE` serves `FILE` there
 as HTML instead, such as a page about the cache; the server reads it once at
@@ -98,7 +98,8 @@ startup and refuses to start if it cannot.
 
 The protocol lives in the `NovaCache.Server` library module as a WAI
 `Application`, so the cache can be embedded in another server with its own
-root page. The bundled executable is one such embedding.
+root page. The bundled executable is one such embedding. One server serves a
+store directory: it orders its own removals against its own uploads.
 
 ### Configuration
 
@@ -107,7 +108,7 @@ root page. The bundled executable is one such embedding.
 | `PORT` | Listen port (default: 5000; also `--port`) |
 | `HOST` | Bind host (default: all interfaces; also `--host`) |
 | `NIX_CACHE_DIR` | Store directory (default: `./nix-cache`; also `--store`) |
-| `CACHE_API_KEY` | Bearer token required for `PUT`. The server refuses to start without it unless `--allow-open-writes` is passed. |
+| `CACHE_API_KEY` | Bearer token for the requests marked authenticated below. The server refuses to start without it unless `--allow-open-writes` is passed. |
 | `SIGNING_KEY_FILE` | Ed25519 secret key file for server-side narinfo signing |
 | `LOG_REQUESTS` | Set to `0` to disable request logging |
 
@@ -122,6 +123,9 @@ root page. The bundled executable is one such embedding.
 | `GET` | `/nar/<file>` | Fetch a NAR (streamed from disk) |
 | `PUT` | `/<hash>.narinfo` | Upload a narinfo (authenticated, validated; refused unless the NAR its `URL` names is stored with its `FileSize` and `FileHash`) |
 | `PUT` | `/nar/<file>` | Upload a NAR (authenticated, streamed to disk) |
+| `DELETE` | `/<hash>.narinfo` | Remove a narinfo; its NAR stays until a reclaim (authenticated) |
+| `GET` | `/reclaim` | List what `POST /reclaim` would remove (authenticated) |
+| `POST` | `/reclaim` | Remove the NARs no narinfo names and abandoned uploads (authenticated) |
 | `POST` | `/nar/<file>/uploads` | Begin a multipart upload of a NAR (authenticated) |
 | `PUT` | `/nar/<file>/uploads/<id>/<n>` | Upload part `n` of it (authenticated, streamed to disk) |
 | `POST` | `/nar/<file>/uploads/<id>` | Complete it: join the parts into `nar/<file>` (authenticated) |
@@ -166,48 +170,56 @@ parts.
 
 A part whose response is lost can be sent again. To a client that sends its
 parts in order, a `404` or `409` for a part means the server no longer holds
-the parts sent before it, such as an upload `reclaim-nars` removed, so it
-begins a new upload. Completion joins the whole NAR before it answers, so its
+the parts sent before it, such as an upload a reclaim removed, so it begins a new
+upload. Completion joins the whole NAR before it answers, so its
 response can be lost, or a retry can meet the first attempt still joining:
 whenever the completion is answered with anything but `200`, or not at all, the
 client uploads the narinfo, whose check of the NAR's `FileSize` and `FileHash`
 decides whether it is stored, and begins a new upload if the narinfo is refused
 for want of its NAR.
 
-### Reclaiming unreferenced NARs
+### Removing entries and reclaiming NARs
 
-A client uploads each NAR before its narinfo, so a NAR whose narinfo was
-refused, or never sent because the push died, stays under `nar/` with nothing
-referencing it. No endpoint deletes a NAR or a narinfo. The `reclaim-nars`
-subcommand does, run on the host against the store directory:
+`DELETE /<hash>.narinfo` removes an entry. Its NAR stays under `nar/`, still
+served, until a reclaim removes it. A narinfo uploaded for a path the cache
+holds replaces the entry, as for a smaller encoding of the same NAR, and the
+NAR the old narinfo named likewise stays until a reclaim.
+
+A reclaim removes the NARs no narinfo names, and the multipart uploads nothing
+has been written to, once each is old enough. `GET /reclaim` lists what
+`POST /reclaim` removes. Both answer with a report in plain text.
 
 ```bash
-nova-cache-server reclaim-nars --store /var/lib/nix-cache           # list
-nova-cache-server reclaim-nars --store /var/lib/nix-cache --delete  # remove
+auth="Authorization: Bearer $CACHE_API_KEY"
+curl -fsS -X DELETE -H "$auth" https://cache.example/<hash>.narinfo  # remove an entry
+curl -fsS -H "$auth" https://cache.example/reclaim                   # list
+curl -fsS -X POST -H "$auth" https://cache.example/reclaim           # remove
 ```
 
-- A NAR is eligible only once it is at least `--min-age-hours` old (default
-  336, two weeks), measured from its modification time. A NAR is unreferenced
-  until its push sends the narinfo, and a push can run for hours.
+- A NAR or an upload is eligible once it is at least `min-age-hours` old
+  (default 336, two weeks), measured from its modification time, as in
+  `POST /reclaim?min-age-hours=24`. A NAR is unreferenced until its push sends
+  the narinfo, and a push can run for hours. Any other query is refused with
+  `400`.
 - If any narinfo cannot be read or parsed, or its `URL` is not `nar/<file>`,
-  the run prints those narinfos, lists and deletes nothing, and exits nonzero:
-  the NAR such a narinfo names is unknown, so no NAR can be called unreferenced.
-- If the store holds NARs and no narinfo at all, the run lists and deletes
-  nothing and exits nonzero: a store that lost its narinfos looks the same as
-  one whose every NAR is unreferenced.
-- A run is not atomic with the server, so run it with no push in progress. A
-  narinfo that arrives during a run for a NAR past the minimum age loses that
-  NAR, which leaves a signed narinfo with nothing behind it.
-- A deletion that fails is reported for that file, and the exit status is
-  nonzero.
-- The run also removes multipart uploads begun and never completed, whose
-  parts are under `uploads/`, once nothing has been written to one for
-  `--min-age-hours`. No narinfo can name an upload's parts, so removing them
-  never leaves a narinfo without its NAR: a push that resumes the upload is
-  refused and begins a new one. A blocked run removes no upload either.
-- The store root comes from `--store`, then `NIX_CACHE_DIR`, then
-  `./nix-cache`, as for the server. A missing `narinfo/` or `nar/` directory is
-  an error, never an empty store.
+  the reclaim answers `409` naming those narinfos and removes nothing: the NAR
+  such a narinfo names is unknown, so no NAR can be called unreferenced.
+- If the store holds NARs and no narinfo at all, the reclaim answers `409` and
+  removes nothing: a store that lost its narinfos looks the same as one whose
+  every NAR is unreferenced. Removing every entry leaves a store like that;
+  stop the server to remove its NARs.
+- A reclaim can run while pushes are in progress. A narinfo is never stored
+  naming a NAR the reclaim removes, and a NAR uploaded during a reclaim is
+  kept. A narinfo that arrives for a NAR the reclaim removed is refused, as
+  when a client skipped uploading a NAR the cache held, which upstream's
+  `nix copy` does; the client's next attempt uploads the NAR.
+- Uploads wait while a reclaim or a `DELETE` runs, and a reclaim reads every
+  narinfo, so on a store with many entries a reclaim holds pushes up for as
+  long as that read takes.
+- A Nix client holding a narinfo that names a removed NAR treats it as a
+  missing substitute and tries its next substituter.
+- A removal that fails is reported for that file, and the reclaim answers
+  `500`.
 
 ### Public cache
 

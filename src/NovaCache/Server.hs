@@ -10,12 +10,15 @@
 -- Protocol surface:
 --
 -- @
--- GET  \/nix-cache-info      cache metadata
--- GET  \/\<hash\>.narinfo      narinfo by store-path hash
--- GET  \/nar\/\<file\>          NAR payload (streamed from disk)
--- GET  \/narinfo-hashes      stored-hash listing (authenticated; push-tool plumbing)
--- PUT  \/\<hash\>.narinfo      validated, checked against its stored NAR, signed, stored (authenticated)
--- PUT  \/nar\/\<file\>          streamed to disk under a size cap (authenticated)
+-- GET    \/nix-cache-info      cache metadata
+-- GET    \/\<hash\>.narinfo      narinfo by store-path hash
+-- GET    \/nar\/\<file\>          NAR payload (streamed from disk)
+-- GET    \/narinfo-hashes      stored-hash listing (authenticated; push-tool plumbing)
+-- PUT    \/\<hash\>.narinfo      validated, checked against its stored NAR, signed, stored (authenticated)
+-- PUT    \/nar\/\<file\>          streamed to disk under a size cap (authenticated)
+-- DELETE \/\<hash\>.narinfo      narinfo removed, its NAR left for a reclaim (authenticated)
+-- GET    \/reclaim             what POST \/reclaim would remove (authenticated)
+-- POST   \/reclaim             NARs no narinfo names, and abandoned uploads, removed (authenticated)
 --
 -- POST \/nar\/\<file\>\/uploads              begin a multipart upload (authenticated)
 -- PUT  \/nar\/\<file\>\/uploads\/\<id\>\/\<n\>     part n, streamed to disk under the same cap (authenticated)
@@ -29,6 +32,12 @@
 -- request bodies.  Its parts are staged outside @nar\/@ (see
 -- "NovaCache.Store"), and the NAR appears there only when the request
 -- that completes the upload joins them.
+--
+-- Removal runs in the server, ordered by the store's gate
+-- ("NovaCache.Store"): a narinfo upload holds it from the check of its
+-- NAR through its write, and a reclaim ("NovaCache.Reclaim") or a
+-- narinfo removal holds it alone, so a narinfo is never stored naming a
+-- NAR a reclaim removes.  One server serves a store directory.
 module NovaCache.Server
   ( -- * Configuration
     ServerConfig (..),
@@ -49,6 +58,9 @@ module NovaCache.Server
     parseUploadTotals,
     renderUploadTotals,
 
+    -- * Reclaim
+    parseMinimumAge,
+
     -- * Handler pieces (exported for tests)
     requireAuth,
     readBodyLimited,
@@ -59,6 +71,8 @@ module NovaCache.Server
     renderCacheInfo,
 
     -- * Stored NAR check
+    NarInfoWrite (..),
+    storeNarInfo,
     NarClaim (..),
     StoredNar (..),
     NarRefusal (..),
@@ -76,11 +90,14 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import Data.Either (lefts)
+import Data.Foldable (toList)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Read as TR
+import Data.Time.Clock (NominalDiffTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
 import qualified Network.HTTP.Types as HTTP
 import Network.Wai
@@ -91,6 +108,7 @@ import Network.Wai
     ResponseReceived,
     getRequestBodyChunk,
     pathInfo,
+    queryString,
     requestBodyLength,
     requestHeaders,
     requestMethod,
@@ -99,14 +117,30 @@ import Network.Wai
   )
 import NovaCache.Hash (NixHash, formatNixHash, hashFinalize, hashInit, hashUpdate, parseNixHash)
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
+import NovaCache.Reclaim
+  ( ReclaimBlocked (..),
+    ReclaimPlan (..),
+    Reclaimed (..),
+    StorePlan (..),
+    Unresolved (..),
+    UploadPlan (..),
+    defaultMinimumAge,
+    listReclaimable,
+    reclaim,
+  )
 import NovaCache.Signing (SecretKey, sign)
 import NovaCache.Store
   ( CacheInfo (..),
     CompletionResult (..),
     FileStore,
+    NarFile (..),
+    NarInfoRemoveResult (..),
+    NarRemoveResult (..),
     NarWriteResult (..),
     PartWriteResult (..),
+    StagedUpload (..),
     UploadId,
+    UploadRemoveResult (..),
     UploadTotals (..),
     beginUpload,
     completeUpload,
@@ -117,16 +151,21 @@ import NovaCache.Store
     parsePartNumber,
     parseUploadId,
     readNarInfo,
+    removeNarInfo,
     renderPartNumber,
     renderUploadId,
     sanitizePath,
+    withRemoval,
+    withoutRemoval,
     writeNarInfo,
     writeNarStreaming,
     writeUploadPart,
   )
 import NovaCache.StorePath (defaultStoreDir, parseStorePath, storePathHashString)
 import NovaCache.Validate (validateNarInfo)
+import System.FilePath (takeFileName)
 import System.IO (IOMode (ReadMode), hPutStrLn, stderr, withBinaryFile)
+import System.IO.Error (ioeGetErrorString)
 
 -- ---------------------------------------------------------------------------
 -- Constants
@@ -159,6 +198,18 @@ narRouteSegment = "nar"
 -- uploads.
 uploadsRouteSegment :: Text
 uploadsRouteSegment = "uploads"
+
+-- | Path of the reclaim: @GET@ lists, @POST@ removes.
+reclaimRouteSegment :: Text
+reclaimRouteSegment = "reclaim"
+
+-- | The query parameter that sets a reclaim's minimum age, in whole
+-- hours.
+minAgeHoursParam :: Text
+minAgeHoursParam = "min-age-hours"
+
+secondsPerHour :: NominalDiffTime
+secondsPerHour = 3600
 
 -- | Bytes read per step while hashing a stored NAR.
 storedNarReadBytes :: Int
@@ -240,7 +291,15 @@ cacheApp cfg req respond = case (routeMethod, pathInfo req) of
     requireAuth cfg req respond $ do
       hashes <- listNarInfoHashes (scStore cfg)
       let body = TE.encodeUtf8 (T.unlines hashes)
-      respond (responseLBS HTTP.status200 hashListHeaders (BL.fromStrict body))
+      respond (responseLBS HTTP.status200 uncachedHeaders (BL.fromStrict body))
+  -- GET /reclaim, POST /reclaim - store maintenance, read across the
+  -- whole store, so authenticated like the hash listing
+  ("GET", [segment])
+    | segment == reclaimRouteSegment ->
+        requireAuth cfg req respond (reclaimRequest cfg req respond ListReclaimable)
+  ("POST", [segment])
+    | segment == reclaimRouteSegment ->
+        requireAuth cfg req respond (reclaimRequest cfg req respond RemoveReclaimable)
   -- GET /<hash>.narinfo
   ("GET", [hashNarinfo])
     | Just hashKey <- T.stripSuffix narInfoSuffix hashNarinfo -> do
@@ -269,6 +328,10 @@ cacheApp cfg req respond = case (routeMethod, pathInfo req) of
   ("PUT", segments)
     | Just fileName <- narRoute segments ->
         requireAuth cfg req respond (putNar cfg req respond fileName)
+  -- DELETE /<hash>.narinfo (auth required)
+  ("DELETE", [hashNarinfo])
+    | Just hashKey <- T.stripSuffix narInfoSuffix hashNarinfo ->
+        requireAuth cfg req respond (deleteNarInfo cfg req respond hashKey)
   -- /nar/<file>/uploads... - multipart upload (auth required)
   (method, segments)
     | Just route <- uploadRoute segments ->
@@ -291,7 +354,11 @@ narRoute [segment, fileName] | segment == narRouteSegment = Just fileName
 narRoute _ = Nothing
 
 -- | Validate a narinfo upload, check it against the NAR it names, then
--- sign and store it.
+-- sign and store it.  A narinfo for a path the cache holds replaces it,
+-- and the NAR the old one named stays until a reclaim finds nothing
+-- naming it.  A stored NAR that cannot be read is the server's own
+-- failure, a 500 like a signing failure, with the exception logged and
+-- kept out of the response.
 putNarInfo :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> ByteString -> IO ResponseReceived
 putNarInfo cfg req respond hashKey body = case decodeAndValidate body of
   Left err -> do
@@ -301,17 +368,38 @@ putNarInfo cfg req respond hashKey body = case decodeAndValidate body of
     | not (narInfoHashMatches hashKey ni) -> do
         logWarn req "HASHMISMATCH"
         respond (badRequest "narinfo StorePath hash does not match request")
-    | otherwise -> requireStoredNar (scStore cfg) req respond ni $ do
-        signedResult <- signNarInfo (scSigningKey cfg) ni
-        case signedResult of
-          Left err -> do
-            logWarn req ("SIGNFAIL: " <> err)
-            respond (responseLBS HTTP.status500 textHeaders "signing failed")
-          Right signed -> do
-            ok <- writeNarInfo (scStore cfg) hashKey signed
-            if ok
-              then respond okResponse
-              else badPath req respond
+    | otherwise -> case narClaim ni of
+        Left refusal -> refuseNar req respond refusal
+        Right claim -> do
+          written <- storeNarInfo (scStore cfg) (signNarInfo (scSigningKey cfg)) hashKey ni claim
+          case written of
+            NarInfoWritten -> respond okResponse
+            NarInfoRefused refusal -> refuseNar req respond refusal
+            NarInfoNarUnreadable err -> do
+              logWarn req ("NARREAD: " <> show err)
+              respond (responseLBS HTTP.status500 textHeaders (textBody ("NAR " <> narPath (ncFileName claim) <> " could not be read")))
+            NarInfoSignFailed err -> do
+              logWarn req ("SIGNFAIL: " <> err)
+              respond (responseLBS HTTP.status500 textHeaders "signing failed")
+            NarInfoBadKey -> badPath req respond
+
+-- | Remove a narinfo, holding the gate alone as every removal does.  A
+-- hash the store could not hold is refused before the gate, so it never
+-- holds up an upload.
+deleteNarInfo :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> Text -> IO ResponseReceived
+deleteNarInfo cfg req respond hashKey = case sanitizePath hashKey of
+  Nothing -> badPath req respond
+  Just _ -> do
+    result <- withRemoval (scStore cfg) (removeNarInfo (scStore cfg) hashKey)
+    removed result
+  where
+    removed result = case result of
+      NarInfoRemoved -> respond okResponse
+      NarInfoAbsent -> respond notFound
+      NarInfoRemoveBadPath -> badPath req respond
+      NarInfoRemoveFailed err -> do
+        logWarn req ("NARINFOREMOVE: " <> show err)
+        respond (responseLBS HTTP.status500 textHeaders "narinfo could not be removed")
 
 -- | Stream a NAR upload into the store.  A declared @Content-Length@ over
 -- the cap is refused before reading anything; chunked or lying transfers
@@ -411,7 +499,7 @@ putNarPart cfg req respond fileName rawPart uid = case parsePartNumber rawPart o
           ( "upload of "
               <> narPath fileName
               <> " holds "
-              <> countedParts held
+              <> counted held "part"
               <> ", so the next is part "
               <> showText (held + 1)
               <> ", not part "
@@ -435,7 +523,7 @@ completeNarUpload cfg req respond fileName uid =
           logWarn req ("STAGINGKEPT: " <> show err)
           respond okResponse
         CompletionPartsMismatch declared held ->
-          refuseConflict req respond ("upload of " <> narPath fileName <> " holds " <> countedParts held <> ", Parts is " <> showText declared)
+          refuseConflict req respond ("upload of " <> narPath fileName <> " holds " <> counted held "part" <> ", Parts is " <> showText declared)
         CompletionSizeMismatch declared joined ->
           refuseConflict req respond ("upload of " <> narPath fileName <> " joins to " <> showText joined <> " bytes, FileSize is " <> showText declared)
         CompletionTooLarge declared -> do
@@ -449,10 +537,10 @@ completeNarUpload cfg req respond fileName uid =
         CompletionUploadUnknown -> unknownUpload req respond fileName (renderUploadId uid)
         CompletionBadPath -> badPath req respond
 
--- | A count of parts with its noun.
-countedParts :: Int -> Text
-countedParts 1 = "1 part"
-countedParts n = showText n <> " parts"
+-- | A count with its noun: @1 part@, @2 parts@.
+counted :: (Show a, Eq a, Num a) => a -> Text -> Text
+counted 1 noun = "1 " <> noun
+counted n noun = showText n <> " " <> noun <> "s"
 
 -- | Keys of the body that completes an upload.
 partsKey, fileSizeKey :: Text
@@ -463,12 +551,13 @@ fileSizeKey = "FileSize"
 fieldSeparator :: Text
 fieldSeparator = ": "
 
--- | Digits in a declared size: at most a uint64's 20, as for a narinfo's
--- FileSize.  The length is bounded before the parse, so an overlong
--- number costs nothing to refuse; a size past 'maxNarBodySize' is
--- refused when the upload is completed.
-maxByteCountDigits :: Int
-maxByteCountDigits = 20
+-- | Digits in a whole number a request declares, a size or an age in
+-- hours: at most a uint64's 20, as for a narinfo's FileSize.  The length
+-- is bounded before the parse, so an overlong number costs nothing to
+-- refuse; a size past 'maxNarBodySize' is refused when the upload is
+-- completed.
+maxWholeNumberDigits :: Int
+maxWholeNumberDigits = 20
 
 -- | The body that completes an upload: how many parts it holds and how
 -- many bytes they join to, as @Parts@ and @FileSize@ lines in narinfo's
@@ -490,7 +579,7 @@ parseUploadTotals body = do
   text <- first (const "completion body is not valid UTF-8") (TE.decodeUtf8' body)
   fields <- traverse splitField (T.lines text)
   parts <- field partsKey fields >>= orRefuse ("Parts must be a whole number from 1 to " <> showText maxUploadParts) . parsePartNumber
-  size <- field fileSizeKey fields >>= orRefuse "FileSize must be a whole number of bytes" . parseByteCount
+  size <- field fileSizeKey fields >>= orRefuse "FileSize must be a whole number of bytes" . parseWholeNumber
   pure UploadTotals {utParts = parts, utFileSize = size}
   where
     splitField line = case T.stripPrefix fieldSeparator <$> T.breakOn fieldSeparator line of
@@ -504,14 +593,151 @@ parseUploadTotals body = do
       _ -> Left ("completion body has more than one " <> key <> " line")
     orRefuse msg = maybe (Left msg) Right
 
--- | A byte count in canonical decimal: digits only, with no sign and no
--- leading zero.
-parseByteCount :: Text -> Maybe Integer
-parseByteCount txt
-  | T.length txt > maxByteCountDigits = Nothing
+-- | A whole number in canonical decimal: digits only, with no sign and
+-- no leading zero.
+parseWholeNumber :: Text -> Maybe Integer
+parseWholeNumber txt
+  | T.length txt > maxWholeNumberDigits = Nothing
   | otherwise = case TR.decimal txt of
       Right (n, _) | showText n == txt -> Just n
       _ -> Nothing
+
+-- ---------------------------------------------------------------------------
+-- Reclaim
+-- ---------------------------------------------------------------------------
+
+-- | Whether a reclaim request lists or removes.
+data ReclaimMode = ListReclaimable | RemoveReclaimable
+
+-- | Answer @GET \/reclaim@, which lists what @POST \/reclaim@ would
+-- remove, or @POST \/reclaim@, which removes it, at the minimum age the
+-- query sets ('parseMinimumAge'), with a report in plain text.  A
+-- blocked run is a 409 naming what blocks it, and a removal that fails
+-- makes the report a 500.  A store that cannot be scanned is the
+-- server's own failure, logged and kept out of the response.
+reclaimRequest :: ServerConfig -> Request -> (Response -> IO ResponseReceived) -> ReclaimMode -> IO ResponseReceived
+reclaimRequest cfg req respond mode = case parseMinimumAge (queryString req) of
+  Left err -> do
+    logWarn req ("BADQUERY: " <> T.unpack err)
+    respond (badRequest err)
+  Right minimumAge -> do
+    result <- try (run minimumAge)
+    case result of
+      Left err -> do
+        logWarn req ("RECLAIMSCAN: " <> show (err :: IOException))
+        respond (responseLBS HTTP.status500 textHeaders "the store could not be scanned")
+      Right (Left blocked) -> do
+        logWarn req "RECLAIMBLOCKED"
+        respond (responseLBS HTTP.status409 uncachedHeaders (textLines (renderBlocked blocked)))
+      Right (Right (status, report)) ->
+        respond (responseLBS status uncachedHeaders (textLines (("minimum age: " <> counted (wholeHours minimumAge) "hour") : report)))
+  where
+    store = scStore cfg
+    run minimumAge = case mode of
+      ListReclaimable -> fmap renderPlan <$> listReclaimable store minimumAge getCurrentTime
+      RemoveReclaimable -> fmap renderReclaimed <$> reclaim store minimumAge getCurrentTime
+
+-- | A reclaim's minimum age from its request's query: 'defaultMinimumAge'
+-- with no query, or @min-age-hours@ given once, as a whole number of
+-- hours in canonical decimal.  Any other parameter is refused rather
+-- than ignored, so a misspelled one never runs a removal at an age the
+-- operator did not choose.
+parseMinimumAge :: HTTP.Query -> Either Text NominalDiffTime
+parseMinimumAge query = case query of
+  [] -> Right defaultMinimumAge
+  [(key, Just value)]
+    | key == TE.encodeUtf8 minAgeHoursParam,
+      Right digits <- TE.decodeUtf8' value,
+      Just hours <- parseWholeNumber digits ->
+        Right (fromInteger hours * secondsPerHour)
+  _ -> Left ("the query takes one parameter, " <> minAgeHoursParam <> ", a whole number of hours")
+
+-- | Whole hours in an age 'parseMinimumAge' read.
+wholeHours :: NominalDiffTime -> Integer
+wholeHours age = floor (age / secondsPerHour)
+
+-- | What a listing finds: each NAR and upload a removal would take, then
+-- the totals.
+renderPlan :: StorePlan -> (HTTP.Status, [Text])
+renderPlan plan =
+  ( HTTP.status200,
+    map (("unreferenced: " <>) . describeNar) nars
+      ++ map (("abandoned: " <>) . describeUpload) uploads
+      ++ ["eligible: " <> reclaimTotals nars uploads, keptLine plan]
+  )
+  where
+    nars = rpEligible (spNars plan)
+    uploads = upEligible (spUploads plan)
+
+-- | What a removal did, each NAR and upload in turn, then the totals:
+-- 500 when any removal failed.
+renderReclaimed :: Reclaimed -> (HTTP.Status, [Text])
+renderReclaimed done =
+  ( if null failures then HTTP.status200 else HTTP.status500,
+    map (either id id) outcomes
+      ++ ["reclaimed: " <> reclaimTotals removedNars removedUploads, keptLine (rdPlan done)]
+  )
+  where
+    outcomes = map narOutcome (rdNars done) ++ map uploadOutcome (rdUploads done)
+    failures = lefts outcomes
+    removedNars = [nar | (nar, NarRemoved) <- rdNars done]
+    removedUploads = [upload | (upload, UploadRemoved) <- rdUploads done]
+    narOutcome (nar, outcome) = case outcome of
+      NarRemoved -> Right ("removed: " <> describeNar nar)
+      NarRemoveFailed err -> Left (failed (narPath (nfName nar)) (T.pack (ioeGetErrorString err)))
+      NarRemoveBadPath -> Left (failed (narPath (nfName nar)) "not a name the store holds")
+    uploadOutcome (upload, outcome) = case outcome of
+      UploadRemoved -> Right ("removed: " <> describeUpload upload)
+      UploadRemoveFailed err -> Left (failed (uploadPath upload) (T.pack (ioeGetErrorString err)))
+      UploadRemoveBadPath -> Left (failed (uploadPath upload) "not a name the store holds")
+    failed path reason = "failed: " <> path <> ": " <> reason
+
+-- | What blocks a reclaim, in a 409's body.
+renderBlocked :: ReclaimBlocked -> [Text]
+renderBlocked (UnresolvedNarInfos unresolved) =
+  map unresolvedLine (toList unresolved)
+    ++ [ counted (length unresolved) "unresolved narinfo"
+           <> ": a reclaim removes nothing while one is unresolved, since the NAR it names"
+           <> " would look unreferenced.  Replace or delete each and try again."
+       ]
+  where
+    unresolvedLine u =
+      "unresolved: " <> T.pack (takeFileName (unresolvedPath u)) <> narInfoSuffix <> ": " <> T.pack (unresolvedReason u)
+renderBlocked NoNarInfos =
+  [ "the store holds NARs and no narinfo: a reclaim removes nothing, since a store that lost"
+      <> " its narinfos looks the same as one whose every NAR is unreferenced.  Restore the"
+      <> " narinfos; if none was referenced, stop the server and remove the NARs."
+  ]
+
+-- | How many NARs and abandoned uploads, and how many bytes each hold.
+reclaimTotals :: [NarFile] -> [StagedUpload] -> Text
+reclaimTotals nars uploads =
+  counted (length nars) "NAR"
+    <> ", "
+    <> counted (sum (map nfSize nars)) "byte"
+    <> "; "
+    <> counted (length uploads) "abandoned upload"
+    <> ", "
+    <> counted (sum (map suSize uploads)) "byte"
+
+-- | What a run keeps for its age.
+keptLine :: StorePlan -> Text
+keptLine plan =
+  "kept, younger than the minimum age: "
+    <> counted (length (rpTooYoung (spNars plan))) "NAR"
+    <> ", "
+    <> counted (length (upTooYoung (spUploads plan))) "upload"
+
+describeNar :: NarFile -> Text
+describeNar nar = narPath (nfName nar) <> " (" <> counted (nfSize nar) "byte" <> ")"
+
+describeUpload :: StagedUpload -> Text
+describeUpload upload = uploadPath upload <> " (" <> counted (suSize upload) "byte" <> ")"
+
+-- | The request path, relative to the cache root, that names an upload.
+uploadPath :: StagedUpload -> Text
+uploadPath upload =
+  narPath (suFileName upload) <> "/" <> uploadsRouteSegment <> "/" <> renderUploadId (suUploadId upload)
 
 -- ---------------------------------------------------------------------------
 -- Validation pipeline
@@ -636,26 +862,43 @@ renderNarRefusal refusal = case refusal of
 narPath :: Text -> Text
 narPath name = narRouteSegment <> "/" <> name
 
--- | Gate a narinfo write on the NAR it names (see 'narClaim' and
--- 'judgeStoredNar').  A refusal is a 400 naming the problem.  A stored
--- NAR that cannot be read is the server's own failure, a 500 like a
--- signing failure, with the exception logged and kept out of the
--- response.
-requireStoredNar :: FileStore -> Request -> (Response -> IO ResponseReceived) -> NarInfo -> IO ResponseReceived -> IO ResponseReceived
-requireStoredNar store req respond ni action = case narClaim ni of
-  Left refusal -> refuse refusal
-  Right claim -> do
-    stored <- readStoredNar store (ncFileName claim)
-    case stored of
-      Left err -> do
-        logWarn req ("NARREAD: " <> show err)
-        respond (responseLBS HTTP.status500 textHeaders (textBody ("NAR " <> narPath (ncFileName claim) <> " could not be read")))
-      Right found -> either refuse (const action) (judgeStoredNar claim found)
-  where
-    refuse refusal = do
-      let msg = renderNarRefusal refusal
-      logWarn req ("BADNAR: " <> T.unpack msg)
-      respond (badRequest msg)
+-- | What a narinfo upload came to once its NAR was checked.
+data NarInfoWrite
+  = NarInfoWritten
+  | NarInfoRefused !NarRefusal
+  | NarInfoNarUnreadable !IOException
+  | NarInfoSignFailed !String
+  | -- | The hash key failed 'sanitizePath'.
+    NarInfoBadKey
+  deriving (Eq, Show)
+
+-- | Store a narinfo over the NAR it claims: check the stored NAR against
+-- the claim ('judgeStoredNar'), sign the narinfo with @signer@ (as
+-- 'signNarInfo' does), and write it under the hash key, all within one
+-- hold of the store's gate ('withoutRemoval').  So no reclaim removes
+-- the NAR between the check and the write: one that starts in between
+-- waits for the write, and then finds the narinfo naming the NAR.
+storeNarInfo :: FileStore -> (NarInfo -> IO (Either String ByteString)) -> Text -> NarInfo -> NarClaim -> IO NarInfoWrite
+storeNarInfo store signer hashKey ni claim = withoutRemoval store $ do
+  stored <- readStoredNar store (ncFileName claim)
+  case judgeStoredNar claim <$> stored of
+    Left err -> pure (NarInfoNarUnreadable err)
+    Right (Left refusal) -> pure (NarInfoRefused refusal)
+    Right (Right ()) -> do
+      signedResult <- signer ni
+      case signedResult of
+        Left err -> pure (NarInfoSignFailed err)
+        Right signed -> do
+          ok <- writeNarInfo store hashKey signed
+          pure (if ok then NarInfoWritten else NarInfoBadKey)
+
+-- | Refuse a narinfo over the NAR it names (see 'narClaim' and
+-- 'judgeStoredNar'): a 400 naming the problem.
+refuseNar :: Request -> (Response -> IO ResponseReceived) -> NarRefusal -> IO ResponseReceived
+refuseNar req respond refusal = do
+  let msg = renderNarRefusal refusal
+  logWarn req ("BADNAR: " <> T.unpack msg)
+  respond (badRequest msg)
 
 -- | Read a stored NAR through once in constant memory, for its size and
 -- SHA-256; 'Nothing' when no file is stored under the name.  The name
@@ -818,7 +1061,7 @@ refuseDeclaredOver limit req respond action = case requestBodyLength req of
   _ -> action
 
 -- | Refuse a request naming no staged upload of the file: one never
--- begun, already completed, or removed by @reclaim-nars@.
+-- begun, already completed, or reclaimed.
 unknownUpload :: Request -> (Response -> IO ResponseReceived) -> Text -> Text -> IO ResponseReceived
 unknownUpload req respond fileName rawId = do
   logWarn req "NOUPLOAD"
@@ -840,6 +1083,10 @@ showText = T.pack . show
 textBody :: Text -> BL.ByteString
 textBody = BL.fromStrict . TE.encodeUtf8
 
+-- | A text response body of lines.
+textLines :: [Text] -> BL.ByteString
+textLines = textBody . T.unlines
+
 -- | Map any uncaught handler exception to a generic 500, so internal error
 -- detail (filesystem paths, exception text) is never leaked to clients.
 onExceptionResponse :: e -> Response
@@ -852,10 +1099,11 @@ textHeaders = [(HTTP.hContentType, "text/plain")]
 htmlHeaders :: HTTP.ResponseHeaders
 htmlHeaders = [(HTTP.hContentType, "text/html; charset=utf-8")]
 
--- | Headers for the authenticated hash listing: push-tool plumbing that
--- changes with every upload, so intermediaries must never cache it.
-hashListHeaders :: HTTP.ResponseHeaders
-hashListHeaders =
+-- | Headers for the authenticated answers that read across the store
+-- (the hash listing, a reclaim's report): they change with every upload,
+-- so intermediaries must never cache them.
+uncachedHeaders :: HTTP.ResponseHeaders
+uncachedHeaders =
   [ (HTTP.hContentType, "text/plain"),
     (HTTP.hCacheControl, "no-store")
   ]

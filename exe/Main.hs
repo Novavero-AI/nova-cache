@@ -15,7 +15,6 @@ import Network.Wai.Middleware.RequestLogger (logStdout)
 import NovaCache.Server (ServerConfig (..), cacheApp, defaultRootResponse, htmlRootResponse, onExceptionResponse)
 import NovaCache.Signing (SecretKey, normalizeKeyText, parseSecretKey, renderPublicKey, toPublicKey)
 import NovaCache.Store (newFileStore)
-import ReclaimNars (reclaimCommand, reclaimMain)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure)
 import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, stdout)
@@ -68,6 +67,14 @@ signingKeyEnvVar = "SIGNING_KEY_FILE"
 requestLogEnvVar :: String
 requestLogEnvVar = "LOG_REQUESTS"
 
+-- | A subcommand this executable does not have: the server reclaims
+-- NARs itself, through @GET \/reclaim@ and @POST \/reclaim@.  Named so
+-- that running it stops with a pointer to those requests rather than
+-- reaching 'serve', which ignores arguments it does not know and would
+-- start a second server over the store.
+reclaimNarsCommand :: String
+reclaimNarsCommand = "reclaim-nars"
+
 -- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
@@ -76,10 +83,15 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-    command : rest
-      | command == reclaimCommand -> do
-          storeEnv <- lookupEnv storeEnvVar
-          reclaimMain (fromMaybe defaultStoreRoot storeEnv) rest
+    command : _
+      | command == reclaimNarsCommand -> do
+          hPutStrLn stderr $
+            "FATAL: "
+              ++ reclaimNarsCommand
+              ++ " is not a subcommand: the server removes unreferenced NARs itself."
+              ++ " With the write key, GET /reclaim lists them and POST /reclaim removes them;"
+              ++ " see the README."
+          exitFailure
     _ -> serve args
 
 -- | Run the cache server.

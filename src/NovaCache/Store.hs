@@ -11,12 +11,34 @@
 -- A multipart upload is completed by a rename from its directory under
 -- @uploads\/@ into @nar\/@, so the two share a filesystem, as they do
 -- under one store root unless one of them is mounted apart.
+--
+-- One process serves a store directory, through one t'FileStore', whose
+-- gate orders what the store gains against what is removed from it.  A
+-- removal runs within 'withRemoval', alone: a narinfo's removal, and a
+-- reclaim from its scan through its last removal.  Whatever must not
+-- overlap a removal runs within 'withoutRemoval', alongside others: each
+-- rename into @nar\/@ ('writeNar', 'writeNarStreaming' and
+-- 'completeUpload' take the gate for the rename), and a narinfo upload
+-- from the check of its NAR through its write.  So a removal never takes a
+-- NAR between that check and that write, and never takes a NAR renamed
+-- into place after it listed the store.  Parts of an upload are staged
+-- outside the gate: no narinfo can name them.
 module NovaCache.Store
-  ( FileStore (..),
+  ( FileStore,
+    fsRoot,
+    fsStoreDir,
+    fsPriority,
     newFileStore,
-    fileStoreAt,
+
+    -- * Additions and removals
+    withoutRemoval,
+    withRemoval,
+
+    -- * Narinfos and NARs
     readNarInfo,
     writeNarInfo,
+    NarInfoRemoveResult (..),
+    removeNarInfo,
     readNar,
     writeNar,
     NarWriteResult (..),
@@ -55,7 +77,8 @@ module NovaCache.Store
   )
 where
 
-import Control.Exception (IOException, catch, onException, try, tryJust)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Control.Exception (IOException, bracket_, catch, onException, try, tryJust)
 import Control.Monad (foldM, guard, join)
 import Crypto.Random (getRandomBytes)
 import Data.ByteString (ByteString)
@@ -92,13 +115,18 @@ import System.IO.Error (isDoesNotExistError)
 -- Types
 -- ---------------------------------------------------------------------------
 
--- | Filesystem-backed cache store configuration.
+-- | A filesystem-backed cache store: its root directory, what
+-- @nix-cache-info@ reports, and the gate that orders its additions
+-- against its removals.  'newFileStore' makes one.
 data FileStore = FileStore
-  { fsRoot :: !FilePath,
+  { -- | The directory that holds @narinfo\/@, @nar\/@ and @uploads\/@.
+    fsRoot :: !FilePath,
+    -- | The Nix store directory @nix-cache-info@ reports.
     fsStoreDir :: !Text,
-    fsPriority :: !Int
+    -- | The priority @nix-cache-info@ reports; Nix prefers a lower one.
+    fsPriority :: !Int,
+    fsGate :: !(TVar GateState)
   }
-  deriving (Show)
 
 -- ---------------------------------------------------------------------------
 -- Constants
@@ -144,7 +172,8 @@ maxFileNameLength = 255
 -- Initialization
 -- ---------------------------------------------------------------------------
 
--- | Create a 't:FileStore' rooted at the given directory.
+-- | Create a 't:FileStore' rooted at the given directory, with a gate of
+-- its own.
 --
 -- Ensures the @narinfo@, @nar@ and @uploads@ subdirectories exist.
 newFileStore :: FilePath -> IO FileStore
@@ -152,20 +181,79 @@ newFileStore root = do
   createDirectoryIfMissing True (root </> narinfoSubdir)
   createDirectoryIfMissing True (root </> narSubdir)
   createDirectoryIfMissing True (root </> uploadsSubdir)
-  pure (fileStoreAt root)
+  gate <- newTVarIO GateState {gsHolders = 0, gsRemoval = NoRemoval}
+  pure
+    FileStore
+      { fsRoot = root,
+        fsStoreDir = defaultStoreDir,
+        fsPriority = defaultPriority,
+        fsGate = gate
+      }
 
--- | A 't:FileStore' over a directory tree as it stands, creating
--- nothing.  For a host tool that reads the store and acts on what it
--- finds: a mistyped root, or a store missing its @narinfo@ directory,
--- must fail the listing, not be scanned as an empty store whose every
--- NAR looks unreferenced.
-fileStoreAt :: FilePath -> FileStore
-fileStoreAt root =
-  FileStore
-    { fsRoot = root,
-      fsStoreDir = defaultStoreDir,
-      fsPriority = defaultPriority
-    }
+-- ---------------------------------------------------------------------------
+-- Additions and removals
+-- ---------------------------------------------------------------------------
+
+-- | Who holds a store's gate.
+data GateState = GateState
+  { -- | Actions running under 'withoutRemoval'.
+    gsHolders :: !Int,
+    gsRemoval :: !RemovalState
+  }
+
+-- | Where a removal stands.  A removal waiting for the holders to finish
+-- admits no new holder, so a steady run of uploads cannot hold it off.
+data RemovalState
+  = NoRemoval
+  | RemovalWaiting
+  | RemovalRunning
+
+-- | Run an action during which nothing is removed from the store.  Such
+-- actions run together; one that starts while a removal runs or waits to
+-- run waits for it to finish.
+--
+-- The gate is not re-entrant: the action must not call 'withoutRemoval'
+-- or 'withRemoval', or an operation that takes the gate itself, since a
+-- removal that begins waiting in between would wait for the action
+-- while the action waits for it.
+withoutRemoval :: FileStore -> IO a -> IO a
+withoutRemoval fs = bracket_ (atomically enter) (atomically leave)
+  where
+    gate = fsGate fs
+    enter = do
+      state <- readTVar gate
+      check (noRemoval (gsRemoval state))
+      writeTVar gate $! state {gsHolders = gsHolders state + 1}
+    leave = modifyTVar' gate (\state -> state {gsHolders = gsHolders state - 1})
+
+-- | Run a removal: alone, once every action under 'withoutRemoval' that
+-- began before it has finished.  Removals run one at a time.  A removal
+-- interrupted while it waits withdraws, so the actions it was holding
+-- off go ahead.  Not re-entrant, as 'withoutRemoval' is not.
+withRemoval :: FileStore -> IO a -> IO a
+withRemoval fs = bracket_ claim (atomically release)
+  where
+    gate = fsGate fs
+    claim = do
+      atomically $ do
+        state <- readTVar gate
+        check (noRemoval (gsRemoval state))
+        writeTVar gate $! state {gsRemoval = RemovalWaiting}
+      atomically begin `onException` atomically release
+    begin = do
+      state <- readTVar gate
+      check (gsHolders state == 0)
+      writeTVar gate $! state {gsRemoval = RemovalRunning}
+    release = modifyTVar' gate (\state -> state {gsRemoval = NoRemoval})
+
+noRemoval :: RemovalState -> Bool
+noRemoval NoRemoval = True
+noRemoval RemovalWaiting = False
+noRemoval RemovalRunning = False
+
+-- | Rename a finished file into @nar\/@, where a removal may be listing.
+renameIntoNars :: FileStore -> FilePath -> FilePath -> IO ()
+renameIntoNars fs from to = withoutRemoval fs (renameFile from to)
 
 -- ---------------------------------------------------------------------------
 -- NarInfo operations
@@ -187,7 +275,36 @@ readNarInfo fs hashKey = case sanitizePath hashKey of
 writeNarInfo :: FileStore -> Text -> ByteString -> IO Bool
 writeNarInfo fs hashKey body = case sanitizePath hashKey of
   Nothing -> pure False
-  Just safe -> atomicWriteFile (fsRoot fs </> narinfoSubdir </> safe) body >> pure True
+  Just safe -> do
+    let target = fsRoot fs </> narinfoSubdir </> safe
+    atomicWriteFile (takeDirectory target) body (`renameFile` target)
+    pure True
+
+-- | Outcome of removing a narinfo.
+data NarInfoRemoveResult
+  = -- | The narinfo is gone.
+    NarInfoRemoved
+  | -- | No narinfo is stored under the hash.
+    NarInfoAbsent
+  | -- | The filesystem refused; the narinfo is still stored.
+    NarInfoRemoveFailed !IOException
+  | -- | The hash failed 'sanitizePath'; nothing was touched.
+    NarInfoRemoveBadPath
+  deriving (Eq, Show)
+
+-- | Remove a narinfo by its store path hash, leaving the NAR it names
+-- for a reclaim ("NovaCache.Reclaim") to remove once nothing names it.
+-- A removal: call it within 'withRemoval'.
+removeNarInfo :: FileStore -> Text -> IO NarInfoRemoveResult
+removeNarInfo fs hashKey = case sanitizePath hashKey of
+  Nothing -> pure NarInfoRemoveBadPath
+  Just safe -> do
+    removed <- tryIO (removeFile (fsRoot fs </> narinfoSubdir </> safe))
+    pure $ case removed of
+      Right () -> NarInfoRemoved
+      Left err
+        | isDoesNotExistError err -> NarInfoAbsent
+        | otherwise -> NarInfoRemoveFailed err
 
 -- ---------------------------------------------------------------------------
 -- NAR operations
@@ -204,12 +321,15 @@ readNar fs fileName = case sanitizePath fileName of
 -- | Write a NAR file by its filename.
 --
 -- Uses atomic write-to-temp-then-rename so concurrent readers never
--- see partial content.
+-- see partial content, and takes the gate for the rename.
 -- Returns 'False' for path components containing traversal sequences.
 writeNar :: FileStore -> Text -> ByteString -> IO Bool
 writeNar fs fileName body = case sanitizePath fileName of
   Nothing -> pure False
-  Just safe -> atomicWriteFile (fsRoot fs </> narSubdir </> safe) body >> pure True
+  Just safe -> do
+    let target = fsRoot fs </> narSubdir </> safe
+    atomicWriteFile (takeDirectory target) body (\tmpPath -> renameIntoNars fs tmpPath target)
+    pure True
 
 -- | Outcome of a streaming NAR write.
 data NarWriteResult
@@ -226,12 +346,14 @@ data NarWriteResult
 -- input), enforcing a total-size cap as bytes arrive so the body is never
 -- held in memory.  Same atomic temp-then-rename discipline as 'writeNar':
 -- readers see the old file or the complete new one, never a partial write.
+-- Only the rename takes the gate, so a removal never waits on a client
+-- sending its body.
 writeNarStreaming :: FileStore -> Text -> Int -> IO ByteString -> IO NarWriteResult
 writeNarStreaming fs fileName limit nextChunk = case sanitizePath fileName of
   Nothing -> pure NarWriteBadPath
   Just safe -> do
     let target = fsRoot fs </> narSubdir </> safe
-    streamed <- streamIntoPlace (takeDirectory target) limit nextChunk (`renameFile` target)
+    streamed <- streamIntoPlace (takeDirectory target) limit nextChunk (\tmpPath -> renameIntoNars fs tmpPath target)
     pure $ case streamed of
       StreamWritten -> NarWriteOk
       StreamOverLimit -> NarWriteTooLarge
@@ -258,9 +380,8 @@ data NarRemoveResult
     NarRemoveBadPath
   deriving (Eq, Show)
 
--- | Remove a stored NAR by its filename.  Nothing in the HTTP protocol
--- calls this: deletion is for a tool the host operator runs against
--- the store directory.
+-- | Remove a stored NAR by its filename.  A removal: call it within
+-- 'withRemoval', after finding that nothing names the NAR.
 removeNar :: FileStore -> Text -> IO NarRemoveResult
 removeNar fs fileName = case sanitizePath fileName of
   Nothing -> pure NarRemoveBadPath
@@ -546,7 +667,7 @@ data CompletionResult
 -- writes at once can each pass, so the cap is checked again here: the
 -- joined size must equal the declared one, so no NAR over the cap is
 -- renamed into place.  The join reads each part once, in constant
--- memory.
+-- memory, and only the rename takes the gate.
 completeUpload :: FileStore -> Text -> UploadId -> Int -> UploadTotals -> IO CompletionResult
 completeUpload fs fileName uid limit (UploadTotals (PartNumber declaredParts) declaredSize) =
   case sanitizePath fileName of
@@ -568,7 +689,7 @@ completeUpload fs fileName uid limit (UploadTotals (PartNumber declaredParts) de
             refused -> pure refused
     placeJoined safe joinedPath size
       | size /= declaredSize = CompletionSizeMismatch declaredSize size <$ removeFile joinedPath
-      | otherwise = UploadCompleted <$ renameFile joinedPath (fsRoot fs </> narSubdir </> safe)
+      | otherwise = UploadCompleted <$ renameIntoNars fs joinedPath (fsRoot fs </> narSubdir </> safe)
 
 -- | Concatenate files, in order, into a new temp file in a directory, in
 -- constant memory, then hand the closed file and the bytes it holds to
@@ -667,9 +788,10 @@ data UploadRemoveResult
     UploadRemoveBadPath
   deriving (Eq, Show)
 
--- | Remove a staged upload and every part it holds.  Nothing in the HTTP
--- protocol calls this: like 'removeNar', it is for a tool the host
--- operator runs against the store directory.
+-- | Remove a staged upload and every part it holds.  A reclaim calls it
+-- within 'withRemoval', but parts are written outside the gate, so when
+-- a part is written to the upload at the same moment, either the part's
+-- write or the removal fails.
 removeUpload :: FileStore -> Text -> UploadId -> IO UploadRemoveResult
 removeUpload fs fileName uid = case sanitizePath fileName of
   Nothing -> pure UploadRemoveBadPath
@@ -739,18 +861,18 @@ sanitizePath txt
 
 -- | Write a file atomically via write-to-temp-then-rename.
 --
--- Writes to a temporary file in the same directory, then renames to
--- the target path. On POSIX, @rename@ is atomic - readers see either
--- the old content or the new content, never a partial write.
--- Cleans up the temporary file on failure.
-atomicWriteFile :: FilePath -> ByteString -> IO ()
-atomicWriteFile target content = do
-  let dir = takeDirectory target
+-- Writes to a new temp file in a directory, then hands the closed file
+-- to @commit@, which renames it to its target in the same directory. On
+-- POSIX, @rename@ is atomic - readers see either the old content or the
+-- new content, never a partial write.  Cleans up the temporary file on
+-- failure.
+atomicWriteFile :: FilePath -> ByteString -> (FilePath -> IO ()) -> IO ()
+atomicWriteFile dir content commit = do
   (tmpPath, h) <- openBinaryTempFile dir tempFilePrefix
   ( do
       BS.hPut h content
       hClose h
-      renameFile tmpPath target
+      commit tmpPath
     )
     `onException` discardTemp tmpPath h
 
