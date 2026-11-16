@@ -5,7 +5,7 @@ module Main (main) where
 
 import Control.Concurrent (myThreadId)
 import Control.Exception (AsyncException (UserInterrupt), Exception, IOException, SomeException, bracket_, displayException, finally, fromException, throwTo, try)
-import Control.Monad (guard, void, zipWithM)
+import Control.Monad (guard, replicateM, void, zipWithM)
 import qualified Crypto.PubKey.Ed25519 as Ed25519
 import Data.Bits (shiftR, (.&.))
 import Data.ByteArray (convert)
@@ -947,6 +947,45 @@ testStream =
           pure (endA, endB)
         removeDirectoryRecursive dir
         assertEqual "stable end" ("", "") ends,
+      -- The pull that opens a file reads its size, so a file cut to
+      -- nothing after that pull leaves the next read short, and the
+      -- empty chunk after that failure would read as the clean end of
+      -- a torn archive.  Writing the file afterwards shows the failure
+      -- closed it: GHC refuses a writer while the process holds a
+      -- reader open.
+      test "every pull after a shrink failure rethrows it" $
+        withWalkTree $ \root -> do
+          let file = root ++ "/file"
+              shrank = Left (userError ("withNarSource: " ++ file ++ " shrank while streaming"))
+          BS.writeFile file "contents"
+          NAR.withNarSourceOpts walkOptions file $ \pull -> do
+            _ <- pull
+            _ <- pull
+            withTruncated file $ do
+              failed <- try pull
+              later <- replicateM 2 (try pull)
+              closed <- isRight <$> (try (BS.writeFile file "") :: IO (Either IOException ()))
+              assertEqual
+                "the pull after the cut, the pulls after it, the file closed"
+                (shrank, [shrank, shrank], True)
+                (failed, later, closed),
+      -- The latch holds any failure, not only a shrink: a file that
+      -- could not be opened stays failed once it is readable again,
+      -- rather than resuming an archive its consumer saw fail.
+      test "every pull after a failed open rethrows it" $
+        withWalkTree $ \root -> do
+          let file = root ++ "/file"
+          BS.writeFile file "contents"
+          NAR.withNarSourceOpts walkOptions file $ \pull -> do
+            _ <- pull
+            withoutPermission readable setOwnerReadable file $ do
+              refused <- try pull
+              getPermissions file >>= setPermissions file . setOwnerReadable True
+              later <- try pull
+              assertEqual
+                "a failed open, then the pull once the file is readable again"
+                (True, refused)
+                (isLeft refused, later :: Either NAR.NarWalkError ByteString),
       test "pulled chunks parse back to the walked tree" $ do
         dir <- caseHackFixture "nova-cache-test-narsource-loop"
         BS.writeFile (dir <> "/data.bin") (BS.replicate 200000 0x5A)
@@ -1173,6 +1212,19 @@ withUnixSocket _ _ = pure True
 withUnixSocket path check = do
   bound <- Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
   Socket.bind bound (Socket.SockAddrUnix path) `finally` Socket.close bound
+  check
+#endif
+
+-- | Cut a file to nothing and run a check.  A stream holding the file
+-- open for reading keeps GHC from giving the same process a handle
+-- that writes it, so the cut is truncate(2), which Windows lacks; the
+-- check is skipped there.
+withTruncated :: FilePath -> IO Bool -> IO Bool
+#if defined(mingw32_HOST_OS)
+withTruncated _ _ = pure True
+#else
+withTruncated path check = do
+  Posix.setFileSize path 0
   check
 #endif
 
